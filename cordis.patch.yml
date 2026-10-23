@@ -1,0 +1,13 @@
+- insert:
+    - id: dsh-learning
+      name: dsh-learning
+      inject: [tools, systemPrompt, commands, llm]
+      config:
+        enabled: true
+        learning: false
+        provider: ''
+        model: ''
+        dailyCalls: 4
+        maxOutputTokens: 600
+        memoryBytes: 2400
+        idleMs: 30000

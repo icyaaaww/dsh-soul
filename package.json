@@ -1,0 +1,14 @@
+{
+  "name": "dsh-learning",
+  "version": "0.1.0",
+  "description": "Local scoped memory, feedback-validated skills and budgeted background learning for DSH",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "exports": {".": "./index.js", "./package.json": "./package.json", "./locale/*.json": "./locale/*.json"},
+  "engines": {"node": ">=24", "dsh": "0.2.0-rc.2"},
+  "dsh": {"bundle": {"patch": "./cordis.patch.yml"}},
+  "files": ["index.js", "src/*.js", "locale/*.json", "cordis.patch.yml", "README.md", "LICENSE", "CHANGELOG.md"],
+  "scripts": {"test": "node --test tests/*.test.mjs", "bench": "node scripts/bench.mjs", "check": "node --check index.js && npm test"},
+  "keywords": ["dsh-plugin", "deepseek-harness", "memory", "learning"]
+}

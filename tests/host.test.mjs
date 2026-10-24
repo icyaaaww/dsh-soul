@@ -41,6 +41,21 @@ test('real DSH commands, durable user events, prompt assembly and schema validat
     assert.equal(JSON.parse(proposal.text).status, 'candidate')
     const second = await prompts.assemble({ agent, scope: agent })
     assert(!second.contexts.some(c => c.text.includes('修复先复现故障')))
+    const inbox = await commands.execute(agent, '/learn inbox', [], signal)
+    assert.equal(inbox.result.kind, 'success')
+    assert(inbox.result.text.includes('修复先复现故障'))
+    await commands.execute(agent, '/learn prefer 修复先复现故障', [], signal)
+    const confirmed = await prompts.assemble({ agent, scope: agent })
+    assert(confirmed.contexts.some(c => c.text.includes('修复先复现故障')))
+    const skillInput = { title: '修复故障', preconditions: ['能够复现'], steps: ['定位根因'], checks: ['验证原问题解决'], counterexamples: ['不能复现时先收集信息'] }
+    const skillResult = await commands.execute(agent, `/learn skill ${JSON.stringify(skillInput)}`, [], signal)
+    assert.equal(skillResult.result.kind, 'success')
+    const skillId = skillResult.result.text.split('：')[1]
+    await commands.execute(agent, `/learn accept ${skillId}`, [], signal)
+    const cards = JSON.parse((await entries.find(t => t.name === 'learning_search').execute({ query: '修复故障' }, { agent, signal })).text)
+    assert(cards.some(c => c.id === skillId && c.status === 'trial' && c.partial))
+    const full = JSON.parse((await entries.find(t => t.name === 'learning_get').execute({ id: skillId }, { agent, signal })).text)
+    assert.deepEqual(JSON.parse(full.text), skillInput)
   } finally { await handle.stop() }
 })
 

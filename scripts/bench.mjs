@@ -16,15 +16,17 @@ try {
   })
   const setupMs = performance.now() - start
   const cases = {
-    specific: Array.from({ length: 100 }, (_, i) => `tag${i * 97}`),
-    broad_chinese: Array.from({ length: 100 }, () => '数据库问题修复'),
+    specific_uncached: { cold: true, queries: Array.from({ length: 100 }, (_, i) => `tag${i * 97}`) },
+    broad_chinese_uncached: { cold: true, queries: Array.from({ length: 100 }, () => '数据库问题修复') },
+    broad_chinese_cached: { cold: false, queries: Array.from({ length: 100 }, () => '数据库问题修复') },
   }
   const result = {}
-  for (const [name, queries] of Object.entries(cases)) {
-    const samples = queries.map(q => { const t = performance.now(); store.recall('project:bench', q); return performance.now() - t }).sort((a,b) => a-b)
+  for (const [name, { cold, queries }] of Object.entries(cases)) {
+    if (!cold) store.recall('project:bench', queries[0])
+    const samples = queries.map(q => { if (cold) store.cache.clear(); const t = performance.now(); store.recall('project:bench', q); return performance.now() - t }).sort((a,b) => a-b)
     result[name] = { p50_ms: +samples[49].toFixed(3), p95_ms: +samples[94].toFixed(3), max_ms: +samples[99].toFixed(3) }
   }
   console.log(JSON.stringify({ fixtureRecords: 10000, samplesPerCase: 100, node: process.version, platform: process.platform,
     cpu: cpus()[0]?.model, memoryGiB: Math.round(totalmem()/2**30), setupMs: Math.round(setupMs), result,
-    note: 'Synthetic disk-backed local benchmark; no model requests. Not an end-to-end quality test or cross-device performance promise.' }, null, 2))
+    note: 'Synthetic disk-backed local benchmark; uncached clears the plugin cache, not SQLite/OS caches. Cached uses one prewarmed query. No model requests; not end-to-end or cross-device performance.' }, null, 2))
 } finally { store.close(); rmSync(folder, { recursive: true, force: true }) }

@@ -39,7 +39,7 @@ test('timeout terminates local waiting even for non-cooperative provider', async
   const { store } = fixture(t)
   const worker = new Learner(store, () => new Promise(() => {}), { ...config, timeoutMs: 20 })
   await worker.tick()
-  assert.equal(store.stats('p').callsToday[0].outcome, 'interrupted')
+  assert.equal(store.stats('p').callsToday[0].outcome, 'timeout')
 })
 test('shutdown aborts in-flight learning before storage teardown', async t => {
   const { store } = fixture(t)

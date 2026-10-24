@@ -35,7 +35,7 @@ export function parseCandidates(text, events) {
 
 export function hostGenerate(llm, config) {
   return async ({ events, signal }) => {
-    let text = '', usage, finish
+    let text = '', usage, finish, failure = 'provider_failure'
     try {
       for await (const chunk of llm.stream({
         provider: config.provider, model: config.model,
@@ -48,11 +48,11 @@ export function hostGenerate(llm, config) {
         if (chunk.type === 'text-delta') text += chunk.text
         if (chunk.type === 'usage') usage = chunk.usage
         if (chunk.type === 'finish') finish = chunk.reason?.kind
-        if (Buffer.byteLength(text) > 16000) throw new Error('output_too_large')
+        if (Buffer.byteLength(text) > 16000) { failure = 'output_too_large'; throw new Error(failure) }
       }
-      if (finish !== 'stop') throw new Error(finish === 'max-tokens' ? 'truncated' : 'provider_failure')
+      if (finish !== 'stop') { failure = finish === 'max-tokens' ? 'truncated' : 'provider_failure'; throw new Error(failure) }
       return { text, usage }
-    } catch (e) { throw Object.assign(new Error('学习请求未完成'), { code: 'request_failed', usage }) }
+    } catch { throw Object.assign(new Error('学习请求未完成'), { code: failure, usage }) }
   }
 }
 
@@ -71,8 +71,8 @@ export class Learner {
     if (!job) return []
     this.controller = new AbortController()
     const signal = this.controller.signal
-    let usage, outcome = 'failed', candidates = []
-    const timeout = setTimeout(() => this.controller?.abort(new Error('学习请求超时')), this.config.timeoutMs)
+    let usage, outcome = 'provider_failure', candidates = [], timedOut = false, received = false
+    const timeout = setTimeout(() => { timedOut = true; this.controller?.abort(new Error('学习请求超时')) }, this.config.timeoutMs)
     let abortListener
     try {
       const aborted = new Promise((_, reject) => {
@@ -81,11 +81,13 @@ export class Learner {
       })
       const response = await Promise.race([this.generate({ events: job.events, signal }), aborted])
       usage = response.usage
+      received = true
       candidates = parseCandidates(response.text, job.events)
       outcome = 'ok'
     } catch (e) {
       usage ??= e?.usage
-      outcome = signal.aborted ? 'interrupted' : 'failed'
+      outcome = signal.aborted ? (timedOut ? 'timeout' : 'interrupted') : received ? 'invalid_candidates' :
+        ['truncated', 'output_too_large'].includes(e?.code) ? e.code : 'provider_failure'
       // Never log provider error bodies or malformed output containing user data.
     } finally {
       clearTimeout(timeout)

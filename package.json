@@ -1,6 +1,6 @@
 {
   "name": "dsh-soul",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Local scoped memory, feedback-validated skills and budgeted background learning for DSH",
   "license": "MIT",
   "repository": {"type": "git", "url": "git+https://github.com/icyaaaww/dsh-soul.git"},
@@ -9,7 +9,7 @@
   "type": "module",
   "main": "index.js",
   "exports": {".": "./index.js", "./package.json": "./package.json", "./locale/*.json": "./locale/*.json"},
-  "engines": {"node": ">=24", "dsh": "0.2.0-rc.2"},
+  "engines": {"node": ">=24", "dsh": "0.2.0-rc.2 || 0.2.1-rc.2"},
   "dsh": {"bundle": {"patch": "./cordis.patch.yml"}},
   "files": ["index.js", "src/*.js", "locale/*.json", "cordis.patch.yml", "README.md", "LICENSE", "CHANGELOG.md"],
   "scripts": {"test": "node --test tests/*.test.mjs", "bench": "node scripts/bench.mjs", "eval": "node scripts/eval.mjs", "check": "node --check index.js && npm test && npm run eval"},

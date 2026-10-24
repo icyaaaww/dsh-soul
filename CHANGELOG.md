@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1 — 2026-10-24
+
+- Verify DSH 0.2.1-rc.2 and explicitly accept it alongside 0.2.0-rc.2 in `engines.dsh`. Soul 0.2.0 is still rejected by the newer host's manifest gate.
+- Add real ToolRuntime/LlmRuntime integration with a deterministic local adapter, cancellation, disk persistence/reload, and version-gate regression checks.
+- Add Windows/Linux CI against both exact supported hosts; an explicitly configured missing or wrong host now fails tests.
+- No runtime behavior or database schema changes; existing schema 2 memories remain in place. No risk exemption is required for supported hosts.
+
 ## 0.2.0 — 2026-10-24
 
 - Public release renamed to DSH Soul (`dsh-soul`); package, bundle and display names match. Existing `/learn` commands and the legacy storage directory are preserved.

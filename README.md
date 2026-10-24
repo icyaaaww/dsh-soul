@@ -1,4 +1,4 @@
-# DSH Soul 0.2
+# DSH Soul 0.2.1
 
 为 DSH 增加有来源、可纠正的长期记忆，以及经过用户反馈验证的工作技能。**用记忆与方法改善上下文，不训练模型权重，不自动改写自身代码。**
 
@@ -6,21 +6,25 @@
 
 0.2 重点：长技能按需读取、试用技能可发现、候选审核摘要、跨连接失效的检索缓存、合并待处理纠正，以及可解释的学习失败与用量统计。无需新增依赖或模型请求。
 
+**0.2.1 修复新版 DSH 安装拦截**：验证后将兼容声明扩展为 `0.2.0-rc.2 || 0.2.1-rc.2`。旧的 Soul 0.2.0 包仍只声明旧版支持；使用 DSH 0.2.1-rc.2 时请下载 Soul 0.2.1，无需跳过兼容检查。此处 Soul 版本与 DSH 版本分别编号。
+
 ## 运行与安装
 
 - Node.js **24+**，使用自带 `node:sqlite`；不需要 Python、GPU、npm 运行时依赖或独立数据库服务。
-- 已针对 **DSH 0.2.0-rc.2** 验证，`engines.dsh` 暂时精确限定该版本。其他宿主版本需适配验证，不建议跳过兼容检查。
+- 已针对 **DSH 0.2.0-rc.2 与 0.2.1-rc.2** 验证，`engines.dsh` 只列出这两个版本。其他宿主版本需适配验证，不建议跳过兼容检查。
 - 标准 DSH bundle：`package.json → dsh.bundle.patch → cordis.patch.yml`，包含中英文展示元信息。
 
 安装打包文件（替换为实际绝对路径）：
 
 ```powershell
-dsh plugin --profile web add 'C:\Downloads\dsh-soul-0.2.0.tgz'
+dsh plugin --profile web add 'C:\Downloads\dsh-soul-0.2.1.tgz'
 ```
 
 重启 DSH，输入 `/learn help`。开发时可在源码目录运行 `npm pack` 生成 TGZ。桌面版应使用其内置插件管理入口，不要用 npm CLI 管理保留的 desktop profile。
 
-从 GitHub Releases 下载 `dsh-soul-0.2.0.tgz` 后按上方命令安装；目前不通过 npm registry 发布。
+从 GitHub Releases 下载 `dsh-soul-0.2.1.tgz` 后按上方命令安装；目前不通过 npm registry 发布。
+
+已安装 Soul 0.2.0 的用户可退出 DSH 后使用相同安装命令升级；无需卸载或删除记忆库。0.2.1 沿用 schema 2，未改动记忆数据格式。
 
 卸载：`dsh plugin --profile web remove dsh-soul`。本地记忆库保留，不删除聊天数据。
 
@@ -124,7 +128,9 @@ npm run bench
 npm pack --dry-run
 ```
 
-测试涵盖中文检索、范围隔离、候选状态、技能反馈、删除与修订传播、在途删除、额度并发与重启、超时与关闭、来源伪造、隐藏思维隔离，以及真实 DSH SessionStore/CommandRuntime/SystemPrompt 和 schema 校验器。设置 `DSH_TEST_PACKAGE` 可指向另一位置的宿主 package.json；没有宿主时集成测试明确跳过。
+测试涵盖中文检索、范围隔离、候选状态、技能反馈、删除与修订传播、在途删除、额度并发与重启、超时与关闭、来源伪造、隐藏思维隔离，以及真实 DSH SessionStore/CommandRuntime/SystemPrompt、ToolRuntime、LlmRuntime 和兼容检查器。LLM 测试使用真实宿主服务与本地确定性适配器，不请求付费 API。
+
+设置 `DSH_TEST_PACKAGE` 可指向另一位置的宿主 package.json，`DSH_TEST_VERSION` 可断言版本；显式指定的宿主缺失时测试失败，不能静默跳过。默认未安装宿主时集成测试明确跳过。CI 额外安装两个已支持宿主，在 Windows/Linux 上运行包含宿主集成的完整检查。详见 `docs/COMPATIBILITY-0.2.1.md`。
 
 性能脚本创建独立临时 SQLite 库，用 10000 条合成记录测检索 p50/p95，分别报告插件缓存未命中和预热后的命中；未清空操作系统及 SQLite 缓存。`npm run eval` 是 11 个手工编写的用户历史检索场景，包括项目隔离、偏好确认、修订、遗忘和长技能生命周期；不是公开独立测试集，不衡量主模型是否真正完成任务。真实 API 语义质量、总费用与跨设备性能仍需后续评测。
 

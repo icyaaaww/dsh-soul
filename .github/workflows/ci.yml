@@ -15,3 +15,22 @@ jobs:
           node-version: '24'
       - run: npm run check
       - run: npm pack --dry-run
+  host:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        dsh: ['0.2.0-rc.2', '0.2.1-rc.2']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install isolated host services
+        run: npm install --prefix work/host --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org @deepseek-ai/dsh@${{ matrix.dsh }}
+      - name: Check against the exact host version (missing host fails)
+        run: npm run check
+        env:
+          DSH_TEST_PACKAGE: ${{ github.workspace }}/work/host/node_modules/@deepseek-ai/dsh/package.json
+          DSH_TEST_VERSION: ${{ matrix.dsh }}

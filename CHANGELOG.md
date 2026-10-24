@@ -2,6 +2,8 @@
 
 ## 0.2.0 — 2026-10-24
 
+- Public release renamed to DSH Soul (`dsh-soul`); package, bundle and display names match. Existing `/learn` commands and the legacy storage directory are preserved.
+
 - Compact skill cards with full-text retrieval; relevant accepted trial skills are discoverable and explicitly unverified.
 - Bounded `/learn inbox` shows candidate/trial summaries, evidence and human review actions.
 - Explicit remember/prefer commands now activate identical existing non-skill candidates.

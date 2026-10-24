@@ -1,8 +1,11 @@
 {
-  "name": "dsh-learning",
+  "name": "dsh-soul",
   "version": "0.2.0",
   "description": "Local scoped memory, feedback-validated skills and budgeted background learning for DSH",
   "license": "MIT",
+  "repository": {"type": "git", "url": "git+https://github.com/icyaaaww/dsh-soul.git"},
+  "homepage": "https://github.com/icyaaaww/dsh-soul#readme",
+  "bugs": {"url": "https://github.com/icyaaaww/dsh-soul/issues"},
   "type": "module",
   "main": "index.js",
   "exports": {".": "./index.js", "./package.json": "./package.json", "./locale/*.json": "./locale/*.json"},

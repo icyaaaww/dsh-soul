@@ -5,7 +5,7 @@ import { Store } from './src/store.js'
 import { Learner, hostGenerate, skillText } from './src/learner.js'
 import { bounded, clean, human, integer, projectScope, textBlocks } from './src/util.js'
 
-export const name = 'dsh-learning'
+export const name = 'dsh-soul'
 export const inject = ['tools', 'systemPrompt', 'commands', 'llm']
 
 export function settings(input = {}) {
@@ -15,6 +15,7 @@ export function settings(input = {}) {
   for (const key of ['enabled', 'learning']) if (input[key] !== undefined && typeof input[key] !== 'boolean') throw new Error(`${key} 必须是布尔值`)
   const config = {
     enabled: input.enabled ?? true, learning: input.learning ?? false, profile,
+    // Keep the pre-rename namespace so existing memories and daily budgets survive.
     database: input.database ?? join(process.env.DSH_HOME?.trim() || join(homedir(), '.dsh'), 'dsh-learning', profile, 'memory.sqlite'),
     provider: input.provider ?? '', model: input.model ?? '', reasoningEffort: input.reasoningEffort ?? '',
     dailyCalls: integer(input.dailyCalls, 4, 0, 100),
@@ -28,7 +29,7 @@ export function settings(input = {}) {
   return config
 }
 
-const HELP = `DSH 成长记忆（这些命令不调用模型）
+const HELP = `DSH Soul 成长记忆（这些命令不调用模型）
 /learn remember 记住的内容                 当前项目事实，立即生效
 /learn prefer 表达偏好                      当前项目偏好，立即生效
 /learn prefer --profile 长期表达偏好         同一 profile 通用偏好
@@ -150,7 +151,7 @@ export function apply(ctx, input = {}) {
       }
       if (event.type === 'turn/end') { store.enqueue(sid, scope); lastActivity = Date.now() }
     }))
-    disposers.push(ctx.systemPrompt.context({ name: 'dsh-learning:memory', order: 950, text: ({ agent }) => {
+    disposers.push(ctx.systemPrompt.context({ name: 'dsh-soul:memory', order: 950, text: ({ agent }) => {
       if (!agent || disposed || agent.session.header?.origin === 'subagent') return ''
       try { return store.recall(projectScope(agent.session), pending.get(String(agent.session.id)) ?? '', config.memoryBytes) }
       catch { return '' }

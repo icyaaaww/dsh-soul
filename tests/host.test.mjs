@@ -4,7 +4,7 @@ import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import { resolve, join } from 'node:path'
 import { existsSync } from 'node:fs'
-const { apply, inject } = await import(process.env.DSH_LEARNING_TEST_ENTRY || new URL('../index.js', import.meta.url).href)
+const { apply, inject } = await import(process.env.DSH_SOUL_TEST_ENTRY || process.env.DSH_LEARNING_TEST_ENTRY || new URL('../index.js', import.meta.url).href)
 
 const manifest = process.env.DSH_TEST_PACKAGE || join(process.env.APPDATA || '', 'npm/node_modules/@deepseek-ai/dsh/package.json')
 test('real DSH commands, durable user events, prompt assembly and schema validators', { skip: !existsSync(manifest) }, async () => {
@@ -32,7 +32,7 @@ test('real DSH commands, durable user events, prompt assembly and schema validat
     const invocation = await commands.execute(agent, '/learn prefer 先给结论再说明', [], signal)
     assert.equal(invocation.result.kind, 'success')
     const assembly = await prompts.assemble({ agent, scope: agent })
-    assert.equal(assembly.contexts.filter(c => c.name === 'dsh-learning:memory').length, 1)
+    assert.equal(assembly.contexts.filter(c => c.name === 'dsh-soul:memory').length, 1)
     assert(assembly.contexts.some(c => c.text.includes('先给结论')))
     const message = createUserMessage({ content: [{ type: 'text', text: '以后修复先复现故障' }], source: { kind: 'user' } })
     session.append('user/message', message, { surfaceOp: 'append' })

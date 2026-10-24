@@ -1,6 +1,6 @@
 - insert:
-    - id: dsh-learning
-      name: dsh-learning
+    - id: dsh-soul
+      name: dsh-soul
       inject: [tools, systemPrompt, commands, llm]
       config:
         enabled: true

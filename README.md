@@ -1,6 +1,8 @@
-# DSH Learning 0.2
+# DSH Soul 0.2
 
 为 DSH 增加有来源、可纠正的长期记忆，以及经过用户反馈验证的工作技能。**用记忆与方法改善上下文，不训练模型权重，不自动改写自身代码。**
+
+让 DSH 更懂你，也更会做事。项目原名 DSH Learning，现统一以 **DSH Soul** 发布，包名为 `dsh-soul`。
 
 0.2 重点：长技能按需读取、试用技能可发现、候选审核摘要、跨连接失效的检索缓存、合并待处理纠正，以及可解释的学习失败与用量统计。无需新增依赖或模型请求。
 
@@ -13,12 +15,16 @@
 安装打包文件（替换为实际绝对路径）：
 
 ```powershell
-dsh plugin --profile web add 'C:\Downloads\dsh-learning-0.2.0.tgz'
+dsh plugin --profile web add 'C:\Downloads\dsh-soul-0.2.0.tgz'
 ```
 
 重启 DSH，输入 `/learn help`。开发时可在源码目录运行 `npm pack` 生成 TGZ。桌面版应使用其内置插件管理入口，不要用 npm CLI 管理保留的 desktop profile。
 
-卸载：`dsh plugin --profile web remove dsh-learning`。本地记忆库保留，不删除聊天数据。
+从 GitHub Releases 下载 `dsh-soul-0.2.0.tgz` 后按上方命令安装；目前不通过 npm registry 发布。
+
+卸载：`dsh plugin --profile web remove dsh-soul`。本地记忆库保留，不删除聊天数据。
+
+如果此前安装过 `dsh-learning`，先退出 DSH，使用 `dsh plugin --profile web remove dsh-learning` 移除旧插件，再安装 `dsh-soul`，并将旧插件的自定义 patch ID 改为 `dsh-soul`。不要同时加载两者；命令仍为 `/learn`，默认存储目录保留原名以继续使用已有记忆与额度。
 
 ## 立即体验：无需额外模型调用
 
@@ -61,7 +67,7 @@ dsh plugin --profile web add 'C:\Downloads\dsh-learning-0.2.0.tgz'
 示例：在当前 profile 的 `cordis.patch.yml` 中追加以下宿主 patch（如已有同 ID override，请合并 config）。该结构需与所安装 DSH 的 patch 格式对应：
 
 ```yaml
-- id: dsh-learning
+- id: dsh-soul
   config:
     learning: true
     provider: your-registered-provider
@@ -97,7 +103,7 @@ provider/model 必须是用户自己的 DSH 路由；不附带 API Key。`reason
 
 ## 数据、删除与可靠性
 
-默认数据路径：`~/.dsh/dsh-learning/<profile>/memory.sqlite`，尊重 `DSH_HOME`。安装目录位于 profiles 下时自动识别 profile；直接从源码加载时默认为 development，也可显式配置 profile/database。指定同一个 database 会共享存储，勿用于需要隔离的 profile。
+默认数据路径：`~/.dsh/dsh-learning/<profile>/memory.sqlite`，为兼容更名前的数据特意保留 `dsh-learning` 目录名，尊重 `DSH_HOME`。安装目录位于 profiles 下时自动识别 profile；直接从源码加载时默认为 development，也可显式配置 profile/database。指定同一个 database 会共享存储，勿用于需要隔离的 profile。
 
 升级时先正常退出使用该库的 DSH，备份数据库，再安装 0.2。首次加载在事务内将 schema 1 升为 2，保留记忆、来源、反馈、遗忘指纹和已用额度；不进行模型重提炼。0.1 无法打开升级后的库，回退应恢复升级前备份；不应让两个插件版本同时写同一库。
 

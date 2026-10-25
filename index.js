@@ -53,6 +53,7 @@ const HELP = `DSH Soul 成长记忆（evolve run 会启动模型试验；其余�
 /learn assess 试用ID helped|neutral|harmed|uncertain 审核理由
 /learn review                              将近期证据排入学习队列（按配置后台处理）
 /learn status                              查看预算、待处理及调用 usage
+/learn evolve example memory|javascript    在项目中创建验证套件示例，不覆盖已有文件
 /learn evolve register 验证套件.json        注册当前项目固定任务及验收条件
 /learn evolve run 套件ID                    异步启动提出→试验→组合→验证→递归→采用
 /learn evolve list                         当前项目已授权验证套件

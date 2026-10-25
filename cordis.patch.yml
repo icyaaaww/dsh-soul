@@ -5,6 +5,7 @@
       config:
         enabled: true
         learning: false
+        evolution: false
         provider: ''
         model: ''
         learningMode: efficiency

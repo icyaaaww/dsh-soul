@@ -1,7 +1,7 @@
 {
   "name": "dsh-soul",
-  "version": "0.3.0",
-  "description": "Scoped memory, evidence-backed method trials and efficiency-first learning for DSH",
+  "version": "0.5.0",
+  "description": "DSH memory and recursive strategy evolution with isolated probes and fixed validation",
   "license": "MIT",
   "repository": {"type": "git", "url": "git+https://github.com/icyaaaww/dsh-soul.git"},
   "homepage": "https://github.com/icyaaaww/dsh-soul#readme",
@@ -11,7 +11,7 @@
   "exports": {".": "./index.js", "./package.json": "./package.json", "./locale/*.json": "./locale/*.json"},
   "engines": {"node": ">=24", "dsh": "0.2.0-rc.2 || 0.2.1-rc.2"},
   "dsh": {"bundle": {"patch": "./cordis.patch.yml"}},
-  "files": ["index.js", "src/*.js", "locale/*.json", "cordis.patch.yml", "README.md", "LICENSE", "CHANGELOG.md"],
-  "scripts": {"test": "node --test tests/*.test.mjs", "bench": "node scripts/bench.mjs", "bench:experience": "node scripts/bench-experience.mjs", "eval": "node scripts/eval.mjs", "check": "node --check index.js && npm test && npm run eval"},
+  "files": ["index.js", "src/*.js", "locale/*.json", "examples/*.json", "docs/EVOLUTION-0.5.md", "cordis.patch.yml", "README.md", "LICENSE", "CHANGELOG.md"],
+  "scripts": {"test": "node --test tests/*.test.mjs", "bench": "node scripts/bench.mjs", "bench:experience": "node scripts/bench-experience.mjs", "demo:evolution": "node scripts/demo-evolution.mjs", "eval": "node scripts/eval.mjs", "check": "node --check index.js && npm test && npm run eval"},
   "keywords": ["dsh-plugin", "deepseek-harness", "memory", "learning"]
 }

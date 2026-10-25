@@ -28,6 +28,14 @@ for (const archive of process.argv.slice(2)) {
     old.finish(job, [], { inputTokens: 10, outputTokens: 20 }, 'ok')
     const tombstones = old.db.prepare('SELECT * FROM tombstones ORDER BY key').all()
     const calls = old.db.prepare('SELECT * FROM calls ORDER BY id').all()
+    let priorTrial
+    if (old.experience) {
+      old.experience.startRun('old-trial', 'p', 1)
+      priorTrial = old.experience.start({ memory: skill, scope: 'p', session: 'old-trial', goal: '验证旧版使用记录', change: '保留现有方法' }).trial.id
+      const observed = old.capture({ eventId: 'result', session: 'old-trial', scope: 'p', role: 'tool', text: '实际工具观察' })
+      old.experience.trackSource('old-trial', 'p', observed)
+      old.experience.report(priorTrial, 'p', 'old-trial', { verdict: 'uncertain', note: '没有基线', sourceIds: [observed] })
+    }
     old.close(); old = null
     upgraded = new Store(path)
     assert.equal(upgraded.get(preference, 'p').text, '先给结论')
@@ -37,14 +45,16 @@ for (const archive of process.argv.slice(2)) {
     assert.equal(upgraded.get(skill, 'p').performance.passedSessions, 1)
     assert.deepEqual(upgraded.db.prepare('SELECT * FROM tombstones ORDER BY key').all(), tombstones)
     assert.deepEqual(upgraded.db.prepare('SELECT * FROM calls ORDER BY id').all(), calls)
-    assert.equal(upgraded.db.prepare('PRAGMA user_version').get().user_version, 3)
+    assert.equal(upgraded.db.prepare('PRAGMA user_version').get().user_version, 4)
+    if (priorTrial) assert.equal(upgraded.experience.get(priorTrial, 'p').verdict, 'uncertain')
+    assert.equal(upgraded.db.prepare('SELECT COUNT(*) AS n FROM evo_suites').get().n, 0)
     assert.equal(upgraded.db.prepare('PRAGMA integrity_check').get().integrity_check, 'ok')
     assert.equal(upgraded.db.prepare('PRAGMA foreign_key_check').all().length, 0)
     upgraded.experience.startRun('new-session', 'p', 1)
     assert(upgraded.experience.start({ memory: skill, scope: 'p', session: 'new-session', goal: '修复故障', change: '验证升级后试用' }).trial.id)
     upgraded.close(); upgraded = null
     assert.throws(() => new OldStore(path), /版本/)
-    console.log(JSON.stringify({ archive: resolve(archive), fromSchema: before, toSchema: 3, passed: true,
+    console.log(JSON.stringify({ archive: resolve(archive), fromSchema: before, toSchema: 4, passed: true,
       verified: ['memory', 'sources', 'feedback', 'tombstones', 'spent budget', 'new trial', 'integrity', 'old-version rejection'] }))
   } finally { old?.close(); upgraded?.close(); rmSync(folder, { recursive: true, force: true }) }
 }

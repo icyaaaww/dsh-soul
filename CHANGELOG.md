@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.0 — 2026-10-26
+
+- Add a working recursive Propose–Probe–Compose loop: execute the incumbent, propose candidates, probe independent workspaces concurrently, execute the composition, continue from verified training improvements and select with separate validation cases.
+- Automatically adopt improved project skills only after all fixed training/validation checks pass. Quality comes first; latency alone cannot win. Ordinary model proposals still require human acceptance. Negative human feedback retires automated skills too.
+- Built-in bounded virtual file executor for text/JSON tasks and an optional local Docker executor for JavaScript functions. Expected outputs remain outside model requests and code containers. No unrestricted shell/project mutation is exposed.
+- Add user-owned validation suites, examples, asynchronous run/status/show/cancel/rollback/unregister commands, model start/status tools and opt-in repeated-failure triggers after host idle.
+- Separate editor/executor model choices; bounded concurrency, rounds, per-case steps, durable per-run/daily request reservations, deadlines, cooldowns and no automatic retries. Carry prior strategy and evidence-supported lessons into later runs.
+- Transactionally migrate schemas 1/2/3 to 4, preserving existing memory, observations and budgets. Add source-dependent probe cleanup and retain fixed-suite provenance separately from human feedback.
+- Add deterministic end-to-end evolution tests, actual DSH LlmRuntime integration, real-container CI and an offline demonstration. The implementation is inspired by Harness², not a reproduction of its entire framework or benchmark gains.
+
+Evolution is off by default until an explicit model route and project suite are configured. JavaScript probes additionally require a prepared local Docker Linux image. Back up the database before upgrading; 0.1–0.3 cannot read schema 4.
+
 ## 0.3.0 — 2026-10-26
 
 - Prioritize correct results, less rework and completion time. Default `learningMode: efficiency` permits 12 learning requests/day, 18000 input bytes, 1600 output tokens, 3600 memory bytes and a 10-second idle delay. `economy` preserves previous limits; explicit overrides win. Background learning remains off until configured, with an explicit provider/model of any suitable capacity.

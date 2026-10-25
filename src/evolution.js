@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises'
+import { readFile, mkdir, writeFile } from 'node:fs/promises'
 import { resolve, isAbsolute } from 'node:path'
 import { bounded, clean, day, hash, id, integer, redact } from './util.js'
 import { skillText } from './learner.js'
@@ -42,7 +42,7 @@ export function better(a, b) {
 }
 const brief = rows => rows.map(({ trace, answer, ...r }) => ({ ...r, answer: bounded(redact(answer), 800),
   trace: trace.slice(-4).map(t => Object.fromEntries(Object.entries(t).map(([k, v]) => [k, typeof v === 'string' ? bounded(redact(v), 600) : v]))) }))
-const codes = new Set(['cancelled', 'timeout', 'request_timeout', 'provider_failure', 'invalid_json', 'invalid_strategy', 'invalid_contract', 'truncated', 'input_limit', 'output_limit', 'run_budget', 'daily_budget', 'source_changed', 'invalid_lesson', 'sandbox_unavailable', 'sandbox_cleanup'])
+const codes = new Set(['cancelled', 'timeout', 'request_timeout', 'provider_failure', 'invalid_json', 'invalid_strategy', 'invalid_contract', 'truncated', 'input_limit', 'output_limit', 'run_budget', 'daily_budget', 'source_changed', 'invalid_lesson', 'sandbox_unavailable', 'sandbox_cleanup', 'sandbox_timeout', 'sandbox_output_limit'])
 
 export class Evolution {
   constructor(store, generate, config) {
@@ -105,6 +105,7 @@ export class Evolution {
     const e = this.store.tx(() => {
       this.recover()
       if (this.db.prepare("SELECT 1 FROM evo_runs WHERE state='running'").get()) throw fail('busy')
+      if (this.db.prepare('SELECT COUNT(*) AS n FROM evo_runs').get().n >= 10000) throw fail('run_limit', '进化记录已达上限，请先整理套件或等待保留期清理')
       const row = this.db.prepare('SELECT * FROM evo_suites WHERE scope=? AND id=?').get(scope, suiteId)
       if (!row) throw fail('not_found', '先用 /learn evolve register 路径 注册本项目验证套件')
       const suite = JSON.parse(row.contract), now = this.store.now()
@@ -265,6 +266,7 @@ export class Evolution {
       if (previous && (this.store.get(previous.memory, e.scope)?.status !== 'active')) throw fail('source_changed')
       const text = skillText({ ...strategy, title: clean(`${e.suite.title}：${strategy.title}`, 200),
         preconditions: [clean(`仅适用 ${e.suite.keywords.join('、')}；自动验证范围 ${e.suite.id}，不代表任意任务成功`, 300), ...strategy.preconditions].slice(0, 12) })
+      skillText(clean(text, 3200)) // Redaction must not leave malformed JSON in an automatically activated skill.
       const source = this.store.capture({ eventId: `evolution:${e.id}`, session: e.session, scope: e.scope, role: 'tool',
         text: `隔离任务执行与固定验收通过；run=${e.id}；${JSON.stringify(summary)}`, priority: 0 })
       const memory = this.store.add({ scope: e.scope, kind: 'skill', text, sourceIds: [source], origin: 'evolution',
@@ -305,6 +307,13 @@ export class Evolution {
   }
   async command(raw, session, scope) {
     const match = raw.trim().match(/^(\S+)(?:\s+([\s\S]+))?$/), verb = match?.[1] ?? 'status', value = match?.[2]?.trim() ?? ''
+    if (verb === 'example') {
+      if (!['memory', 'javascript'].includes(value) || !session.header?.cwd || !isAbsolute(session.header.cwd)) throw fail('invalid_path', '在项目中使用 evolve example memory 或 javascript')
+      const folder = resolve(session.header.cwd, '.dsh-soul'), path = resolve(folder, `evolution-${value}.json`)
+      const content = await readFile(new URL(`../examples/evolution-${value}.json`, import.meta.url), 'utf8')
+      await mkdir(folder, { recursive: true }); await writeFile(path, content, { flag: 'wx' })
+      return { path, next: `/learn evolve register ${path}`, note: '示例用于学习配置；请扩充为你的实际任务与验收条件' }
+    }
     if (verb === 'register') {
       let path = value.replace(/^"(.*)"$/, '$1')
       if (!path || (!isAbsolute(path) && !session.header?.cwd)) throw fail('invalid_path', '需要绝对路径或会话工作目录')
@@ -333,7 +342,7 @@ export class Evolution {
       })
       return { removed: value, note: '保留不含正文的调用额度；不删除用户提供的原始套件文件' }
     }
-    throw fail('unknown_command', '使用 evolve register/run/list/status/show/cancel/rollback/unregister')
+    throw fail('unknown_command', '使用 evolve example/register/run/list/status/show/cancel/rollback/unregister')
   }
   async stop() { this.closed = true; this.active?.controller.abort(fail('cancelled')); await this.running }
 }

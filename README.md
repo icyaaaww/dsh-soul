@@ -1,167 +1,169 @@
-# DSH Soul 0.3.0
+# DSH Soul 0.5.0
 
-为 DSH 增加有来源、可纠正的长期记忆，以及经过用户反馈验证的工作技能。**用记忆与方法改善上下文，不训练模型权重，不自动改写自身代码。**
+为 DSH 提供长期记忆，以及**提出候选 → 独立执行 → 比较 → 组合 → 复测 → 递归改进 → 自动采用**的方法进化流程。目标是结果正确、少返工、更快完成；模型成本由配置限制，不强制使用便宜模型。
 
-让 DSH 更懂你，也更会做事。项目原名 DSH Learning，现统一以 **DSH Soul** 发布，包名为 `dsh-soul`。
+进化的对象是项目内的技能和工作策略，不是模型权重、身份或权限。0.5 已实现完整的受限试验循环，仍不是对所有开放任务都能自行判定成功的通用自进化系统。
 
-0.3 重点：**结果质量 → 减少返工 → 完成时间**。增加有来源的方法使用记录和前后对比，在相关程度相同的技能之间优先选择经过人工验证的方法。保留长技能按需读取、检索缓存和后台增量学习；费用是可配置限制，不用便宜模型作为硬性目标。
+## 安装与升级
 
-兼容声明继续为 `0.2.0-rc.2 || 0.2.1-rc.2`。旧的 Soul 0.2.0 包只声明旧版支持；使用 DSH 0.2.1-rc.2 时请下载 Soul 0.2.1 或 0.3.0，无需跳过兼容检查。Soul 版本与 DSH 版本分别编号。
+- Node.js 24+，使用自带 SQLite，零 npm 运行时依赖。
+- 明确兼容 DSH `0.2.0-rc.2 || 0.2.1-rc.2`，不跳过宿主兼容检查。
+- 标准 DSH bundle，包名 `dsh-soul`，含中英文元信息。
+- 内存任务无需其他运行环境；实际执行 JavaScript 的套件另需本地 Docker Linux 引擎及预先准备的 Node 镜像。
 
-## 运行与安装
-
-- Node.js **24+**，使用自带 `node:sqlite`；不需要 Python、GPU、npm 运行时依赖或独立数据库服务。
-- 已针对 **DSH 0.2.0-rc.2 与 0.2.1-rc.2** 验证，`engines.dsh` 只列出这两个版本。其他宿主版本需适配验证，不建议跳过兼容检查。
-- 标准 DSH bundle：`package.json → dsh.bundle.patch → cordis.patch.yml`，包含中英文展示元信息。
-
-安装打包文件（替换为实际绝对路径）：
+从本仓库 Releases 下载 TGZ，退出 DSH、备份记忆库后安装：
 
 ```powershell
-dsh plugin --profile web add 'C:\Downloads\dsh-soul-0.3.0.tgz'
+dsh plugin --profile web add 'C:\Downloads\dsh-soul-0.5.0.tgz'
 ```
 
-重启 DSH，输入 `/learn help`。开发时可在源码目录运行 `npm pack` 生成 TGZ。桌面版应使用其内置插件管理入口，不要用 npm CLI 管理保留的 desktop profile。
+替换实际路径与 profile；桌面版使用其内置插件入口。重启后输入 `/learn help`。不通过 npm registry 发布。
 
-从 GitHub Releases 下载 `dsh-soul-0.3.0.tgz` 后按上方命令安装；目前不通过 npm registry 发布。
+**本版数据库升级到 schema 4。**原记忆、来源、反馈、试用、遗忘指纹和额度保留；0.1–0.3 不能打开升级后的库，回退需恢复备份。默认目录仍是 `~/.dsh/dsh-learning/<profile>/memory.sqlite`，尊重 `DSH_HOME`。不要让不同插件版本同时写入同一库。
 
-已安装旧版本的用户请退出 DSH、备份记忆库，再使用相同命令升级；无需卸载或删除记忆库。**0.3.0 升级到 schema 3，旧版插件不能打开升级后的库**，回退需恢复备份。
+原名 `dsh-learning` 的旧插件需先移除，再安装 Soul；不要同时加载。卸载 Soul 保留记忆库和宿主聊天记录。
 
-卸载：`dsh plugin --profile web remove dsh-soul`。本地记忆库保留，不删除聊天数据。
+## 0.5 真正新增了什么
 
-如果此前安装过 `dsh-learning`，先退出 DSH，使用 `dsh plugin --profile web remove dsh-learning` 移除旧插件，再安装 `dsh-soul`，并将旧插件的自定义 patch ID 改为 `dsh-soul`。不要同时加载两者；命令仍为 `/learn`，默认存储目录保留原名以继续使用已有记忆与额度。
+| 环节 | 行为 |
+| --- | --- |
+| 基线 | 用当前方法执行固定训练任务，记录实际输出、通过情况、调用和动作次数 |
+| 提出 | 编辑模型根据失败及差异提出多个结构化方法 |
+| 探测 | 候选在互不共享状态的工作区中并发执行 |
+| 组合 | 根据已发生的行为组合方法，并重新执行组合方案 |
+| 递归 | 有改进则把选中方法用于下一轮；无提升、重复候选、预算或时间不足就停止 |
+| 验证 | 选定方法后，基线与新方法都执行单独的验证用例；验证输入与答案不交给编辑模型 |
+| 采用 | 所有训练及验证用例通过，且相对基线有可确认的质量或步骤改进，才自动写入本项目技能 |
+| 复用 | 相关任务可召回新技能；后续进化复用当前策略及有来源的改进经验 |
 
-## 立即体验：无需额外模型调用
+套件由用户注册，任务、固定答案和运行权限不能由被测模型修改。普通模型建议仍保持 candidate；只有通过已授权套件的进化策略可以自动进入 active，卡片明确标记 `fixed_suite`。一条人工失败反馈仍会停用它。
 
-```text
-/learn prefer --profile 先给结论，再解释必要细节
-/learn remember 当前项目使用 Node 24，修复前先复现问题
-/learn search 修复
-/learn list active
-/learn inbox
-/learn show 记忆ID
-/learn revise 记忆ID 新的内容
-/learn forget 记忆ID
-/learn status
-```
+实际耗时会记录，但一次运行更快不能独自决定升级。质量相同时，至少两个用例减少模型调用或动作数，且没有逐用例资源/错误回退，才算效率改进。
 
-`prefer` 默认是当前项目偏好；`--profile` 是同一个 DSH profile 的通用偏好。`remember` 默认记录项目事实，也支持 `--profile`，请仅用于确实需要跨项目共享的事实。
+## 开启进化
 
-当前目录来自 DSH session.header.cwd，按规范化路径划分项目；没有工作目录时只在当前会话内可见。不会自动猜测多个子目录属于同一个 Git 项目。不同 profile 使用独立数据库；单 profile 目前面向单用户，不作为多租户服务。
-
-普通对话中的纠正在开启后台学习后可以被提炼为**候选**；主模型也可以调用 `learning_propose` 提交候选。`/learn inbox` 分别列出最多 10 条候选、试用技能和待审核方法报告，附来源与下一步命令。使用 `/learn accept ID` 接受后才自动召回。自然语言候选不会未经确认就变成永久偏好；当前明确指令仍应立即由 DSH 遵循，不必等学习完成。对已有同文候选执行 `remember/prefer` 会立即确认原记录；技能仍需试用验证。
-
-## 技能闭环
-
-```text
-/learn skill {"title":"排查测试失败","preconditions":["已有可复现故障"],"steps":["记录失败输出","定位根因","进行最小修改"],"checks":["相关测试通过","确认原问题已解决"],"counterexamples":["没有复现时先收集信息，不直接重写"]}
-/learn accept 技能ID
-/learn feedback 技能ID pass 本次按流程定位并解决了故障
-```
-
-技能从 candidate 进入 trial。**两个不同会话的人工通过反馈**才提升为 active；同一会话重复反馈不叠加。一条失败反馈即停用为 deprecated，修订产生新版本并重新验证。不同会话只是最低限度的去重，并不能证明两次任务真的独立，仍需真实使用结果。
-
-有效和相关试用技能以短卡片提供：ID、状态、标题、部分适用条件。上下文和 `learning_search` 返回相同的有界卡片；标记 `partial` 的资料必须先用 `learning_get` 读取全文、检查项和反例后使用。试用技能明确标记为待检查方案，不当成已经验证的成功经验；候选和失败技能不自动注入。`/learn search` 仍查看有效记忆全文，`/learn show ID` 可人工检查任意当前范围记录。
-
-插件不自动运行候选脚本，不自动重放具有外部副作用的工具，也不把普通工具 exit=0 当成整个任务成功。短卡片减少每次携带完整长技能的输入；真正使用时读取全文会增加一次工具往返及模型输入，不能保证每个任务都更快或总费用都更低。
-
-## 0.3 方法效果记录
-
-在普通任务中，由 DSH 主模型按需使用以下工具，不要求每次任务都写报告：
-
-1. `learning_trial`：执行前登记已接受的技能、具体成功标准、方法变化；返回完整技能，可替代一次 `learning_get`。
-2. 正常完成任务；插件观察本轮耗时、模型步骤、已返回结果的任务工具调用和工具错误。
-3. `learning_evidence` → `learning_result`：引用本轮用户/实际工具观察，报告 helped、neutral、harmed 或 uncertain。模型报告始终未审核。
-4. 用户用 `/learn inbox`、`/learn trials` 或 `/learn trial 试用ID` 查看证据，再用 `/learn assess 试用ID helped|neutral|harmed|uncertain 理由` 审核。
-
-同一项目、同目标且已结束的历史试用可作为 `baseline`；没有基线时仍可记录一次试用，但不能确认改进归因。注册过晚、同时使用多个方法、缺失来源或观察不完整时也不展示可归因的差值。相同目标字符串不证明任务和环境真的可比，需人工检查。
-
-`helped` 审核和原有 `feedback pass` 按会话合并去重；两次独立会话通过才激活，`harmed` 立即停用。neutral/uncertain 不算通过。排序只在词项覆盖相同的技能之间使用人工证据，不因单纯更快或模型自称有效而加分。
-
-指标仅代表**单轮观察**：耗时包含模型、工具及轮内等待时间，工具错误不等于返工次数，`completed` 不等于任务成功。跨轮任务总耗时、结果质量和因果关系尚不能自动测定。登记、取证和报告会消耗主模型的工具往返与输入输出，应选择值得复用的方法使用此流程；不会为对比而自动重复执行任务。
-
-## 可选：后台增量学习
-
-默认 `learning: false`：本地采集、检索、明确记忆命令和技能管理均可用，**没有后台模型请求**。在插件配置中显式设置 DSH 已注册的 provider 与 model 后开启。可选择更强模型改善提炼质量，也可选经济模型；不会隐式选择路由。
-
-示例：在当前 profile 的 `cordis.patch.yml` 中追加以下宿主 patch（如已有同 ID override，请合并 config）。该结构需与所安装 DSH 的 patch 格式对应：
+默认 `learning: false`、`evolution: false`，不会自行请求模型。后台记忆提炼和方法进化可以分别开启。在当前 profile 的 patch 中配置已注册的模型路由：
 
 ```yaml
 - id: dsh-soul
   config:
-    learning: true
-    provider: your-registered-provider
-    model: your-selected-model
-    learningMode: efficiency
+    evolution: true
+    evolutionProvider: your-registered-provider
+    evolutionModel: your-executor-model
+    evolutionEditorModel: your-editor-model
+    evolutionMaxRounds: 2
+    evolutionCandidates: 2
+    evolutionConcurrency: 2
 ```
 
-provider/model 必须是用户自己的 DSH 路由；不附带 API Key。`reasoningEffort` 可选，必须用适配器支持的值；当前 DeepSeek 宿主适配器使用 `off/low/high/max`，可将简单提炼设为 `off` 后测试质量。其他适配器不应直接套用该值。
+编辑模型和执行模型可以不同，但使用同一个 evolutionProvider；省略编辑模型时沿用执行模型。也可以由已有 provider/model 配置提供默认路由。不附带 API Key，不自动挑选供应商。
 
-触发条件是明确记忆/纠正类表达、工具失败和手动 `/learn review`。关键词只是排队信号，不是自动生效判断。它会把近期有限摘录交给学习模型；返回内容须引用本批证据、通过结构校验，然后保存为候选。普通对话不逐轮进行模型反思，也不整库重写。同一会话同一范围、尚未开始的作业在合并后不超过 24 条来源时合并；在途作业不修改。排队也会考虑最近 12 条常规消息之外尚未处理的纠正，仍受输入字节和队列上限约束。
+先在项目里生成示例：
 
-后台只在观察到的会话空闲且达到 idleMs 后启动，一次处理一个作业。任务忙时不启动新作业，已发出的作业允许在限时内结束。冷启动后可能无法知道所有已在运行的宿主任务，不能保证全局资源调度。
+```text
+/learn evolve example memory
+/learn evolve register .dsh-soul/evolution-memory.json
+/learn evolve run normalize-numbers
+/learn evolve status
+/learn evolve show 运行ID
+```
 
-预设参数如下，显式设置单个参数会覆盖预设。升级时保留旧的自定义数值就仍使用旧数值；此前开启学习但未覆盖这些参数的用户，升级后采用效率模式的较高额度。
+注册的是本项目的一类任务，不是对任意电脑操作的授权。**示例只演示配置，实际使用应替换为自己的代表性任务和验收条件。**方法本来就能正确且高效完成时，结果可以是 unchanged；并不要求每次都“进化成功”。
 
-| 参数 | efficiency（默认） | economy |
-| --- | ---: | ---: |
-| dailyCalls | 12 | 4 |
-| maxInputBytes | 18000 | 12000 |
-| maxOutputTokens | 1600 | 600 |
-| memoryBytes | 3600 | 2400 |
-| idleMs | 10000 | 30000 |
+套件设置 `auto: true` 后，同一轮正常任务出现至少两次非 Soul 工具错误、且用户任务关键词匹配时，会排队等宿主空闲后自动启动；每个套件有冷却时间。主模型也可通过 `learning_evolve` 启动已经注册的套件。注册、改验收条件和回退仍是用户命令。
 
-更大额度不等于主动用满，也不保证提速；它允许提炼更完整的条件、检查和反例。效率模式不强制模型型号，不在每个任务前展开多路执行。
+```text
+/learn evolve list
+/learn evolve cancel 运行ID
+/learn evolve rollback 套件ID
+/learn evolve unregister 套件ID
+```
 
-## 费用、延迟与边界
+取消、超时或失败保留原方法，不自动重试或断点续跑已付费请求。回退会停用当前方法，并在前版仍可用时恢复前版；没有前版则返回种子方法作为后续进化基线。
 
-- 默认每个 profile 每 UTC 日最多 12 个插件逻辑学习请求，额度跨重启持久化；失败、中断也占用一次。economy 为 4 次。
-- 不自动重试。超时或崩溃后用量可能未知，不自动重发，避免重复付费。
-- 日额度是本插件调用限制，**不是供应商 HTTP 尝试数或人民币硬上限**。宿主/provider 中间件自身的重试需另外配置与计费。
-- 单请求证据默认最多 18000 UTF-8 字节，输出上限 1600 token。输入字节数不是精确 token 数；系统提示与请求封装另计。
-- 动态记忆区块默认最多 3600 字节，完整卡片放不下时跳过，不产生半截 JSON。普通长记忆仅提供最多 500 字节预览，并标记需取全文。
-- 使用中文二元词及英文关键词搜索，无嵌入 API；同义改写检索能力有限，不提供向量检索。
-- 最多缓存 128 个范围/原查询/字节上限组合；增添、接受、修订、反馈、删除均通过数据库版本标记失效，其他连接的变更也可见。命中缓存只节省本地检索时间，主模型仍需阅读返回资料。
-- `/learn status` 返回配置、原始 usage、当日已报告用量汇总、未知用量请求数、当前项目最近 10 个作业结果，以及缓存命中/未命中和合并次数。input/cacheRead/cacheWrite 分列，reasoning 只是输出内部统计，不能再叠加到 output 计费；可选字段没有报告时，汇总只表示已报告部分。状态不覆盖主对话总费用，也不自动换算货币。
-- 失败原因使用固定代码：`timeout`、`interrupted`、`truncated`、`invalid_candidates`、`provider_failure`、`output_too_large`；不把供应商错误正文或无效模型输出写进诊断。`recentJobs` 中的 `source_changed` 表示证据已删除或修订。
-- 检索计数先缓存在进程内，在查看状态、空闲维护或正常卸载时落盘，避免每次拼提示词写库；崩溃可能损失未刷新统计，但已预留的学习额度独立持久化。
-- 稳定偏好也占主模型输入，每次请求可能再计费。本地存储免费不等于模型阅读记忆免费。
+## 两种执行器
 
-本地捕获只读取正文和有界错误摘要，不读取 reasoning 内容。登记方法试用期间还会保留有界的工具成功输出摘录；单轮已关联来源达到 12 条后停止新增成功输出，错误摘要仍按原规则捕获。运行指标不保存工具参数。常见凭据格式在落盘前脱敏，但模式匹配不能保证识别所有秘密；敏感内容不要交给自动学习。开启远程学习模型后，选中的摘录会经 DSH 发往该模型；不能称为全程离线。
+**memory**：每个执行实例只操作自己的内存文件，支持 read/write/finish。适用于信息提取、JSON/文本转换、格式整理、受约束的文件生成等。用 equals、jsonEquals、contains 检查实际答案或文件。没有 shell、网络、真实文件系统或宿主工具入口。
 
-## 数据、删除与可靠性
+**javascript**：模型生成 `solution.mjs`，默认导出接受一个 JSON 输入的函数；插件在独立容器中实际调用，再在容器外比较返回值。固定答案不进入容器。需要配置：
 
-默认数据路径：`~/.dsh/dsh-learning/<profile>/memory.sqlite`，为兼容更名前的数据特意保留 `dsh-learning` 目录名，尊重 `DSH_HOME`。安装目录位于 profiles 下时自动识别 profile；直接从源码加载时默认为 development，也可显式配置 profile/database。指定同一个 database 会共享存储，勿用于需要隔离的 profile。
+```yaml
+    evolutionDockerImage: node:24-alpine
+    evolutionSandboxTimeoutMs: 10000
+```
 
-升级时先正常退出使用该库的 DSH，备份数据库，再安装 0.3。首次加载在事务内将 schema 1/2 升为 3，保留记忆、来源、反馈、遗忘指纹和已用额度；不进行模型重提炼。0.1/0.2.x 无法打开升级后的库，回退应恢复升级前备份；不应让两个插件版本同时写同一库。已用实际发布的 0.1.0 与 0.2.1 TGZ 验证迁移。
+由用户先准备镜像，例如 `docker pull node:24-alpine`；插件本身不拉取镜像。镜像在运行前解析为不可变 ID。容器无网络、宿主凭据和宿主工作目录挂载，只有只读的临时试验文件；有 CPU、内存、进程数、输出及运行时间限制。正常完成和取消都等待清理。容器隔离不是内核漏洞防护的绝对保证；异常断电后的残留资源需检查。
 
-每条记忆保留来源、范围、状态和版本。原文属于数据，不拥有修改身份或权限的权力；用户当前要求优先。模型工具可以读取资料、提交候选、登记使用和报告观察，激活/修订/删除及效果审核由 `/learn` 人类命令执行。
+使用 `/learn evolve example javascript` 创建代码套件，注册后运行 `normalize-js`。当前代码执行接口仅支持 JSON 输入/输出的 JavaScript 函数；不执行任意项目 shell 命令，不自动覆盖用户真实项目文件。
 
-遗忘会删除记录、搜索条目、引用摘录及依赖或共享来源的记忆，并阻止相同来源事件和相同文字指纹被自动重新学习。用户可以通过新的明确 remember/prefer 命令重新记住同一事实，旧来源仍受抑制。为了稳妥，部分共享证据的关联记忆也会一起删除；后台在途结果检查版本变化，不能将已删除来源写回。
+详细套件格式、状态、停止条件和验证边界见 [进化设计与使用](docs/EVOLUTION-0.5.md)。
 
-删除不能清除宿主原聊天记录、已经发送给 API 的内容或已在当前模型历史中的副本；需要时新建会话并按宿主方式删除历史。此版本也不保证识别来自全新来源的同义重述。SQLite secure_delete 已开启，但不承诺对磁盘备份、WAL 和文件系统快照进行取证级擦除。
+## 效率与用量
 
-未引用对话摘录默认 30 天保留、约 10000 条上限；已被记忆或试用报告引用的来源保留。维护在空闲时运行，因此不是即时磁盘硬上限。未完成队列最多 32 个，过期作业不重发；有效与候选记忆合计上限 10000，达到后需整理。完成作业与调用明细保留 30 天。运行记录与方法试用各有 10000 条上限；未被试用引用的运行保留 30 天，引用记录随技能遗忘清理。单轮最多 4 个方法、4096 个去重事件；溢出、中断、重启丢失时段和缺失工具结果均不能视为完整观察。遗忘抑制指纹不含原文，长期保留用于防复活。
+默认进化参数：
 
-## 验证
+| 配置 | 默认值 |
+| --- | ---: |
+| evolutionMaxRounds | 2 |
+| evolutionCandidates | 2 |
+| evolutionConcurrency | 2 |
+| evolutionMaxSteps | 每个用例 6 次模型请求 |
+| evolutionMaxCalls | 每次进化 160 次逻辑请求上限 |
+| evolutionDailyCalls | 每 profile 每 UTC 日 400 次 |
+| evolutionMaxTokens | 每次请求最多 2400 输出 token |
+| evolutionTimeoutMs | 整次进化 180000 ms |
+| evolutionRequestTimeoutMs | 单请求 60000 ms |
+| evolutionCooldownMs | 自动触发同套件间隔 3600000 ms |
 
-```powershell
-npm test
-npm run eval
+这些都是上限，不是目标调用量。实际开销由用例数、步骤数、候选数和轮数共同决定；成功完整运行可能需要几十次模型调用。并发缩短部分等待时间，不减少总请求。进化期间不启动新的后台记忆提炼作业，已经发出的请求允许在限时内结束。
+
+`/learn evolve status` 查看阶段与已预留调用；`show` 查看逐请求 usage 和执行记录。额度跨重启持久化，失败和取消也占额度；宿主/provider 自身重试可能产生更多 HTTP 尝试，故它不是人民币硬预算。模型 usage 未报告就保留未知，不按零花费处理。
+
+选择依据是通过验收与减少必要工作步骤，**尚未建立真实模型上的净提速或总费用下降结论**。强模型可能减少试错，也可能更慢，需要按任务评测。
+
+## 原有记忆和人工技能仍可用
+
+```text
+/learn prefer --profile 先给结论，再解释细节
+/learn remember 当前项目使用 Node 24
+/learn search 关键词
+/learn inbox
+/learn show 记忆ID
+/learn accept 记忆ID
+/learn revise 记忆ID 新内容
+/learn forget 记忆ID
+/learn feedback 技能ID pass|fail 说明
+/learn trials
+/learn trial 试用ID
+/learn assess 试用ID helped|neutral|harmed|uncertain 理由
+/learn status
+```
+
+偏好/事实按规范化 cwd 隔离；无 cwd 时按会话隔离，profile 偏好只在当前 profile 共享。普通技能须接受并经过两个不同会话的人工通过反馈才激活；自动套件验证另有明确来源标记，不冒充人工认可。
+
+`learning_trial` 可以登记正常任务的方法使用并返回完整技能，`learning_evidence`、`learning_result` 用于记录来源与观察。这套人工试用记录与自动进化试验分开，正常任务的工具 exit=0 或 completed 都不是成功证明。
+
+普通记忆使用中文二元词/英文关键词检索，无嵌入 API；128 条检索缓存跨连接失效。上下文默认最多 3600 字节，长技能按需取全文。词面匹配可能漏掉同义表达，模型读取记忆仍消耗 token。
+
+可另行设置 `learning: true` 和明确的 provider/model 开启增量记忆提炼：efficiency 默认每日 12 次、输入 18000 字节、输出 1600 token、空闲 10 秒；economy 为 4 次、12000 字节、600 token、空闲 30 秒。显式数值覆盖预设。这些额度与进化额度分别统计。
+
+## 数据和限制
+
+修订/遗忘会传播到依赖记忆和试验记录；在途结果不能复活已删除来源。注销进化套件会移除注册内容、其技能和试验正文，保留不含正文的额度记录；不会删除用户原始套件文件或宿主聊天记录。
+
+记录不含模型 reasoning；常见凭据格式会脱敏，但不能保证识别所有秘密。**套件文件会存入本地库，模型需要的任务文本和虚拟文件内容会发送到所配置的模型。**不要把秘密或真实账号操作放入试验用例。
+
+每项目最多 20 个套件，套件最多 12 个用例、256 KB；运行记录上限 10000。无技能引用的完成进化记录保留 30 天，已采用版本保留其验证证据；调用明细保留 30 天。不会自动改变用户偏好、模型权重、权限或插件核心源码。
+
+## 验证与参考
+
+```text
+npm run check
+npm run demo:evolution
 npm run bench
-npm run bench:experience
 npm pack --dry-run
 ```
 
-测试涵盖中文检索、范围隔离、候选状态、技能反馈、删除与修订传播、在途删除、额度并发与重启、超时与关闭、来源伪造、隐藏思维隔离，以及真实 DSH SessionStore/CommandRuntime/SystemPrompt、ToolRuntime、LlmRuntime 和兼容检查器。LLM 测试使用真实宿主服务与本地确定性适配器，不请求付费 API。
+demo 使用本地确定性模型替身，但执行的虚拟文件读写、比较、组合复测与自动采用都是生产代码；它验证流程，不证明真实模型质量。测试覆盖两版真实 DSH 服务。CI 额外使用真实 Docker 运行代码、检查网络/写入限制、超时清理，并跑完整代码进化流程。
 
-设置 `DSH_TEST_PACKAGE` 可指向另一位置的宿主 package.json，`DSH_TEST_VERSION` 可断言版本；显式指定的宿主缺失时测试失败，不能静默跳过。默认未安装宿主时集成测试明确跳过。CI 额外安装两个已支持宿主，在 Windows/Linux 上运行包含宿主集成的完整检查。详见 `docs/COMPATIBILITY-0.2.1.md`。
-
-性能脚本创建独立临时 SQLite 库，用 10000 条合成记录测检索 p50/p95，分别报告插件缓存未命中和预热后的命中；未清空操作系统及 SQLite 缓存。`npm run eval` 是 11 个手工编写的用户历史检索场景，包括项目隔离、偏好确认、修订、遗忘和长技能生命周期；不是公开独立测试集，不衡量主模型是否真正完成任务。真实 API 语义质量、总费用与跨设备性能仍需后续评测。
-
-## 设计依据
-
-借鉴 Reflexion 的反馈学习、ACE 的增量经验维护、Mem0 的选择性记忆和 Sleep-time Compute 的异步复用思想。0.3 还参考 Google Research 的 [Harness²](https://github.com/google-research/harness2)（[论文](https://arxiv.org/abs/2610.14224)），将方法、执行证据、对比和可复用经验分开记录。本实现独立编写，没有复制这些项目源码，也不声称复现其论文指标。
-
-Soul 0.3 是证据闭环的基础：使用正常任务中的观察，不实现 Harness² 的完整递归 Propose–Probe–Compose，不自动重复执行任务或修改运行框架。详细设计与边界见 `docs/EFFICIENCY-0.3.md`，本版验证见 `docs/VALIDATION-0.3.md`。
-
-暂未实现：向量检索、图形记忆面板、全自动技能测试/执行、模型微调、自主源码修改、人民币硬预算、自动修改身份与目标。
+参考 Google Research [Harness²](https://github.com/google-research/harness2) 与 [论文](https://arxiv.org/abs/2610.14224) 的任务内 Propose–Probe–Compose 和跨任务经验复用。0.5 独立实现了受限执行器上的递归循环，没有复制上游代码，也没有移植其全部运行框架编辑面、执行后端或评测结果。与上游开放任务方案不同，本版自动采用依赖用户固定验收条件。

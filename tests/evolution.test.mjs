@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Store } from '../src/store.js'
@@ -51,6 +51,26 @@ test('training improvement cannot be adopted when held-out cases fail', async t 
   assert.equal(run.state, 'rejected'); assert.equal(run.reason, 'validation_failed')
   assert.equal(run.summary.selected.passed, 2); assert.equal(run.memory, null)
   assert.equal(f.e.current('p', 'numbers'), undefined)
+})
+
+test('a second recursive round uses the first winner and can improve it again', async t => {
+  const f = setup(t), original = f.e.generate
+  let round = 0
+  f.e.generate = async request => {
+    if (request.phase === 'propose') {
+      round++
+      if (round === 2) {
+        assert.deepEqual(request.data.baseline.strategy.steps, ['numeric'])
+        return { candidates: [method('numeric unique'), method('numeric unique alternative')] }
+      }
+    }
+    if (request.phase === 'compose' && round === 1) return { strategy: method('baseline'), lesson: { cue: '数字数组', lesson: '第一轮只改善部分场景，继续检查去重', evidence: request.data.candidates.map(c => c.label) } }
+    return original(request)
+  }
+  const run = await f.run()
+  assert.equal(run.state, 'adopted')
+  assert.equal(run.round, 2)
+  assert(run.probes.some(p => p.label === 'r2-composed' && p.results.every(r => r.pass)))
 })
 
 test('composition regressions are actually probed and do not replace a better candidate', async t => {
@@ -193,4 +213,44 @@ test('JavaScript without a configured sandbox fails before reserving any model r
   f.e.register('p', contract); const result = await f.run()
   assert.equal(result.reason, 'sandbox_unavailable')
   assert.equal(f.s.db.prepare('SELECT COUNT(*) AS n FROM evo_calls').get().n, 0)
+})
+
+test('bundled examples copy without overwriting and register for the current project', async t => {
+  const f = setup(t), folder = mkdtempSync(join(tmpdir(), 'soul-example-')), session = { id: 'user', header: { cwd: folder } }
+  t.after(() => rmSync(folder, { recursive: true, force: true }))
+  for (const runtime of ['memory', 'javascript']) {
+    const example = await f.e.command(`example ${runtime}`, session, 'project')
+    const original = readFileSync(example.path, 'utf8')
+    const registered = await f.e.command(`register "${example.path}"`, session, 'project')
+    assert.equal(registered.train, 2); assert.equal(registered.validation, 2)
+    await assert.rejects(f.e.command(`example ${runtime}`, session, 'project'), { code: 'EEXIST' })
+    assert.equal(readFileSync(example.path, 'utf8'), original)
+  }
+  assert.equal(f.e.list('project').length, 2)
+  assert.equal(f.e.list('unrelated').length, 0)
+})
+
+test('rollback restores the previous verified version after an efficiency improvement', async t => {
+  const f = setup(t), first = await f.run(), original = f.e.generate
+  f.e.generate = async request => {
+    if (request.phase === 'propose') return { candidates: [method('numeric unique efficient'), method('numeric unique efficient alternative')] }
+    if (request.phase === 'compose') return { strategy: method('numeric unique efficient composed'), lesson: {
+      cue: '数字数组', lesson: '省略多余的中间文件写入', evidence: request.data.candidates.map(c => c.label),
+    } }
+    if (!request.data.strategy.steps.join(' ').includes('efficient') && !request.data.observations.length) {
+      return { actions: [{ type: 'write', path: 'scratch.txt', text: 'redundant' }] }
+    }
+    return original(request)
+  }
+  const second = await f.run()
+  assert.equal(second.state, 'adopted', JSON.stringify(second))
+  assert.notEqual(second.memory, first.memory)
+  assert.equal(f.s.get(first.memory, 'p').status, 'deprecated')
+  assert.equal(f.e.current('p', 'numbers').parent, first.memory)
+  const reverted = f.e.rollback('p', 'numbers')
+  assert.equal(reverted.current, first.memory)
+  assert.equal(f.s.get(first.memory, 'p').status, 'active')
+  assert.equal(f.s.get(second.memory, 'p').status, 'deprecated')
+  assert(f.s.recall('p', '数字数组', 6000).includes('fixed_suite'))
+  assert.equal(f.s.recall('elsewhere', '数字数组'), '')
 })

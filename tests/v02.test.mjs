@@ -156,7 +156,7 @@ test('schema v1 upgrade preserves memories, evidence, tombstones and spent budge
     s.db.exec(`DROP TRIGGER memory_insert_revision; DROP TRIGGER memory_update_revision;
       DROP TRIGGER memory_delete_revision; DELETE FROM meta WHERE key='retrieval_revision'; PRAGMA user_version=1;`)
     s.close(); s = new Store(path)
-    assert.equal(s.db.prepare('PRAGMA user_version').get().user_version, 2)
+    assert.equal(s.db.prepare('PRAGMA user_version').get().user_version, 3)
     assert.equal(s.get(key, 'p').text, '先给结论'); assert(s.event(evidence))
     assert.deepEqual(s.db.prepare('SELECT * FROM tombstones ORDER BY key').all(), tombstones)
     assert.equal(s.stats('p').callsToday.length, 1)

@@ -13,19 +13,22 @@ export function settings(input = {}) {
   const profile = input.profile ?? profileMatch?.[1] ?? 'development'
   if (!/^[a-zA-Z0-9_-]{1,80}$/.test(profile)) throw new Error('profile 标识无效')
   for (const key of ['enabled', 'learning']) if (input[key] !== undefined && typeof input[key] !== 'boolean') throw new Error(`${key} 必须是布尔值`)
+  const learningMode = input.learningMode ?? 'efficiency'
+  if (!['efficiency', 'economy'].includes(learningMode)) throw new Error('learningMode 必须是 efficiency 或 economy')
+  const efficient = learningMode === 'efficiency'
   const config = {
-    enabled: input.enabled ?? true, learning: input.learning ?? false, profile,
+    enabled: input.enabled ?? true, learning: input.learning ?? false, profile, learningMode,
     // Keep the pre-rename namespace so existing memories and daily budgets survive.
     database: input.database ?? join(process.env.DSH_HOME?.trim() || join(homedir(), '.dsh'), 'dsh-learning', profile, 'memory.sqlite'),
     provider: input.provider ?? '', model: input.model ?? '', reasoningEffort: input.reasoningEffort ?? '',
-    dailyCalls: integer(input.dailyCalls, 4, 0, 100),
-    maxInputBytes: integer(input.maxInputBytes, 12000, 2000, 32000),
-    maxOutputTokens: integer(input.maxOutputTokens, 600, 200, 2000),
-    memoryBytes: integer(input.memoryBytes, 2400, 500, 6000),
-    idleMs: integer(input.idleMs, 30000, 1000, 3600000),
+    dailyCalls: integer(input.dailyCalls, efficient ? 12 : 4, 0, 100),
+    maxInputBytes: integer(input.maxInputBytes, efficient ? 18000 : 12000, 2000, 32000),
+    maxOutputTokens: integer(input.maxOutputTokens, efficient ? 1600 : 600, 200, 4000),
+    memoryBytes: integer(input.memoryBytes, efficient ? 3600 : 2400, 500, 6000),
+    idleMs: integer(input.idleMs, efficient ? 10000 : 30000, 1000, 3600000),
     timeoutMs: integer(input.timeoutMs, 60000, 100, 120000),
   }
-  if (config.learning && (!config.provider || !config.model)) throw new Error('后台学习需要明确设置 provider 和 model；不会偷偷沿用昂贵主模型')
+  if (config.learning && (!config.provider || !config.model)) throw new Error('后台学习需要明确设置 provider 和 model；可选择适合任务的强模型或经济模型')
   return config
 }
 
@@ -42,6 +45,9 @@ const HELP = `DSH Soul 成长记忆（这些命令不调用模型）
 /learn forget ID                           删除及关联派生记录
 /learn skill {"title":"...","preconditions":["..."],"steps":["..."],"checks":["..."],"counterexamples":[]}
 /learn feedback ID pass|fail 使用结果说明    当前会话作为一次独立试用；2个会话通过才激活，失败即停用
+/learn trials [技能ID]                     查看最近方法使用与观察指标
+/learn trial 试用ID                        查看前后差异、证据和归因限制
+/learn assess 试用ID helped|neutral|harmed|uncertain 审核理由
 /learn review                              将近期证据排入学习队列（按配置后台处理）
 /learn status                              查看预算、待处理及调用 usage
 候选不会自动变成你的偏好。后台学习需在 bundle 中配置 learning/provider/model。`
@@ -54,6 +60,16 @@ export function command(store, raw, session) {
   if (verb === 'help') return HELP
   if (verb === 'status') return JSON.stringify(store.stats(scope), null, 2)
   if (verb === 'inbox') return JSON.stringify(store.inbox(scope), null, 2)
+  if (verb === 'trials') return JSON.stringify(store.experience.list(scope, text), null, 2)
+  if (verb === 'trial') {
+    const row = store.experience.get(text, scope)
+    if (!row) throw new Error('试用不存在或不属于当前项目')
+    return JSON.stringify(row, null, 2)
+  }
+  if (verb === 'assess') {
+    const [key, verdict] = rest
+    return JSON.stringify(store.experience.assess(key, scope, verdict, text.replace(/^\S+\s+\S+\s*/, '')), null, 2)
+  }
   if (verb === 'list') return JSON.stringify(store.search(scope, '', { status: text || 'active', limit: 20 }), null, 2)
   if (verb === 'search') return JSON.stringify(store.search(scope, text, { limit: 12 }), null, 2)
   if (verb === 'show') {
@@ -91,9 +107,12 @@ const output = { schema: { type: 'object', properties: { text: { type: 'string' 
   render: (_args, value) => [{ type: 'text', text: value.text }] }
 const str = description => ({ type: 'string', description })
 const tools = [
-  { name: 'learning_search', description: '查当前范围的有效记忆和相关试用技能卡片。partial 必须 learning_get 读全文及反例后使用；trial 未验证充分，只能作待检查方案。不存在时不编造。', properties: { query: str('关键词；中文可用') }, required: ['query'] },
+  { name: 'learning_search', description: '查当前范围的有效记忆和相关试用技能卡片。partial 必须用 learning_get 或 learning_trial 读全文及反例后使用；trial 未验证充分，只能作待检查方案。不存在时不编造。', properties: { query: str('关键词；中文可用') }, required: ['query'] },
   { name: 'learning_get', description: '按 ID 查看当前范围记忆及其来源，包含技能的条件、步骤、检查与反例。', properties: { id: str('记忆 ID') }, required: ['id'] },
-  { name: 'learning_propose', description: '提出有当前用户消息作为来源的记忆候选，不能自动激活、覆盖偏好或改变权限。告诉用户可用 /learn list candidate 检查。', properties: { kind: { type: 'string', enum: ['preference', 'fact', 'episode'] }, text: str('有范围、可纠正的简短内容') }, required: ['kind', 'text'] },
+  { name: 'learning_propose', description: '提出有来源的记忆或结构化技能候选，不激活、不覆盖偏好。技能只提炼实际证据，保留适用条件、检查及反例；不能把模型自评当成效果。用 /learn inbox 审核。', properties: { kind: { type: 'string', enum: ['preference', 'fact', 'episode', 'skill'] }, text: str('简短内容；skill 为含 title/preconditions/steps/checks/counterexamples 的 JSON 字符串'), sources: str('可选：learning_evidence 返回的当前会话来源 ID 的 JSON 数组；默认最近用户消息') }, required: ['kind', 'text'] },
+  { name: 'learning_trial', description: '采用已接受的技能前登记方法使用，返回完整技能。只登记，不执行额外任务。goal 为具体成功标准，change 为本次方法变化；有同目标的历史基线才传 baseline。优先复用有效方法，质量优先于速度。', properties: { id: str('技能 ID'), goal: str('本任务目标与成功标准'), change: str('本次采用或改变的方法'), baseline: str('可选：已经完成且同目标的试用 ID') }, required: ['id', 'goal', 'change'] },
+  { name: 'learning_evidence', description: '查看当前会话最近用户/工具观察及当前轮次指标，供候选或试用报告引用。工具未报错、运行结束不代表任务成功；不重复执行操作来制造证据。', properties: {}, required: [] },
+  { name: 'learning_result', description: '记录当前会话的技能使用报告，模型判断保持未审核。用 learning_evidence 的本轮来源，区分 helped/neutral/harmed/uncertain；缺基线或多项变更不能声称因果。不能激活技能。', properties: { id: str('试用 ID'), report: str('JSON：{"verdict":"helped|neutral|harmed|uncertain","note":"观察和限制","sourceIds":["本轮来源ID"]}') }, required: ['id', 'report'] },
 ]
 
 export function apply(ctx, input = {}) {
@@ -116,7 +135,7 @@ export function apply(ctx, input = {}) {
     lastActivity = Date.now()
     const priority = /以后|记住|纠正|不对|别再|下次|remember|from now on|correction/i.test(text) ? 2 : 0
     const key = store.capture({ eventId, session: String(session.id), scope: projectScope(session), role: 'user', text, priority })
-    if (key) lastHuman.set(String(session.id), key)
+    if (key) { lastHuman.set(String(session.id), key); store.experience.trackSource(String(session.id), projectScope(session), key) }
   }
   try {
     // Observe accepted user input before assembly; never mutate the admission decision.
@@ -134,11 +153,13 @@ export function apply(ctx, input = {}) {
     }))
     listen('agent/disposed', safe(({ agent }) => {
       const key = String(agent.session.id)
+      store.experience.interrupt(key)
       pending.delete(key); lastHuman.delete(key); active.delete(key)
     }))
     listen('session/event', safe((session, event) => {
       if (disposed || session.header?.origin === 'subagent') return
       const scope = projectScope(session), sid = String(session.id)
+      store.experience.observe(sid, scope, event.seq, event.type, event.data)
       if (event.type === 'user/message') rememberUser(session, event.data, event.seq)
       if (event.type === 'assistant/message' && !event.data.interrupted) {
         const text = textBlocks(event.data.message?.content)
@@ -146,8 +167,14 @@ export function apply(ctx, input = {}) {
       }
       if (event.type === 'tool/result') {
         const message = event.data.message
-        // Store a bounded error observation, not entire tool outputs or commands/secrets.
-        if (message?.isError) store.capture({ eventId: event.seq, session: sid, scope, role: 'tool', text: `工具失败：${textBlocks(message.content) || '未提供可读错误'}`, priority: 1 })
+        // Only retain bounded successful observations during a registered method trial.
+        // Soul's own tool results are not independent evidence of task success.
+        const toolName = store.experience.toolName(sid, scope, message?.toolCallId)
+        if (!toolName?.startsWith('learning_') && (message?.isError || (toolName && store.experience.wantsObservation(sid, scope)))) {
+          const key = store.capture({ eventId: event.seq, session: sid, scope, role: 'tool',
+            text: `工具观察（${message?.isError ? '错误' : '未报告工具错误，不等于任务成功'}）：${bounded(textBlocks(message?.content) || '无可读结果', 1600)}`, priority: message?.isError ? 1 : 0 })
+          store.experience.trackSource(sid, scope, key)
+        }
       }
       if (event.type === 'turn/end') { store.enqueue(sid, scope); lastActivity = Date.now() }
     }))
@@ -164,6 +191,7 @@ export function apply(ctx, input = {}) {
         if (!exec?.agent?.session) throw new Error('需要当前 DSH 会话')
         for (const key of definition.required) if (typeof args?.[key] !== 'string' || !args[key].trim()) throw new Error('缺少工具参数')
         if (Object.keys(args).some(key => !(key in definition.properties))) throw new Error('不支持的参数')
+        for (const key of Object.keys(args)) if (typeof args[key] !== 'string') throw new Error('工具参数必须是文字')
         const { session, scope } = describe(exec.agent)
         let value
         if (definition.name === 'learning_search') value = store.discover(scope, clean(args.query, 2000))
@@ -174,11 +202,21 @@ export function apply(ctx, input = {}) {
             return e ? { ...e, text: bounded(e.text, 1800) } : null
           }).filter(Boolean) } : { error: '记忆不存在或不属于当前范围' }
         }
+        else if (definition.name === 'learning_trial') value = store.experience.start({ memory: args.id, scope, session: String(session.id), goal: args.goal, change: args.change, baseline: args.baseline })
+        else if (definition.name === 'learning_evidence') value = store.experience.evidence(String(session.id), scope)
+        else if (definition.name === 'learning_result') value = store.experience.report(args.id, scope, String(session.id), args.report)
         else {
-          if (!['preference', 'fact', 'episode'].includes(args.kind)) throw new Error('候选类型无效')
+          if (!['preference', 'fact', 'episode', 'skill'].includes(args.kind)) throw new Error('候选类型无效')
           const source = lastHuman.get(String(session.id))
-          if (!source) throw new Error('没有当前用户消息作为依据')
-          value = { id: store.tx(() => store.add({ scope, kind: args.kind, text: args.text, sourceIds: [source] })), status: 'candidate' }
+          const sourceIds = args.sources ? JSON.parse(args.sources) : source ? [source] : []
+          if (!Array.isArray(sourceIds) || !sourceIds.length || sourceIds.length > 12) throw new Error('需要 1–12 条当前会话来源')
+          for (const key of sourceIds) {
+            const e = store.event(key)
+            if (!e || e.session !== String(session.id) || e.scope !== scope || !['user', 'tool'].includes(e.role)) throw new Error('来源必须是当前会话的用户表达或工具观察')
+          }
+          if (args.kind === 'preference' && !sourceIds.some(key => store.event(key).role === 'user')) throw new Error('偏好必须引用用户表达')
+          const key = store.tx(() => store.add({ scope, kind: args.kind, text: args.kind === 'skill' ? skillText(args.text) : args.text, sourceIds }))
+          value = { id: key, status: store.get(key, scope).status }
         }
         return { text: JSON.stringify(value) }
       },
@@ -188,7 +226,7 @@ export function apply(ctx, input = {}) {
         try {
           signal?.throwIfAborted()
           if (rawInput.trim() === 'status') return { kind: 'success', text: JSON.stringify({
-            learning: config.learning, provider: config.provider, model: config.model,
+            learning: config.learning, learningMode: config.learningMode, provider: config.provider, model: config.model,
             limits: { dailyCalls: config.dailyCalls, maxEvidenceBytes: config.maxInputBytes, maxOutputTokens: config.maxOutputTokens, memoryBytes: config.memoryBytes },
             ...store.stats(projectScope(agent.session)),
           }, null, 2) }

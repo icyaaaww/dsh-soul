@@ -125,7 +125,7 @@ test('real LLM runtime and tool pipeline preserve sourced learning, usage and ca
     const ids = await handle.learner.tick()
     assert.equal(ids.length, 1); assert.equal(requests, 1)
     assert.equal(request.provider, 'local-test'); assert.equal(request.model, 'deterministic-fixture')
-    assert.equal(request.maxTokens, 600); assert.deepEqual(request.tools, [])
+    assert.equal(request.maxTokens, 1600); assert.deepEqual(request.tools, [])
     const signal = new AbortController().signal
     const candidate = await tools.execute({ callId: 'get-candidate', name: 'learning_get', arguments: { id: ids[0] }, agent, signal })
     assert.equal(candidate.isError, false)
@@ -205,4 +205,73 @@ test('real host compatibility gate accepts the release and rejects untested vers
       assert(evaluatePluginCompatibility(pkg, {}, unsupported))
     }
   }
+})
+
+test('real host method trials capture independent tool evidence, compare and require human review', { skip: !existsSync(manifest) }, async () => {
+  const req = createRequire(resolve(manifest)), load = name => import(pathToFileURL(req.resolve(name)).href)
+  const { Context } = await load('@deepseek-ai/cordis')
+  const { SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt')
+  const { CommandRuntime } = await load('@deepseek-ai/dsh-commands')
+  const { SessionStore } = await load('@deepseek-ai/dsh-session')
+  const { ToolRuntime } = await load('@deepseek-ai/dsh-tools')
+  const { createUserMessage, createToolResultMessage } = await load('@deepseek-ai/dsh-llm')
+  const ctx = new Context(), sessions = new SessionStore(ctx)
+  new SystemPrompt(ctx, { includeHarnessIdentity: false, includeRuntimeContext: true })
+  const commands = new CommandRuntime(ctx), tools = new ToolRuntime(ctx)
+  const handle = apply(ctx, { database: ':memory:' }), signal = new AbortController().signal
+  const skill = { title: '先复现后修复', preconditions: ['已有失败用例'], steps: ['检查日志'], checks: ['原失败用例通过'], counterexamples: ['不可复现时先收集证据'] }
+  const invoke = async (session, name, args) => {
+    const result = await tools.execute({ callId: name, name, arguments: args, agent: { session }, signal })
+    assert.equal(result.isError, false, JSON.stringify(result))
+    return JSON.parse(result.content.find(block => block.type === 'text').text)
+  }
+  const command = async (session, text) => {
+    const result = (await commands.execute({ session }, `/learn ${text}`, [], signal)).result
+    assert.equal(result.kind, 'success', result.text); return result.text
+  }
+  const user = (session, text) => session.append('user/message', createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }), { surfaceOp: 'append' })
+  const result = (session, id, name, text) => {
+    session.append('tool/call', { turn: 1, step: 1, callId: id, name, arguments: '{}' })
+    session.append('tool/result', { turn: 1, step: 1, message: createToolResultMessage({ callId: id, content: [{ type: 'text', text }], isError: false }) }, { surfaceOp: 'append' })
+  }
+  try {
+    const first = sessions.create('method-base', { meta: { cwd: process.cwd() } })
+    const key = (await command(first, `skill ${JSON.stringify(skill)}`)).split('：')[1]
+    await command(first, `accept ${key}`)
+    const run = async (session, baseline) => {
+      session.append('turn/start', { turn: 1 }); user(session, '修复原失败用例并验证回归')
+      session.append('step/start', { turn: 1, step: 1 })
+      const registration = await invoke(session, 'learning_trial', { id: key, goal: '原失败用例及回归通过', change: '按日志定位配置错误', ...(baseline ? { baseline } : {}) })
+      assert.deepEqual(JSON.parse(registration.skill), skill)
+      result(session, 'self', 'learning_get', 'SENTINEL_SELF_TOOL')
+      result(session, 'test', 'test_runner', '原失败用例及 12 个回归用例通过')
+      const evidence = await invoke(session, 'learning_evidence', {})
+      assert(!JSON.stringify(evidence.sources).includes('SENTINEL_SELF_TOOL'))
+      const observed = evidence.sources.find(e => e.role === 'tool')
+      assert(observed.text.includes('12 个回归'))
+      const report = await invoke(session, 'learning_result', { id: registration.trial.id, report: JSON.stringify({ verdict: 'helped', note: '观察到通过；归因由人工核对', sourceIds: [observed.id] }) })
+      assert.equal(report.review, null)
+      session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+      const completed = JSON.parse(await command(session, `trial ${report.id}`))
+      assert.equal(completed.observed.complete, 1)
+      assert.equal(completed.observed.tool_calls, 1); assert.equal(completed.observed.steps, 1)
+      return { id: report.id, observed }
+    }
+    const base = await run(first)
+    const second = sessions.create('method-next', { meta: { cwd: process.cwd() } })
+    const next = await run(second, base.id)
+    const assessed = JSON.parse(await command(second, `assess ${next.id} helped 人工核实条件一致且结果质量合格`))
+    assert.equal(assessed.review, 'helped'); assert.equal(assessed.comparison.blockers.length, 0)
+    const full = await invoke(second, 'learning_get', { id: key })
+    assert.equal(full.performance.passedSessions, 1); assert.equal(full.status, 'trial')
+    const proposal = await invoke(second, 'learning_propose', { kind: 'skill', text: JSON.stringify({ ...skill, title: '改进的诊断方法' }), sources: JSON.stringify([next.observed.id]) })
+    assert.equal(proposal.status, 'candidate')
+    for (const args of [
+      { kind: 'skill', text: 'invalid skill', sources: JSON.stringify([next.observed.id]) },
+      { kind: 'skill', text: JSON.stringify(skill), sources: JSON.stringify([base.observed.id]) },
+    ]) assert.equal((await tools.execute({ callId: 'bad', name: 'learning_propose', arguments: args, agent: { session: second }, signal })).isError, true)
+    const status = JSON.parse(await command(second, 'status'))
+    assert.equal(status.metrics.find(m => m.key === 'contained_errors')?.value ?? 0, 0)
+    assert.equal(status.observations.turns, 2)
+  } finally { await handle.stop() }
 })

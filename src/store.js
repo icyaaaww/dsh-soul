@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { clean, day, hash, id, terms } from './util.js'
 import { card, MEMORY_HEADER } from './cards.js'
+import { Experience, EXPERIENCE_SCHEMA } from './experience.js'
 
 const kinds = new Set(['preference', 'fact', 'episode', 'skill'])
 const states = new Set(['candidate', 'trial', 'active', 'deprecated'])
@@ -16,7 +17,7 @@ export class Store {
     this.db = new DatabaseSync(path)
     this.db.exec(`PRAGMA busy_timeout=100; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;`)
     const version = this.db.prepare('PRAGMA user_version').get().user_version
-    if (version > 2) { this.db.close(); throw new Error('记忆库版本高于插件支持版本') }
+    if (version > 3) { this.db.close(); throw new Error('记忆库版本高于插件支持版本') }
     try { this.db.exec(`
       BEGIN IMMEDIATE;
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -55,12 +56,14 @@ export class Store {
         UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='retrieval_revision'; END;
       CREATE TRIGGER IF NOT EXISTS memory_delete_revision AFTER DELETE ON memories BEGIN
         UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='retrieval_revision'; END;
-      PRAGMA user_version=2;
+      ${EXPERIENCE_SCHEMA}
+      PRAGMA user_version=3;
       COMMIT;
     `) } catch (error) { this.db.close(); throw error }
     this.revisionQuery = this.db.prepare("SELECT value FROM meta WHERE key='retrieval_revision'")
+    this.experience = new Experience(this)
   }
-  close() { try { this.flushMetrics() } finally { this.cache.clear(); this.db.close() } }
+  close() { try { this.experience.interrupt(); this.flushMetrics() } finally { this.cache.clear(); this.db.close() } }
   tx(fn) {
     this.db.exec('BEGIN IMMEDIATE')
     try { const value = fn(); this.db.exec('COMMIT'); return value }
@@ -92,7 +95,8 @@ export class Store {
     const row = this.db.prepare("SELECT * FROM memories WHERE id=? AND (scope=? OR scope='profile')").get(key, scope)
     if (!row) return null
     return { ...row, sources: this.db.prepare('SELECT event FROM sources WHERE memory=?').all(key).map(x => x.event),
-      feedback: this.db.prepare('SELECT * FROM feedback WHERE memory=? ORDER BY created').all(key) }
+      feedback: this.db.prepare('SELECT * FROM feedback WHERE memory=? ORDER BY created').all(key),
+      ...(row.kind === 'skill' ? { performance: this.experience.summary(key), trials: this.experience.history(scope, key) } : {}) }
   }
   add({ scope, kind, text, sourceIds, origin = 'model', active = false, parentIds = [], supersedes = null }) {
     if (!kinds.has(kind) || !scope) throw new Error('记忆类型或范围无效')
@@ -107,6 +111,9 @@ export class Store {
       if (active && (origin !== 'human' || e.role !== 'command')) throw new Error('自动提取不能直接激活')
       if (origin === 'human' && e.role !== 'command') throw new Error('人工记忆必须来自明确命令')
     }
+    // A lesson derived from observed skill use remains dependent on that skill.
+    parentIds = [...new Set([...parentIds, ...sourceIds.flatMap(source => this.db.prepare(`
+      SELECT DISTINCT t.memory FROM trials t JOIN run_sources rs ON rs.run=t.run WHERE rs.event=?`).all(source).map(r => r.memory))])]
     for (const parent of parentIds) {
       const row = this.get(parent, scope)
       if (!row || row.status === 'deprecated') throw new Error('派生记忆的父来源无效')
@@ -146,10 +153,17 @@ export class Store {
       ORDER BY bm25(search),m.updated DESC,m.id LIMIT ?`).all(match, scope, status, limit)
   }
   discover(scope, query, { includeTrials = true, limit = 6 } = {}) {
-    const active = this.search(scope, query, { limit })
+    const active = this.experience.rank(this.search(scope, query, { limit: Math.min(30, limit * 3) }), query).slice(0, limit)
     const hasTrials = includeTrials && query.trim() && this.db.prepare("SELECT 1 FROM memories WHERE (scope=? OR scope='profile') AND status='trial' AND kind='skill' LIMIT 1").get(scope)
-    const trials = hasTrials ? this.search(scope, query, { status: 'trial', limit: 2 }).filter(r => r.kind === 'skill') : []
-    return [...active, ...trials].map(card)
+    const trials = hasTrials ? this.experience.rank(this.search(scope, query, { status: 'trial', limit: 6 }).filter(r => r.kind === 'skill'), query).slice(0, 2) : []
+    return [...active, ...trials].map(row => {
+      const item = card(row)
+      if (row.kind === 'skill') {
+        const p = this.experience.summary(row.id)
+        if (Object.values(p).some(Boolean)) item.evidence = p
+      }
+      return item
+    })
   }
   inbox(scope) {
     return ['candidate', 'trial'].map(status => ({ status,
@@ -157,7 +171,7 @@ export class Store {
       items: this.search(scope, '', { status, limit: 10 }).map(row => ({ ...card(row),
         evidence: this.db.prepare('SELECT e.role,e.text FROM sources s JOIN events e ON e.id=s.event WHERE s.memory=? ORDER BY e.created DESC LIMIT 1').all(row.id).map(e => ({ role: e.role, text: clean(e.text, 240) })),
         next: status === 'candidate' ? `/learn show ${row.id} → /learn accept ${row.id}` : `/learn feedback ${row.id} pass|fail 真实使用结果`,
-      })) }))
+      })) })).concat({ status: 'review', items: this.experience.inbox(scope) })
   }
   recall(scope, query, maxBytes = 2400) {
     const revision = this.revisionQuery.get().value
@@ -207,11 +221,8 @@ export class Store {
         throw new Error('先接受候选技能进入 trial；废弃技能需修订为新版本')
       this.db.prepare('INSERT INTO feedback VALUES (?,?,?,?,?) ON CONFLICT(memory,trial) DO UPDATE SET verdict=excluded.verdict,note=excluded.note,created=excluded.created')
         .run(key, clean(trial, 200), verdict, clean(note, 1000), this.now())
-      const results = this.db.prepare('SELECT verdict FROM feedback WHERE memory=?').all(key)
-      const status = results.some(x => x.verdict === 'fail') ? 'deprecated' : results.length >= 2 ? 'active' : 'trial'
-      this.db.prepare('UPDATE memories SET status=?,updated=? WHERE id=?').run(status, this.now(), key)
-      if (status === 'deprecated') this.db.prepare('INSERT OR IGNORE INTO tombstones VALUES (?,?)').run(`memory:${row.fingerprint}`, this.now())
-      return status
+      this.experience.recalculate(key)
+      return this.get(key, scope).status
     })
   }
   revise(key, scope, text, session) {
@@ -225,6 +236,7 @@ export class Store {
       for (const affected of this.dependents(key)) {
         this.db.prepare("UPDATE memories SET status='deprecated',updated=? WHERE id=?").run(this.now(), affected.id)
         this.db.prepare('INSERT OR IGNORE INTO tombstones VALUES (?,?)').run(`memory:${affected.fingerprint}`, this.now())
+        this.experience.invalidateMemory(affected.id)
       }
       this.suppressSources(key)
       this.bump()
@@ -233,6 +245,7 @@ export class Store {
   }
   suppressSources(key) {
     for (const { event } of this.db.prepare('SELECT event FROM sources WHERE memory=?').all(key)) {
+      this.experience.invalidateEvidence(event)
       this.db.prepare('INSERT OR IGNORE INTO tombstones VALUES (?,?)').run(`event:${event}`, this.now())
       this.db.prepare('DELETE FROM events WHERE id=?').run(event)
     }
@@ -242,6 +255,8 @@ export class Store {
       if (!this.get(key, scope)) throw new Error('记忆不存在或不属于当前范围')
       const rows = this.dependents(key)
       for (const row of rows) {
+        this.experience.invalidateMemory(row.id)
+        this.experience.forgetSources(row.id)
         this.db.prepare('INSERT OR IGNORE INTO tombstones VALUES (?,?)').run(`memory:${row.fingerprint}`, this.now())
         this.suppressSources(row.id)
         this.db.prepare('DELETE FROM search WHERE id=?').run(row.id)
@@ -260,12 +275,14 @@ export class Store {
   maintain() {
     this.flushMetrics()
     return this.tx(() => {
+      this.experience.maintain()
       const cutoff = this.now() - 30 * 86400000
       this.db.prepare("UPDATE jobs SET state='cancelled',outcome='expired' WHERE state='pending' AND created<?").run(cutoff)
       this.db.prepare("DELETE FROM jobs WHERE state NOT IN ('pending','running') AND created<?").run(cutoff)
       this.db.prepare('DELETE FROM calls WHERE created<?').run(cutoff)
       // Evidence used by memories is retained; unreferenced chat excerpts have a cap/TTL.
       this.db.prepare(`DELETE FROM events WHERE id NOT IN (SELECT event FROM sources)
+        AND id NOT IN (SELECT event FROM trial_sources)
         AND (created<? OR id IN (SELECT id FROM events ORDER BY created DESC,rowid DESC LIMIT -1 OFFSET 10000))
         AND id NOT IN (SELECT value FROM jobs,json_each(jobs.event_ids) WHERE jobs.state='running')`).run(cutoff)
       this.db.prepare('DELETE FROM queued_sources WHERE event NOT IN (SELECT id FROM events)').run()
@@ -361,6 +378,8 @@ export class Store {
       metrics: this.db.prepare('SELECT * FROM metrics').all(),
       recentJobs: this.db.prepare('SELECT state,outcome,created FROM jobs WHERE scope=? ORDER BY created DESC,rowid DESC LIMIT 10').all(scope),
       cache: { entries: this.cache.size, maxEntries: 128 },
+      observations: this.db.prepare('SELECT COUNT(*) AS turns,SUM(tool_errors) AS toolErrors FROM runs WHERE scope=?').get(scope),
+      methodReviews: this.db.prepare('SELECT review,COUNT(*) AS count FROM trials WHERE scope=? AND reported IS NOT NULL GROUP BY review').all(scope),
       budgetDay: 'UTC', epoch: this.epoch(),
     }
   }

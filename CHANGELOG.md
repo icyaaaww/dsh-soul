@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0 — 2026-10-26
+
+- Prioritize correct results, less rework and completion time. Default `learningMode: efficiency` permits 12 learning requests/day, 18000 input bytes, 1600 output tokens, 3600 memory bytes and a 10-second idle delay. `economy` preserves previous limits; explicit overrides win. Background learning remains off until configured, with an explicit provider/model of any suitable capacity.
+- Add `learning_trial`, `learning_evidence`, `learning_result`, `/learn trials`, `/learn trial` and `/learn assess`. Registration returns the complete skill, avoiding a separate fetch when using the trial workflow.
+- Observe turn wall time, steps, completed task tool calls and errors from real host events. Pair tool results by call ID, exclude Soul tools, deduplicate events and mark interrupted, incomplete or late observations. No tool arguments are stored.
+- Require same-scope/goal baselines, real run-linked evidence and human review for improvement credit. Unknown quality or lower time alone cannot promote skills. Two distinct sessions across human pass feedback and helpful assessments are needed; harmful feedback deprecates the skill.
+- Prefer human-supported skills within equal lexical relevance. Keep model reports separate from confirmed outcomes. Invalidate reports, dependent comparisons and cached cards when evidence is revised or forgotten.
+- Transactionally migrate schemas 1/2 to 3. Preserve memories, feedback, tombstones and spent budget; older plugins require a pre-upgrade backup to roll back.
+- Add real-host trial workflow tests, evidence/attribution regressions, released-artifact upgrade verification and an observation/skill retrieval benchmark. Both supported DSH versions remain explicitly listed.
+
+Inspired by Harness²'s evidence-supported refinement; this release does not implement recursive probe executions, automatic harness edits or model training. No end-to-end speedup or real-model quality gain has been established.
+
 ## 0.2.1 — 2026-10-24
 
 - Verify DSH 0.2.1-rc.2 and explicitly accept it alongside 0.2.0-rc.2 in `engines.dsh`. Soul 0.2.0 is still rejected by the newer host's manifest gate.

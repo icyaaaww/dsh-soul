@@ -230,9 +230,15 @@ export class Evolution {
         if (winner === current) { reason = 'no_improvement'; break }
         current = winner; lesson = nextLesson
         reason = round === this.config.rounds ? 'round_limit' : 'improved'
-        // Preserve a worst-case holdout allowance instead of consuming it on another round.
+        // A new round needs all candidate/composition probes plus the final baseline/winner holdout.
         const used = this.db.prepare('SELECT COUNT(*) AS n FROM evo_calls WHERE run=?').get(e.id).n
-        if (this.config.maxCalls - used < (2 * e.suite.cases.filter(c => c.split === 'validation').length + 2) * this.config.maxSteps + 2) { reason = 'validation_reserve'; break }
+        const dailyUsed = this.db.prepare('SELECT COUNT(*) AS n FROM evo_calls WHERE day=?').get(day(this.store.now())).n
+        const trainCount = e.suite.cases.filter(c => c.split === 'train').length
+        const validationCount = e.suite.cases.length - trainCount
+        const nextRoundAndValidation = ((this.config.candidates + 1) * trainCount + 2 * validationCount) * this.config.maxSteps + 2
+        if (round < this.config.rounds && Math.min(this.config.maxCalls - used, this.config.dailyCalls - dailyUsed) < nextRoundAndValidation) {
+          reason = 'validation_reserve'; break
+        }
       }
       summary = { baseline: score(baseline.results), selected: score(current.results), selectedLabel: current.label,
         lesson: lesson ? { ...lesson, status: 'model_interpretation' } : null }

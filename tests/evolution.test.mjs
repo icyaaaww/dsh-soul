@@ -116,6 +116,17 @@ test('call reservations are bounded despite concurrent probes and failure preser
   assert.equal(f.s.db.prepare('SELECT COUNT(*) AS n FROM evo_calls').get().n, 8)
 })
 
+test('a useful winner reaches holdout before another round could consume the run or daily allowance', async t => {
+  for (const limits of [{ evolutionMaxCalls: 60 }, { evolutionDailyCalls: 60 }]) {
+    const f = setup(t, {}, limits), run = await f.run()
+    assert.equal(run.state, 'adopted')
+    assert.equal(run.round, 1)
+    assert.equal(f.model.requests.filter(r => r.phase === 'propose').length, 1)
+    assert.equal(run.summary.validation.selected.passed, 2)
+    assert(f.model.requests.length < 60)
+  }
+})
+
 test('cancellation and timeout terminate local waiting without late adoption or automatic retries', async t => {
   const s = new Store(':memory:'); let started, resolveLate
   const admitted = new Promise(resolve => { started = resolve })

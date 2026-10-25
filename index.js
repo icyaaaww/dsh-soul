@@ -132,7 +132,7 @@ export function apply(ctx, input = {}) {
   const config = settings(input)
   if (!config.enabled) return
   const store = new Store(config.database)
-  const pending = new Map(), lastHuman = new Map(), active = new Set(), failures = new Map(), disposers = []
+  const pending = new Map(), lastHuman = new Map(), active = new Set(), failures = new Map(), autoQueue = new Map(), disposers = []
   let lastActivity = Date.now(), lastMaintenance = 0, disposed = false, timer
   const llm = config.learning || config.evolutionConfig.enabled ? (typeof ctx.get === 'function' ? ctx.get('llm') : ctx.llm) : null
   if ((config.learning || config.evolutionConfig.enabled) && !llm?.stream) { store.close(); throw new Error('学习/进化缺少 DSH llm 服务') }
@@ -194,7 +194,10 @@ export function apply(ctx, input = {}) {
       }
       if (event.type === 'turn/end') {
         store.enqueue(sid, scope); lastActivity = Date.now()
-        if ((failures.get(sid) ?? 0) >= 2 && config.evolutionConfig.enabled) evolution.automatic(scope, sid, pending.get(sid) ?? '')
+        if ((failures.get(sid) ?? 0) >= 2 && config.evolutionConfig.enabled) {
+          autoQueue.set(scope, { session: sid, query: pending.get(sid) ?? '' })
+          if (autoQueue.size > 16) autoQueue.delete(autoQueue.keys().next().value)
+        }
         failures.delete(sid)
       }
     }))
@@ -253,7 +256,9 @@ export function apply(ctx, input = {}) {
             limits: { dailyCalls: config.dailyCalls, maxEvidenceBytes: config.maxInputBytes, maxOutputTokens: config.maxOutputTokens, memoryBytes: config.memoryBytes },
             ...store.stats(projectScope(agent.session)),
           }, null, 2) }
-          return { kind: 'success', text: command(store, rawInput, agent.session) }
+          const result = command(store, rawInput, agent.session)
+          if (evolution.active && evolution.active.epoch !== store.epoch()) await evolution.cancel(evolution.active.scope, evolution.active.id)
+          return { kind: 'success', text: result }
         }
         catch (e) { return { kind: 'error', text: bounded(e.message, 500) } }
       },
@@ -261,12 +266,16 @@ export function apply(ctx, input = {}) {
     timer = setInterval(() => {
       if (disposed || active.size || Date.now() - lastActivity < config.idleMs) return
       if (Date.now() - lastMaintenance > 3600000) { safe(() => store.maintain())(); lastMaintenance = Date.now() }
+      if (!evolution.running && autoQueue.size) {
+        const [scope, job] = autoQueue.entries().next().value; autoQueue.delete(scope)
+        safe(() => evolution.automatic(scope, job.session, job.query))()
+      }
       if (config.learning && !evolution.running) learner.tick().catch(() => {})
     }, Math.min(5000, config.idleMs))
     timer.unref?.()
     const stop = async () => {
       if (disposed) return
-      disposed = true; clearInterval(timer)
+      disposed = true; clearInterval(timer); autoQueue.clear()
       for (const dispose of disposers.reverse()) if (typeof dispose === 'function') dispose()
       await Promise.all([learner.stop(), evolution.stop()]); store.close()
     }

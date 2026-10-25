@@ -24,7 +24,7 @@ function cli(args, { signal, input = '', timeoutMs = 15000, env = process.env } 
   })
 }
 
-const program = timeoutMs => `import {Worker} from 'node:worker_threads';let data='';for await(const chunk of process.stdin)data+=chunk;const input=JSON.parse(data);const worker=new Worker(\`const {parentPort,workerData}=require('node:worker_threads');import('/workspace/solution.mjs').then(m=>m.default(workerData)).then(value=>parentPort.postMessage(value)).catch(()=>process.exit(1));\`,{eval:true,workerData:input,resourceLimits:{maxOldGenerationSizeMb:32,stackSizeMb:4}});const timer=setTimeout(()=>process.exit(124),${timeoutMs});worker.once('message',value=>{process.stdout.write(JSON.stringify(value));clearTimeout(timer);process.exit(0)});worker.once('error',()=>process.exit(1));worker.once('exit',code=>{if(code)process.exit(code)});`
+const program = timeoutMs => `import {Worker} from 'node:worker_threads';let data='';for await(const chunk of process.stdin)data+=chunk;const input=JSON.parse(data);const worker=new Worker(\`const {parentPort,workerData}=require('node:worker_threads');import('/workspace/solution.mjs').then(m=>m.default(workerData)).then(value=>parentPort.postMessage(value)).catch(()=>process.exit(1));\`,{eval:true,execArgv:[],workerData:input,resourceLimits:{maxOldGenerationSizeMb:32,stackSizeMb:4}});const timer=setTimeout(()=>process.exit(124),${timeoutMs});worker.once('message',value=>{process.stdout.write(JSON.stringify(value));clearTimeout(timer);process.exit(0)});worker.once('error',()=>process.exit(1));worker.once('exit',code=>{if(code)process.exit(code)});`
 
 // No user/model-supplied command line, image, host mount or Docker option is accepted from a suite.
 // The configured local image is resolved to an immutable image ID before any model requests.
@@ -54,7 +54,7 @@ export async function executeJavaScript(prepared, { files, input, signal, timeou
       await mkdir(dirname(target), { recursive: true, mode: 0o755 }); await writeFile(target, content, { mode: 0o644 })
     }
     signal.throwIfAborted(); creationAttempted = true
-    const result = await cli([...prepared.args, 'create', '--name', container, '--label', 'dsh-soul=probe',
+    const result = await cli([...prepared.args, 'create', '--pull', 'never', '--name', container, '--label', 'dsh-soul=probe',
       '--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
       '--pids-limit', '64', '--memory', '128m', '--memory-swap', '128m', '--cpus', '1', '--user', '65534:65534',
       '--tmpfs', '/tmp:rw,noexec,nosuid,size=8m', '--mount', `type=bind,source=${folder},target=/workspace,readonly`,
@@ -64,7 +64,9 @@ export async function executeJavaScript(prepared, { files, input, signal, timeou
     created = true
     const execution = await cli([...prepared.args, 'start', '--attach', '--interactive', container],
       { signal, env: prepared.env, input: JSON.stringify(input), timeoutMs })
-    return { ok: execution.code === 0, output: execution.stdout, error: execution.code ? 'program_error' : null }
+    const inspected = await cli([...prepared.args, 'inspect', '--format', '{{.State.Running}} {{.State.ExitCode}} {{.State.OOMKilled}}', container], { signal, env: prepared.env })
+    const ok = execution.code === 0 && inspected.code === 0 && inspected.stdout.trim() === 'false 0 false'
+    return { ok, output: execution.stdout, error: ok ? null : 'program_error' }
   } catch (error) {
     if (signal.aborted) throw signal.reason
     if (created && ['sandbox_timeout', 'sandbox_output_limit'].includes(error.code)) return { ok: false, output: '', error: error.code }

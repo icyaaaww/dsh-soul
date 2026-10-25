@@ -38,6 +38,8 @@ test('full proposal/probe/composition/recursion/holdout loop executes independen
   assert.equal(second.state, 'unchanged')
   assert.equal(f.e.current('p', 'numbers').memory, run.memory)
   assert(f.model.requests.filter(r => r.phase === 'propose').at(-1).data.priorLesson)
+  f.s.feedback(run.memory, 'p', 'human-pass', 'pass', '实际使用通过')
+  assert.equal(f.s.get(run.memory, 'p').status, 'active')
   f.e.rollback('p', 'numbers')
   assert.equal(f.e.current('p', 'numbers'), undefined)
   assert.equal(f.s.recall('p', '数字数组'), '')
@@ -174,4 +176,21 @@ test('real stream wrapper uses separate editor route, excludes reasoning and rej
   const generate = evolutionGenerate(llm, config()), usages = []
   assert.deepEqual(await generate({ system: 'system', data: {}, phase: 'propose', signal: new AbortController().signal, onUsage: u => usages.push(u) }), { ok: true })
   assert.equal(requests[0].model, 'editor'); assert.deepEqual(requests[0].tools, []); assert.equal(usages.length, 1)
+  const truncated = evolutionGenerate({ async *stream() { yield { type: 'text-delta', text: '{"ok":true}' }; yield { type: 'finish', reason: { kind: 'max-tokens' } } } }, config())
+  await assert.rejects(truncated({ system: '', data: {}, phase: 'execute', signal: new AbortController().signal, onUsage() {} }), /truncated/)
+})
+
+test('negative human feedback immediately retires an automatically validated method', async t => {
+  const f = setup(t), run = await f.run()
+  f.s.feedback(run.memory, 'p', 'real-user', 'fail', '真实任务出现回归')
+  assert.equal(f.e.current('p', 'numbers'), undefined)
+  assert.equal(f.s.recall('p', '数字数组'), '')
+})
+
+test('JavaScript without a configured sandbox fails before reserving any model request', async t => {
+  const f = setup(t), contract = suite({ runtime: 'javascript' })
+  contract.cases.forEach(c => { c.invocation = JSON.parse(c.files['input.json']); c.checks = [{ target: 'execution', kind: 'jsonEquals', expected: c.checks[0].expected }] })
+  f.e.register('p', contract); const result = await f.run()
+  assert.equal(result.reason, 'sandbox_unavailable')
+  assert.equal(f.s.db.prepare('SELECT COUNT(*) AS n FROM evo_calls').get().n, 0)
 })

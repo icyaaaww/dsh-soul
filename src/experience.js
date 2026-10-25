@@ -201,7 +201,10 @@ export class Experience {
     const passes = this.db.prepare(`SELECT COUNT(*) AS n FROM (
       SELECT trial AS session FROM feedback WHERE memory=? AND verdict='pass'
       UNION SELECT session FROM trials WHERE memory=? AND review='helped')`).get(memory, memory).n
-    const status = failed ? 'deprecated' : passes >= 2 ? 'active' : 'trial'
+    const verified = this.db.prepare(`SELECT 1 FROM evo_versions v JOIN evo_suites s ON s.scope=v.scope AND s.id=v.suite
+      JOIN evo_runs r ON r.id=v.run WHERE v.memory=? AND v.state='current' AND s.hash=v.suite_hash
+      AND r.state='adopted' AND r.summary IS NOT NULL AND EXISTS(SELECT 1 FROM sources WHERE memory=v.memory)`).get(memory)
+    const status = failed ? 'deprecated' : passes >= 2 || verified ? 'active' : 'trial'
     this.db.prepare('UPDATE memories SET status=?,updated=? WHERE id=?').run(status, this.store.now(), memory)
     if (failed) this.db.prepare('INSERT OR IGNORE INTO tombstones VALUES (?,?)').run(`memory:${row.fingerprint}`, this.store.now())
   }

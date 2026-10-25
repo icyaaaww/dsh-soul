@@ -3,9 +3,10 @@ import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import { resolve, join } from 'node:path'
-import { existsSync, mkdtempSync, rmSync, readFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 const { apply, inject } = await import(process.env.DSH_SOUL_TEST_ENTRY || process.env.DSH_LEARNING_TEST_ENTRY || new URL('../index.js', import.meta.url).href)
+import { fixtureModel, suite } from './evolution-fixture.mjs'
 
 const manifest = process.env.DSH_TEST_PACKAGE || join(process.env.APPDATA || '', 'npm/node_modules/@deepseek-ai/dsh/package.json')
 if (process.env.DSH_TEST_PACKAGE && !existsSync(manifest)) throw new Error('Configured DSH test package is missing; refusing to skip host tests')
@@ -274,4 +275,52 @@ test('real host method trials capture independent tool evidence, compare and req
     assert.equal(status.metrics.find(m => m.key === 'contained_errors')?.value ?? 0, 0)
     assert.equal(status.observations.turns, 2)
   } finally { await handle.stop() }
+})
+
+test('real DSH routes run the full evolution pipeline, expose status and inject the verified method', { skip: !existsSync(manifest) }, async () => {
+  const req = createRequire(resolve(manifest)), load = name => import(pathToFileURL(req.resolve(name)).href)
+  const { Context } = await load('@deepseek-ai/cordis')
+  const { SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt')
+  const { CommandRuntime } = await load('@deepseek-ai/dsh-commands')
+  const { SessionStore } = await load('@deepseek-ai/dsh-session')
+  const { ToolRuntime } = await load('@deepseek-ai/dsh-tools')
+  const { LlmRuntime, LlmAdapter, createUserMessage } = await load('@deepseek-ai/dsh-llm')
+  const ctx = new Context(), sessions = new SessionStore(ctx)
+  const prompts = new SystemPrompt(ctx, { includeHarnessIdentity: false, includeRuntimeContext: true }), fixture = fixtureModel(), routes = []
+  const commands = new CommandRuntime(ctx), tools = new ToolRuntime(ctx), llm = new LlmRuntime(ctx)
+  class LocalAdapter extends LlmAdapter {
+    async *stream(options) {
+      routes.push(options.model)
+      const data = JSON.parse(options.messages[0].content[0].text)
+      const result = await fixture.generate({ phase: data.phase ?? 'execute', data })
+      yield { type: 'reasoning-delta', text: 'PRIVATE_REASONING' }
+      yield { type: 'text-delta', text: JSON.stringify(result) }
+      yield { type: 'usage', usage: { inputTokens: 100, outputTokens: 40 } }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    }
+  }
+  const unregister = llm.registerAdapter(['soul-evo-fixture'], new LocalAdapter())
+  const folder = mkdtempSync(join(tmpdir(), 'soul-evo-host-')), contract = join(folder, 'suite.json')
+  writeFileSync(contract, JSON.stringify(suite()))
+  const handle = apply(ctx, { database: ':memory:', evolution: true, evolutionProvider: 'soul-evo-fixture', evolutionModel: 'executor', evolutionEditorModel: 'editor' })
+  try {
+    const session = sessions.create('evolution-host', { meta: { cwd: folder } }), agent = { session }, signal = new AbortController().signal
+    const registered = await commands.execute(agent, `/learn evolve register ${contract}`, [], signal)
+    assert.equal(registered.result.kind, 'success', registered.result.text)
+    const start = await tools.execute({ callId: 'start', name: 'learning_evolve', arguments: { suite: 'numbers' }, agent, signal })
+    assert.equal(start.isError, false, JSON.stringify(start))
+    const runId = JSON.parse(start.content[0].text).id
+    await handle.evolution.running
+    const status = await tools.execute({ callId: 'status', name: 'learning_evolution_status', arguments: { id: runId }, agent, signal })
+    assert.equal(status.isError, false)
+    const run = JSON.parse(status.content[0].text).runs[0]
+    assert.equal(run.state, 'adopted', JSON.stringify(run))
+    assert(routes.includes('executor')); assert(routes.includes('editor'))
+    session.append('user/message', createUserMessage({ content: [{ type: 'text', text: '请规范化数字数组' }], source: { kind: 'user' } }), { surfaceOp: 'append' })
+    const assembly = await prompts.assemble({ agent, scope: agent })
+    assert(assembly.contexts.some(c => c.text.includes(run.memory) && c.text.includes('fixed_suite')))
+    assert(!JSON.stringify(handle.evolution.inspect(run.scope, run.id)).includes('PRIVATE_REASONING'))
+    const stats = JSON.parse((await commands.execute(agent, '/learn status', [], signal)).result.text)
+    assert.equal(stats.metrics.find(m => m.key === 'contained_errors')?.value ?? 0, 0)
+  } finally { await handle.stop(); unregister(); rmSync(folder, { recursive: true, force: true }) }
 })

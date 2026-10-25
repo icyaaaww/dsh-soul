@@ -4,6 +4,7 @@ import { dirname } from 'node:path'
 import { clean, day, hash, id, terms } from './util.js'
 import { card, MEMORY_HEADER } from './cards.js'
 import { Experience, EXPERIENCE_SCHEMA } from './experience.js'
+import { EVOLUTION_SCHEMA } from './evolution-schema.js'
 
 const kinds = new Set(['preference', 'fact', 'episode', 'skill'])
 const states = new Set(['candidate', 'trial', 'active', 'deprecated'])
@@ -17,7 +18,7 @@ export class Store {
     this.db = new DatabaseSync(path)
     this.db.exec(`PRAGMA busy_timeout=100; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;`)
     const version = this.db.prepare('PRAGMA user_version').get().user_version
-    if (version > 3) { this.db.close(); throw new Error('记忆库版本高于插件支持版本') }
+    if (version > 4) { this.db.close(); throw new Error('记忆库版本高于插件支持版本') }
     try { this.db.exec(`
       BEGIN IMMEDIATE;
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -57,7 +58,8 @@ export class Store {
       CREATE TRIGGER IF NOT EXISTS memory_delete_revision AFTER DELETE ON memories BEGIN
         UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='retrieval_revision'; END;
       ${EXPERIENCE_SCHEMA}
-      PRAGMA user_version=3;
+      ${EVOLUTION_SCHEMA}
+      PRAGMA user_version=4;
       COMMIT;
     `) } catch (error) { this.db.close(); throw error }
     this.revisionQuery = this.db.prepare("SELECT value FROM meta WHERE key='retrieval_revision'")
@@ -96,7 +98,8 @@ export class Store {
     if (!row) return null
     return { ...row, sources: this.db.prepare('SELECT event FROM sources WHERE memory=?').all(key).map(x => x.event),
       feedback: this.db.prepare('SELECT * FROM feedback WHERE memory=? ORDER BY created').all(key),
-      ...(row.kind === 'skill' ? { performance: this.experience.summary(key), trials: this.experience.history(scope, key) } : {}) }
+      ...(row.kind === 'skill' ? { performance: this.experience.summary(key), trials: this.experience.history(scope, key),
+        verification: this.db.prepare('SELECT suite,run,state FROM evo_versions WHERE memory=?').get(key) ?? null } : {}) }
   }
   add({ scope, kind, text, sourceIds, origin = 'model', active = false, parentIds = [], supersedes = null }) {
     if (!kinds.has(kind) || !scope) throw new Error('记忆类型或范围无效')
@@ -161,6 +164,8 @@ export class Store {
       if (row.kind === 'skill') {
         const p = this.experience.summary(row.id)
         if (Object.values(p).some(Boolean)) item.evidence = p
+        const verified = this.db.prepare('SELECT suite,run FROM evo_versions WHERE memory=? AND state=?').get(row.id, 'current')
+        if (verified) item.verification = { ...verified, kind: 'fixed_suite', note: '仅验证套件内任务，不是人工确认或普遍能力证明' }
       }
       return item
     })
@@ -255,6 +260,8 @@ export class Store {
       if (!this.get(key, scope)) throw new Error('记忆不存在或不属于当前范围')
       const rows = this.dependents(key)
       for (const row of rows) {
+        this.db.prepare('DELETE FROM evo_probes WHERE run IN (SELECT run FROM evo_dependencies WHERE memory=? UNION SELECT run FROM evo_versions WHERE memory=?)').run(row.id, row.id)
+        this.db.prepare('UPDATE evo_runs SET summary=NULL WHERE id IN (SELECT run FROM evo_dependencies WHERE memory=? UNION SELECT run FROM evo_versions WHERE memory=?)').run(row.id, row.id)
         this.experience.invalidateMemory(row.id)
         this.experience.forgetSources(row.id)
         this.db.prepare('INSERT OR IGNORE INTO tombstones VALUES (?,?)').run(`memory:${row.fingerprint}`, this.now())
@@ -280,6 +287,8 @@ export class Store {
       this.db.prepare("UPDATE jobs SET state='cancelled',outcome='expired' WHERE state='pending' AND created<?").run(cutoff)
       this.db.prepare("DELETE FROM jobs WHERE state NOT IN ('pending','running') AND created<?").run(cutoff)
       this.db.prepare('DELETE FROM calls WHERE created<?').run(cutoff)
+      this.db.prepare('DELETE FROM evo_calls WHERE created<?').run(cutoff)
+      this.db.prepare("DELETE FROM evo_runs WHERE created<? AND state!='running' AND id NOT IN (SELECT run FROM evo_versions)").run(cutoff)
       // Evidence used by memories is retained; unreferenced chat excerpts have a cap/TTL.
       this.db.prepare(`DELETE FROM events WHERE id NOT IN (SELECT event FROM sources)
         AND id NOT IN (SELECT event FROM trial_sources)

@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url'
 import { Store } from './src/store.js'
 import { Learner, hostGenerate, skillText } from './src/learner.js'
 import { bounded, clean, human, integer, projectScope, textBlocks } from './src/util.js'
+import { Evolution, evolutionSettings } from './src/evolution.js'
+import { evolutionGenerate } from './src/evolution-model.js'
 
 export const name = 'dsh-soul'
 export const inject = ['tools', 'systemPrompt', 'commands', 'llm']
@@ -27,12 +29,13 @@ export function settings(input = {}) {
     memoryBytes: integer(input.memoryBytes, efficient ? 3600 : 2400, 500, 6000),
     idleMs: integer(input.idleMs, efficient ? 10000 : 30000, 1000, 3600000),
     timeoutMs: integer(input.timeoutMs, 60000, 100, 120000),
+    evolutionConfig: evolutionSettings(input),
   }
   if (config.learning && (!config.provider || !config.model)) throw new Error('后台学习需要明确设置 provider 和 model；可选择适合任务的强模型或经济模型')
   return config
 }
 
-const HELP = `DSH Soul 成长记忆（这些命令不调用模型）
+const HELP = `DSH Soul 成长记忆（evolve run 会启动模型试验；其余管理命令不调用模型）
 /learn remember 记住的内容                 当前项目事实，立即生效
 /learn prefer 表达偏好                      当前项目偏好，立即生效
 /learn prefer --profile 长期表达偏好         同一 profile 通用偏好
@@ -50,6 +53,14 @@ const HELP = `DSH Soul 成长记忆（这些命令不调用模型）
 /learn assess 试用ID helped|neutral|harmed|uncertain 审核理由
 /learn review                              将近期证据排入学习队列（按配置后台处理）
 /learn status                              查看预算、待处理及调用 usage
+/learn evolve register 验证套件.json        注册当前项目固定任务及验收条件
+/learn evolve run 套件ID                    异步启动提出→试验→组合→验证→递归→采用
+/learn evolve list                         当前项目已授权验证套件
+/learn evolve status [运行ID]               阶段、额度与结果
+/learn evolve show 运行ID                   执行证据、策略与实际 usage
+/learn evolve cancel [运行ID]               停止当前进化任务
+/learn evolve rollback 套件ID               回退自动采用的方法
+/learn evolve unregister 套件ID             移除套件、进化技能及试验正文
 候选不会自动变成你的偏好。后台学习需在 bundle 中配置 learning/provider/model。`
 
 export function command(store, raw, session) {
@@ -113,17 +124,20 @@ const tools = [
   { name: 'learning_trial', description: '采用已接受的技能前登记方法使用，返回完整技能。只登记，不执行额外任务。goal 为具体成功标准，change 为本次方法变化；有同目标的历史基线才传 baseline。优先复用有效方法，质量优先于速度。', properties: { id: str('技能 ID'), goal: str('本任务目标与成功标准'), change: str('本次采用或改变的方法'), baseline: str('可选：已经完成且同目标的试用 ID') }, required: ['id', 'goal', 'change'] },
   { name: 'learning_evidence', description: '查看当前会话最近用户/工具观察及当前轮次指标，供候选或试用报告引用。工具未报错、运行结束不代表任务成功；不重复执行操作来制造证据。', properties: {}, required: [] },
   { name: 'learning_result', description: '记录当前会话的技能使用报告，模型判断保持未审核。用 learning_evidence 的本轮来源，区分 helped/neutral/harmed/uncertain；缺基线或多项变更不能声称因果。不能激活技能。', properties: { id: str('试用 ID'), report: str('JSON：{"verdict":"helped|neutral|harmed|uncertain","note":"观察和限制","sourceIds":["本轮来源ID"]}') }, required: ['id', 'report'] },
+  { name: 'learning_evolve', description: '对用户已注册的本项目验证套件启动真正的方法进化：独立执行候选、组合、回归验证后择优采用。重复失败或缺少可靠方法时使用；简单任务直接做。不修改验收规则或执行宿主命令。启动后用 learning_evolution_status 查询，不重复启动。', properties: { suite: str('已注册套件 ID') }, required: ['suite'] },
+  { name: 'learning_evolution_status', description: '查看本项目已授权的进化套件和最近执行状态；指定 id 时查看运行摘要。', properties: { id: str('可选：运行 ID') }, required: [] },
 ]
 
 export function apply(ctx, input = {}) {
   const config = settings(input)
   if (!config.enabled) return
   const store = new Store(config.database)
-  const pending = new Map(), lastHuman = new Map(), active = new Set(), disposers = []
+  const pending = new Map(), lastHuman = new Map(), active = new Set(), failures = new Map(), disposers = []
   let lastActivity = Date.now(), lastMaintenance = 0, disposed = false, timer
-  const llm = config.learning ? (typeof ctx.get === 'function' ? ctx.get('llm') : ctx.llm) : null
-  if (config.learning && !llm?.stream) { store.close(); throw new Error('后台学习缺少 DSH llm 服务') }
+  const llm = config.learning || config.evolutionConfig.enabled ? (typeof ctx.get === 'function' ? ctx.get('llm') : ctx.llm) : null
+  if ((config.learning || config.evolutionConfig.enabled) && !llm?.stream) { store.close(); throw new Error('学习/进化缺少 DSH llm 服务') }
   const learner = new Learner(store, config.learning ? hostGenerate(llm, config) : null, config)
+  const evolution = new Evolution(store, config.evolutionConfig.enabled ? evolutionGenerate(llm, config.evolutionConfig) : null, config.evolutionConfig)
   const safe = fn => (...args) => { try { return fn(...args) } catch { try { store.metric('contained_errors') } catch {} } }
   const listen = (event, handler) => disposers.push(ctx.on(event, handler))
   const describe = agent => ({ session: agent.session, scope: projectScope(agent.session) })
@@ -154,11 +168,12 @@ export function apply(ctx, input = {}) {
     listen('agent/disposed', safe(({ agent }) => {
       const key = String(agent.session.id)
       store.experience.interrupt(key)
-      pending.delete(key); lastHuman.delete(key); active.delete(key)
+      pending.delete(key); lastHuman.delete(key); active.delete(key); failures.delete(key)
     }))
     listen('session/event', safe((session, event) => {
       if (disposed || session.header?.origin === 'subagent') return
       const scope = projectScope(session), sid = String(session.id)
+      if (event.type === 'turn/start') failures.set(sid, 0)
       store.experience.observe(sid, scope, event.seq, event.type, event.data)
       if (event.type === 'user/message') rememberUser(session, event.data, event.seq)
       if (event.type === 'assistant/message' && !event.data.interrupted) {
@@ -170,13 +185,18 @@ export function apply(ctx, input = {}) {
         // Only retain bounded successful observations during a registered method trial.
         // Soul's own tool results are not independent evidence of task success.
         const toolName = store.experience.toolName(sid, scope, message?.toolCallId)
+        if (toolName && !toolName.startsWith('learning_') && message?.isError) failures.set(sid, (failures.get(sid) ?? 0) + 1)
         if (!toolName?.startsWith('learning_') && (message?.isError || (toolName && store.experience.wantsObservation(sid, scope)))) {
           const key = store.capture({ eventId: event.seq, session: sid, scope, role: 'tool',
             text: `工具观察（${message?.isError ? '错误' : '未报告工具错误，不等于任务成功'}）：${bounded(textBlocks(message?.content) || '无可读结果', 1600)}`, priority: message?.isError ? 1 : 0 })
           store.experience.trackSource(sid, scope, key)
         }
       }
-      if (event.type === 'turn/end') { store.enqueue(sid, scope); lastActivity = Date.now() }
+      if (event.type === 'turn/end') {
+        store.enqueue(sid, scope); lastActivity = Date.now()
+        if ((failures.get(sid) ?? 0) >= 2 && config.evolutionConfig.enabled) evolution.automatic(scope, sid, pending.get(sid) ?? '')
+        failures.delete(sid)
+      }
     }))
     disposers.push(ctx.systemPrompt.context({ name: 'dsh-soul:memory', order: 950, text: ({ agent }) => {
       if (!agent || disposed || agent.session.header?.origin === 'subagent') return ''
@@ -194,7 +214,9 @@ export function apply(ctx, input = {}) {
         for (const key of Object.keys(args)) if (typeof args[key] !== 'string') throw new Error('工具参数必须是文字')
         const { session, scope } = describe(exec.agent)
         let value
-        if (definition.name === 'learning_search') value = store.discover(scope, clean(args.query, 2000))
+        if (definition.name === 'learning_evolve') value = evolution.start(scope, args.suite, String(session.id))
+        else if (definition.name === 'learning_evolution_status') value = { suites: evolution.list(scope), runs: evolution.status(scope, args.id) }
+        else if (definition.name === 'learning_search') value = store.discover(scope, clean(args.query, 2000))
         else if (definition.name === 'learning_get') {
           const row = store.get(args.id, scope)
           value = row ? { ...row, evidence: row.sources.slice(0, 4).map(key => {
@@ -221,10 +243,11 @@ export function apply(ctx, input = {}) {
         return { text: JSON.stringify(value) }
       },
     }))
-    disposers.push(ctx.commands.register({ name: 'learn', description: '查看与管理成长记忆、技能和学习预算（不调用模型）', input: { hint: 'help / remember / prefer / search / status' }, recordInput: false,
-      handler: ({ agent, rawInput, signal }) => {
+    disposers.push(ctx.commands.register({ name: 'learn', description: '管理成长记忆、技能与进化任务（evolve run 会调用模型）', input: { hint: 'help / remember / prefer / search / status / evolve' }, recordInput: false,
+      handler: async ({ agent, rawInput, signal }) => {
         try {
           signal?.throwIfAborted()
+          if (/^evolve(?:\s|$)/.test(rawInput.trim())) return { kind: 'success', text: JSON.stringify(await evolution.command(rawInput.trim().slice(6), agent.session, projectScope(agent.session)), null, 2) }
           if (rawInput.trim() === 'status') return { kind: 'success', text: JSON.stringify({
             learning: config.learning, learningMode: config.learningMode, provider: config.provider, model: config.model,
             limits: { dailyCalls: config.dailyCalls, maxEvidenceBytes: config.maxInputBytes, maxOutputTokens: config.maxOutputTokens, memoryBytes: config.memoryBytes },
@@ -238,17 +261,17 @@ export function apply(ctx, input = {}) {
     timer = setInterval(() => {
       if (disposed || active.size || Date.now() - lastActivity < config.idleMs) return
       if (Date.now() - lastMaintenance > 3600000) { safe(() => store.maintain())(); lastMaintenance = Date.now() }
-      if (config.learning) learner.tick().catch(() => {})
+      if (config.learning && !evolution.running) learner.tick().catch(() => {})
     }, Math.min(5000, config.idleMs))
     timer.unref?.()
     const stop = async () => {
       if (disposed) return
       disposed = true; clearInterval(timer)
       for (const dispose of disposers.reverse()) if (typeof dispose === 'function') dispose()
-      await learner.stop(); store.close()
+      await Promise.all([learner.stop(), evolution.stop()]); store.close()
     }
     // Cordis accepts a disposer (not a plain diagnostic object) as startup result.
-    return Object.assign(stop, { store, learner, stop, config })
+    return Object.assign(stop, { store, learner, evolution, stop, config })
   } catch (e) {
     clearInterval(timer)
     for (const dispose of disposers.reverse()) if (typeof dispose === 'function') dispose()

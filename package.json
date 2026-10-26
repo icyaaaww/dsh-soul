@@ -1,7 +1,7 @@
 {
   "name": "dsh-soul",
-  "version": "0.8.0",
-  "description": "DSH memory, reviewed strategy experiments and real-host harness evolution with worktree probes",
+  "version": "0.8.1",
+  "description": "Standalone DSH harness evolution: observed divergence, worktree probes, trial adoption and rollback",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -20,7 +20,7 @@
   },
   "engines": {
     "node": ">=24",
-    "dsh": ">=0.2.0-rc.2 <0.3.0-0"
+    "dsh": ">=0.2.1-rc.2 <0.3.0-0"
   },
   "dsh": {
     "bundle": {
@@ -30,35 +30,23 @@
   "files": [
     "index.js",
     "src/*.js",
-    "src/harness-evolution/index.js",
-    "src/harness-evolution/src/*.js",
-    "src/harness-evolution/harness/**",
+    "harness/default/*.md",
     "locale/*.json",
-    "examples/*.json",
-    "docs/EVOLUTION-0.5.md",
     "cordis.patch.yml",
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
-    "docs/VALIDATION-0.5.1.md",
-    "docs/HARNESS-0.8.md",
-    "docs/VALIDATION-0.8.md"
+    "docs/*.md"
   ],
   "scripts": {
     "test": "node scripts/test.mjs",
-    "bench": "node scripts/bench.mjs",
-    "bench:experience": "node scripts/bench-experience.mjs",
-    "demo:evolution": "node scripts/demo-evolution.mjs",
-    "demo:harness": "node scripts/demo-harness.mjs",
-    "test:harness-host": "node scripts/test-harness-host.mjs",
-    "eval": "node scripts/eval.mjs",
-    "check": "node --check index.js && npm test && npm run eval && npm run test:upgrade",
-    "test:upgrade": "node scripts/check-upgrades.mjs"
+    "check": "node --check index.js && npm test",
+    "demo": "node scripts/demo.mjs",
+    "test:host": "node scripts/test-host.mjs"
   },
   "keywords": [
     "dsh-plugin",
     "deepseek-harness",
-    "memory",
-    "learning"
+    "evolution"
   ]
 }

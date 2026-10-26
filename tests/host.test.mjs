@@ -2,106 +2,81 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
-import { resolve, join } from 'node:path'
-import { existsSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, existsSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-const { apply, inject } = await import(process.env.DSH_SOUL_TEST_ENTRY || process.env.DSH_LEARNING_TEST_ENTRY || new URL('../index.js', import.meta.url).href)
-import { fixtureModel, suite } from './evolution-fixture.mjs'
+import { join, resolve } from 'node:path'
+import { execFileSync } from 'node:child_process'
+import { createHostRunner } from '../src/host-runner.js'
+import { hostProbe } from '../src/host-probe.js'
+import { readDefaults } from '../src/harness.js'
+const pluginModule = await import(process.env.DSH_SOUL_TEST_ENTRY ?? new URL('../index.js', import.meta.url).href)
+import { projectScope } from '../src/util.js'
 
-const manifest = process.env.DSH_TEST_PACKAGE || join(process.env.APPDATA || '', 'npm/node_modules/@deepseek-ai/dsh/package.json')
-if (process.env.DSH_TEST_PACKAGE && !existsSync(manifest)) throw new Error('Configured DSH test package is missing; refusing to skip host tests')
-if (process.env.DSH_TEST_VERSION) assert.equal(JSON.parse(readFileSync(manifest, 'utf8')).version, process.env.DSH_TEST_VERSION)
-test('real DSH commands, durable user events, prompt assembly and schema validators', { skip: !existsSync(manifest) }, async () => {
-  const req = createRequire(resolve(manifest))
-  const load = name => import(pathToFileURL(req.resolve(name)).href)
-  const { Context } = await load('@deepseek-ai/cordis')
-  const { SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt')
-  const { SessionStore } = await load('@deepseek-ai/dsh-session')
-  const { CommandRuntime } = await load('@deepseek-ai/dsh-commands')
-  const { createUserMessage } = await load('@deepseek-ai/dsh-llm')
-  const { assertSupportedJsonSchema, validateJsonSchemaValue } = await load('@deepseek-ai/dsh-tools')
-  const ctx = new Context()
-  const sessions = new SessionStore(ctx)
-  const prompts = new SystemPrompt(ctx, { includeHarnessIdentity: false, includeRuntimeContext: true })
-  const commands = new CommandRuntime(ctx)
-  const entries = []
-  ctx.provide('tools')
-  ctx.set('tools', { register(t) { entries.push(t) } })
-  const handle = apply(ctx, { database: ':memory:' })
-  try {
-    for (const tool of entries) { assertSupportedJsonSchema(tool.parameters); assertSupportedJsonSchema(tool.output.schema) }
-    const session = sessions.create('learning-host-test', { meta: { cwd: process.cwd() } })
-    const agent = { session }
-    const signal = new AbortController().signal
-    const invocation = await commands.execute(agent, '/learn prefer 先给结论再说明', [], signal)
-    assert.equal(invocation.result.kind, 'success')
-    const assembly = await prompts.assemble({ agent, scope: agent })
-    assert.equal(assembly.contexts.filter(c => c.name === 'dsh-soul:memory').length, 1)
-    assert(assembly.contexts.some(c => c.text.includes('先给结论')))
-    const message = createUserMessage({ content: [{ type: 'text', text: '以后修复先复现故障' }], source: { kind: 'user' } })
-    session.append('user/message', message, { surfaceOp: 'append' })
-    const proposal = await entries.find(t => t.name === 'learning_propose').execute({ kind: 'preference', text: '修复先复现故障' }, { agent, signal })
-    assert.deepEqual(validateJsonSchemaValue(entries[0].output.schema, proposal, ''), [])
-    assert.equal(JSON.parse(proposal.text).status, 'candidate')
-    const second = await prompts.assemble({ agent, scope: agent })
-    assert(!second.contexts.some(c => c.text.includes('修复先复现故障')))
-    const inbox = await commands.execute(agent, '/learn inbox', [], signal)
-    assert.equal(inbox.result.kind, 'success')
-    assert(inbox.result.text.includes('修复先复现故障'))
-    await commands.execute(agent, '/learn prefer 修复先复现故障', [], signal)
-    const confirmed = await prompts.assemble({ agent, scope: agent })
-    assert(confirmed.contexts.some(c => c.text.includes('修复先复现故障')))
-    const skillInput = { title: '修复故障', preconditions: ['能够复现'], steps: ['定位根因'], checks: ['验证原问题解决'], counterexamples: ['不能复现时先收集信息'] }
-    const skillResult = await commands.execute(agent, `/learn skill ${JSON.stringify(skillInput)}`, [], signal)
-    assert.equal(skillResult.result.kind, 'success')
-    const skillId = skillResult.result.text.split('：')[1]
-    await commands.execute(agent, `/learn accept ${skillId}`, [], signal)
-    const cards = JSON.parse((await entries.find(t => t.name === 'learning_search').execute({ query: '修复故障' }, { agent, signal })).text)
-    assert(cards.some(c => c.id === skillId && c.status === 'trial' && c.partial))
-    const full = JSON.parse((await entries.find(t => t.name === 'learning_get').execute({ id: skillId }, { agent, signal })).text)
-    assert.deepEqual(JSON.parse(full.text), skillInput)
-  } finally { await handle.stop() }
-})
-
-test('real Cordis plugin fiber loads and awaits disposer; reload has no duplicate registrations', { skip: !existsSync(manifest) }, async () => {
-  const req = createRequire(resolve(manifest)), load = name => import(pathToFileURL(req.resolve(name)).href)
-  const { Context } = await load('@deepseek-ai/cordis')
-  const { SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt')
-  const { CommandRuntime } = await load('@deepseek-ai/dsh-commands')
-  const ctx = new Context()
-  new SystemPrompt(ctx, { includeHarnessIdentity: false, includeRuntimeContext: true })
-  new CommandRuntime(ctx)
-  ctx.provide('tools'); ctx.set('tools', { register() { return () => {} } })
-  ctx.provide('llm'); ctx.set('llm', {})
-  let handle
-  const plugin = { name: 'learning-fixture', inject, apply(context, config) { handle = apply(context, config); return handle } }
-  for (let i = 0; i < 2; i++) {
-    const fiber = ctx.plugin(plugin, { database: ':memory:' })
-    await fiber.inertia
-    assert.equal(fiber.state, 2)
-    assert(handle.store.stats('p'))
-    await fiber.dispose()
-    assert.throws(() => handle.store.stats('p'), /closed|not open|database/i)
+const manifest = process.env.DSH_TEST_PACKAGE
+test('real DSH: spawn integration on 0.2.1, explicit refusal on 0.2.0', { skip: !manifest, timeout: 30000 }, async () => {
+  const req = createRequire(resolve(manifest)), load = name => import(pathToFileURL(req.resolve('@deepseek-ai/' + name)).href)
+  const hostVersion = JSON.parse(readFileSync(manifest, 'utf8')).version
+  if (process.env.DSH_TEST_VERSION) assert.equal(hostVersion, process.env.DSH_TEST_VERSION)
+  const { Context } = await load('cordis')
+  const { SessionStore } = await load('dsh-session')
+  const { SessionProjectionRegistry } = await load('dsh-session-projection')
+  const { AgentRegistry } = await load('dsh-agent')
+  const { AgentLoop } = await load('dsh-agent-loop')
+  const { SystemPrompt } = await load('dsh-system-prompt')
+  const { ToolRuntime } = await load('dsh-tools')
+  const { LlmRuntime, LlmAdapter } = await load('dsh-llm')
+  const { default: SubagentRuntime } = await load('dsh-subagent')
+  if (JSON.parse(readFileSync(manifest, 'utf8')).version === '0.2.0-rc.2') {
+    assert.equal(typeof SubagentRuntime.prototype.startActivation, 'undefined')
+    const ctx = new Context()
+    new SystemPrompt(ctx, { includeHarnessIdentity: false })
+    new AgentRegistry(ctx)
+    const runner = createHostRunner(ctx)
+    assert.equal(runner.capability().reason, 'host_runner_unavailable')
+    runner.stop(); await ctx.fiber.dispose()
+    return
   }
-})
-
-test('real LLM runtime and tool pipeline preserve sourced learning, usage and cancellation', { skip: !existsSync(manifest) }, async () => {
-  const req = createRequire(resolve(manifest)), load = name => import(pathToFileURL(req.resolve(name)).href)
-  const { Context } = await load('@deepseek-ai/cordis')
-  const { SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt')
-  const { CommandRuntime } = await load('@deepseek-ai/dsh-commands')
-  const { SessionStore } = await load('@deepseek-ai/dsh-session')
-  const { ToolRuntime } = await load('@deepseek-ai/dsh-tools')
-  const { LlmRuntime, LlmAdapter, createUserMessage } = await load('@deepseek-ai/dsh-llm')
+  const { WorkingDirectoryService } = await load('dsh-working-directory')
+  const { LocalFileSystem } = await load('dsh-fs-local')
+  const { CommandRuntime } = await load('dsh-commands')
+  const { createUserMessage } = await load('dsh-llm')
+  // 0.2.0 only checks peerDependencies; engines.dsh is enforced by the newer host.
+  const { evaluatePluginCompatibility } = await load('dsh-app-boot')
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  assert.equal(evaluatePluginCompatibility(pkg, {}, '0.2.1-rc.2'), undefined)
+  assert.notEqual(evaluatePluginCompatibility(pkg, {}, '0.2.0-rc.2'), undefined)
+  const spawnProvider = await load('dsh-subagent-spawn-in-process')
+  const dir = mkdtempSync(join(tmpdir(), 'evolve-real-host-'))
+  const git = (...args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', windowsHide: true })
+  git('init', '-q'); writeFileSync(join(dir, 'README.md'), 'host integration fixture\n')
+  git('add', '.'); git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture')
   const ctx = new Context()
-  const sessions = new SessionStore(ctx)
+  new SessionStore(ctx); new SessionProjectionRegistry(ctx)
   new SystemPrompt(ctx, { includeHarnessIdentity: false, includeRuntimeContext: true })
-  const commands = new CommandRuntime(ctx), tools = new ToolRuntime(ctx), llm = new LlmRuntime(ctx)
-  let requests = 0, request, hang = false, started
+  new LocalFileSystem(ctx, { cwd: dir, diffBasisMaxBytes: 1048576 }); new WorkingDirectoryService(ctx, { defaultDirectory: dir })
+  const agents = new AgentRegistry(ctx), tools = new ToolRuntime(ctx), llm = new LlmRuntime(ctx)
+  const commands = new CommandRuntime(ctx)
+  new AgentLoop(ctx, { agents: [], maxParallelToolCalls: { get: () => 1 } })
+  new SubagentRuntime(ctx, { maxDepth: { get: () => 1 }, maxActiveSubagents: { get: () => 8 } })
+  spawnProvider.apply(ctx, { providerName: 'spawn' })
+  if (process.env.DSH_EVOLVE_DEBUG) ctx.on('session/event', (s, e) => console.error(s.id, e.type, JSON.stringify(e.data).slice(0, 1200)))
+  await new Promise(resolve => setImmediate(resolve))
+  let requests = [], toolCwd, mode = 'normal', started, edits = 0
   class LocalAdapter extends LlmAdapter {
     async *stream(options) {
-      requests++; request = options
-      if (hang) {
+      requests.push(options)
+      const lastUser = options.messages.findLastIndex(m => m.role === 'user')
+      let data
+      try { data = JSON.parse(options.messages[lastUser]?.content?.find(b => b.type === 'text')?.text) } catch {}
+      if (data?.index?.target) {
+        edits++
+        yield { type: 'text-delta', index: 0, text: JSON.stringify({ actions: [
+          { type: 'write', path: 'harness/tools.md', text: edits === 1 ? '检查参数，失败时停止并报告原因。' : '先检查参数，失败时停止并报告原因。' }, { type: 'finish', why: 'reduce tool errors' }] }) }
+        yield { type: 'usage', usage: { inputTokens: 19, outputTokens: 11 } }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+        return
+      }
+      if (mode === 'hang') {
         started()
         await new Promise((resolve, reject) => {
           if (options.signal.aborted) reject(options.signal.reason)
@@ -109,228 +84,127 @@ test('real LLM runtime and tool pipeline preserve sourced learning, usage and ca
         })
         return
       }
-      const events = JSON.parse(options.messages[0].content[0].text)
-      const evidence = events.find(e => e.role === 'user')
-      yield { type: 'reasoning-delta', text: 'private test reasoning' }
-      yield { type: 'text-delta', text: JSON.stringify({ memories: [{ kind: 'preference', text: '先复现问题再修复', sourceIds: [evidence.id] }] }) }
-      yield { type: 'usage', usage: { inputTokens: 20, outputTokens: 30, cacheReadTokens: 10 } }
-      yield { type: 'finish', reason: { kind: 'stop' } }
+      if (!options.messages.slice(lastUser + 1).some(m => m.role === 'tool') || mode === 'loop') {
+        const block = { type: 'tool-call', id: 'call-' + requests.length, name: 'fixture_write', arguments: '{}' }
+        yield { type: 'block-start', index: 0, blockType: 'tool-call' }
+        yield { type: 'block-end', index: 0, block }
+        yield { type: 'usage', usage: { inputTokens: 13, outputTokens: 7 } }
+        yield { type: 'finish', reason: { kind: 'tool-calls' } }
+      } else {
+        yield { type: 'block-start', index: 0, blockType: 'text' }
+        yield { type: 'text-delta', index: 0, text: 'done' }
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: 'done' } }
+        yield { type: 'usage', usage: { inputTokens: 17, outputTokens: 3 } }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      }
     }
   }
-  const unregister = llm.registerAdapter(['local-test'], new LocalAdapter())
-  const handle = apply(ctx, { database: ':memory:', learning: true, provider: 'local-test', model: 'deterministic-fixture', idleMs: 3600000 })
+  llm.registerAdapter(['local-test'], new LocalAdapter())
+  tools.register({ name: 'fixture_write', description: 'Write fixture output', parameters: { type: 'object', properties: {}, additionalProperties: false },
+    output: { schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] }, render: (_, value) => [{ type: 'text', text: value.text }] },
+    execute: async (_, exec) => {
+      toolCwd = ctx.workingDirectory.get(exec.agent.session)
+      if (mode === 'baseline') throw new Error('invalid parameters')
+      if (exec.agent.session.header.origin === 'subagent') writeFileSync(join(toolCwd, 'result.txt'), 'ok')
+      return { text: 'written' }
+    } })
+  const parent = await agents.create({ sessionId: 'test-parent', meta: { cwd: dir }, agentOptions: { provider: 'local-test', model: 'fixture' } })
+  const runner = createHostRunner(ctx), settled = [], payloads = []
+  const execute = hostProbe({ spawn: runner.spawn, capability: runner.capability, provider: 'local-test', model: 'fixture', steps: 3 })
+  const files = { ...readDefaults(), 'memory.md': 'CANDIDATE_SENTINEL' }
+  const reserve = payload => { payloads.push(payload); return { settle: (outcome, usage) => settled.push({ outcome, usage }) } }
+  const input = { parent: parent.agent, root: dir, files, task: 'write result', reserve, signal: new AbortController().signal,
+    checks: [{ name: 'artifact', argv: [process.execPath, '-e', "if(require('fs').readFileSync('result.txt','utf8')!=='ok')process.exit(1)"] }] }
   try {
-    const session = sessions.create('learning-stream-test', { meta: { cwd: process.cwd() } }), agent = { session }
-    session.append('user/message', createUserMessage({ content: [{ type: 'text', text: '以后先复现问题再修复' }], source: { kind: 'user' } }), { surfaceOp: 'append' })
-    session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
-    const ids = await handle.learner.tick()
-    assert.equal(ids.length, 1); assert.equal(requests, 1)
-    assert.equal(request.provider, 'local-test'); assert.equal(request.model, 'deterministic-fixture')
-    assert.equal(request.maxTokens, 1600); assert.deepEqual(request.tools, [])
-    const signal = new AbortController().signal
-    const candidate = await tools.execute({ callId: 'get-candidate', name: 'learning_get', arguments: { id: ids[0] }, agent, signal })
-    assert.equal(candidate.isError, false)
-    assert(JSON.stringify(candidate).includes('candidate'))
-    assert(!JSON.stringify(candidate).includes('private test reasoning'))
-    assert.equal((await commands.execute(agent, `/learn accept ${ids[0]}`, [], signal)).result.kind, 'success')
-    const search = await tools.execute({ callId: 'search-active', name: 'learning_search', arguments: { query: '复现问题' }, agent, signal })
-    assert.equal(search.isError, false); assert(JSON.stringify(search).includes(ids[0]))
-    const status = JSON.parse((await commands.execute(agent, '/learn status', [], signal)).result.text)
-    assert.equal(status.usageToday.inputTokens, 20); assert.equal(status.usageToday.cacheReadTokens, 10)
-    hang = true
-    const dispatch = new Promise(resolve => { started = resolve })
-    await commands.execute(agent, '/learn review', [], signal)
-    const running = handle.learner.tick()
-    await dispatch
-    await handle.learner.stop(); await running
-    assert.equal(request.signal.aborted, true)
-    const stopped = JSON.parse((await commands.execute(agent, '/learn status', [], signal)).result.text)
-    assert(stopped.callsToday.some(c => c.outcome === 'interrupted'))
-  } finally { await handle.stop(); unregister() }
-  assert.equal(tools.get('learning_get'), undefined)
-})
+    assert.equal(runner.capability(parent.agent).ok, true)
+    await execute.preflight({ cwd: dir, parent: parent.agent })
+    const result = await execute(input)
+    assert.equal(result.metrics.complete, true, JSON.stringify(result))
+    assert.equal(result.metrics.deliverable, true)
+    assert.equal(result.metrics.steps, 2); assert.equal(result.metrics.toolCalls, 1); assert.equal(result.metrics.toolErrors, 0)
+    assert.equal(result.transcript, 'done'); assert.equal(result.checks[0].ok, true)
+    assert.equal(requests.length, 2); assert.equal(settled.length, 2)
+    assert(settled.every(s => s.outcome === 'ok' && s.usage.inputTokens > 0))
+    assert(requests.every(r => JSON.stringify(r.messages).includes('CANDIDATE_SENTINEL')))
+    assert(payloads.every(p => p.includes('CANDIDATE_SENTINEL')))
+    assert.notEqual(toolCwd, dir); assert.equal(existsSync(toolCwd), false)
+    assert.equal(existsSync(join(dir, 'result.txt')), false); assert.equal(git('status', '--porcelain'), '')
+    assert.deepEqual(agents.list().map(a => a.id), ['test-parent'])
+    assert.equal(git('worktree', 'list', '--porcelain').match(/worktree /g).length, 1)
 
-test('host reload preserves disk memories and revisions; forgetting survives reopening', { skip: !existsSync(manifest) }, async () => {
-  const req = createRequire(resolve(manifest)), load = name => import(pathToFileURL(req.resolve(name)).href)
-  const { Context } = await load('@deepseek-ai/cordis')
-  const { SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt')
-  const { CommandRuntime } = await load('@deepseek-ai/dsh-commands')
-  const { SessionStore } = await load('@deepseek-ai/dsh-session')
-  const { ToolRuntime } = await load('@deepseek-ai/dsh-tools')
-  const folder = mkdtempSync(join(tmpdir(), 'soul-host-disk-'))
-  const ctx = new Context(), sessions = new SessionStore(ctx)
-  const prompts = new SystemPrompt(ctx, { includeHarnessIdentity: false, includeRuntimeContext: true })
-  const commands = new CommandRuntime(ctx)
-  new ToolRuntime(ctx)
-  const session = sessions.create('disk-test', { meta: { cwd: folder } }), agent = { session }, signal = new AbortController().signal
-  let handle
-  const run = async raw => {
-    const result = (await commands.execute(agent, `/learn ${raw}`, [], signal)).result
-    assert.equal(result.kind, 'success', result.text)
-    return result.text
-  }
-  try {
-    handle = apply(ctx, { database: join(folder, 'memory.sqlite') })
-    const first = (await run('prefer 回答先给结论')).split('：')[1]
-    await handle.stop()
-    handle = apply(ctx, { database: join(folder, 'memory.sqlite') })
-    assert((await prompts.assemble({ agent, scope: agent })).contexts.some(c => c.text.includes('回答先给结论')))
-    const next = (await run(`revise ${first} 回答先说明条件`)).split('：')[1]
-    assert.equal(JSON.parse(await run(`show ${next}`)).version, 2)
-    await handle.stop()
-    handle = apply(ctx, { database: join(folder, 'memory.sqlite') })
-    const assembly = await prompts.assemble({ agent, scope: agent })
-    assert(assembly.contexts.some(c => c.text.includes('回答先说明条件')))
-    assert(!assembly.contexts.some(c => c.text.includes('回答先给结论')))
-    await run(`forget ${next}`)
-    await handle.stop()
-    handle = apply(ctx, { database: join(folder, 'memory.sqlite') })
-    assert.equal(JSON.parse(await run('list active')).length, 0)
-    assert(!(await prompts.assemble({ agent, scope: agent })).contexts.some(c => c.name === 'dsh-soul:memory' && c.text.trim()))
-    assert.equal(handle.store.db.prepare('PRAGMA integrity_check').get().integrity_check, 'ok')
-  } finally { await handle?.stop(); rmSync(folder, { recursive: true, force: true }) }
-})
+    requests = []
+    await assert.rejects(() => execute({ ...input, reserve: () => { throw Object.assign(new Error('input_limit'), { code: 'input_limit' }) } }), error => error.code === 'input_limit')
+    assert.equal(requests.length, 0); assert.equal(agents.list().length, 1)
 
-test('real host compatibility gate accepts the release and rejects untested versions', { skip: !existsSync(manifest) }, async () => {
-  const req = createRequire(resolve(manifest))
-  const { evaluatePluginCompatibility } = await import(pathToFileURL(req.resolve('@deepseek-ai/dsh-app-boot')).href)
-  const entry = process.env.DSH_SOUL_TEST_ENTRY || new URL('../index.js', import.meta.url).href
-  const pkg = JSON.parse(readFileSync(new URL('./package.json', entry), 'utf8'))
-  const version = JSON.parse(readFileSync(manifest, 'utf8')).version
-  assert.equal(evaluatePluginCompatibility(pkg, {}, version), undefined)
-  // 0.2.0's gate only reads peers. Verify engines rejection using the newer gate.
-  if (version === '0.2.1-rc.2') {
-    const old = { ...pkg, version: '0.2.0', engines: { ...pkg.engines, dsh: '0.2.0-rc.2' } }
-    assert.equal(evaluatePluginCompatibility(old, {}, version).requirements['engines.dsh'], '0.2.0-rc.2')
-    for (const compatible of ['0.2.1-rc.3', '0.2.1', '0.2.2-rc.1', '0.2.9']) assert.equal(evaluatePluginCompatibility(pkg, {}, compatible), undefined)
-    for (const unsupported of ['0.2.0-rc.1', '0.3.0-rc.1', '0.3.0']) {
-      assert(evaluatePluginCompatibility(pkg, {}, unsupported))
+    const failedCheck = await execute({ ...input, checks: [{ name: 'fails', argv: [process.execPath, '-e', 'process.exit(1)'] }] })
+    assert.equal(failedCheck.checks[0].ok, false); assert.equal(failedCheck.metrics.deliverable, false)
+
+    mode = 'loop'; requests = []
+    await assert.rejects(() => execute(input), error => error.code === 'probe_step_limit')
+    assert.equal(requests.length, 3); assert.equal(agents.list().length, 1)
+
+    mode = 'hang'; requests = []
+    const controller = new AbortController(), dispatched = new Promise(resolve => { started = resolve })
+    const running = execute({ ...input, signal: controller.signal })
+    await dispatched
+    controller.abort(Object.assign(new Error('cancelled'), { code: 'cancelled' }))
+    await assert.rejects(() => running, /cancelled/)
+    assert.equal(requests[0].signal.aborted, true); assert.equal(agents.list().length, 1)
+    runner.stop()
+    const timedRunner = createHostRunner(ctx, { requestTimeoutMs: 100 })
+    try {
+      const timed = hostProbe({ spawn: timedRunner.spawn, capability: timedRunner.capability, provider: 'local-test', model: 'fixture' })
+      await assert.rejects(() => timed(input), error => error.code === 'request_timeout')
+      assert.equal(agents.list().length, 1)
+    } finally { timedRunner.stop() }
+
+    // Full plugin commands use actual AgentLoop observations, not fabricated episode rows.
+    let handle
+    const fiber = ctx.plugin({ ...pluginModule, apply(context, config) { handle = pluginModule.apply(context, config); return handle } },
+      { enabled: true, profile: 'test', database: ':memory:', provider: 'local-test', model: 'fixture',
+      checks: input.checks, cooldownTurns: 0, shadowWindow: 2 })
+    await fiber.inertia
+    assert.equal(fiber.state, 2)
+    const command = async text => (await commands.execute(parent.agent, '/evolve ' + text, [], new AbortController().signal)).result
+    const turn = async text => {
+      parent.agent.send(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }), 'next-turn', true)
+      await parent.agent.whenIdle()
     }
+    try {
+      const scope = projectScope(parent.agent.session)
+      assert.equal((await command('status')).kind, 'success')
+      assert.equal(tools.get('learning_search'), undefined)
+      assert.equal(git('status', '--porcelain'), '')
+      mode = 'baseline'
+      for (let i = 0; i < 3; i++) await turn('write result')
+      const diagnosis = await command('diagnose')
+      assert.equal(JSON.parse(diagnosis.text).repeats, 3, diagnosis.text)
+      mode = 'normal'; requests = []
+      const launched = await command('run')
+      assert.equal(launched.kind, 'success', launched.text)
+      const outcome = await handle.evolve.running
+      assert.equal(outcome.state, 'shadow', JSON.stringify(outcome))
+      assert.equal(outcome.cost.calls, 3)
+      assert.equal(handle.store.db.prepare('SELECT COUNT(*) AS n FROM call').get().n, 3)
+      assert.equal(git('status', '--porcelain'), '')
+      for (let i = 0; i < 2; i++) await turn('write result')
+      assert.equal(handle.evolve.current(scope).state, 'stable')
+      // A correction on the next turn is attributed to the previous task and rolls back.
+      mode = 'baseline'; await turn('write result')
+      mode = 'normal'
+      const second = await command('run')
+      assert.equal(second.kind, 'success', second.text)
+      await handle.evolve.running
+      const beforeCorrection = handle.evolve.current(scope)
+      assert.equal(beforeCorrection.state, 'shadow')
+      await turn('不对，还是不行')
+      assert.notEqual(handle.evolve.current(scope).rev, beforeCorrection.rev)
+      assert.equal(handle.evolve.current(scope).state, 'stable')
+    } finally { await fiber.dispose() }
+    assert.equal(tools.get('evolve_status'), undefined)
+    assert.equal(tools.get('learning_search'), undefined)
+  } finally {
+    runner.stop(); await parent.dispose(); await ctx.fiber.dispose()
+    rmSync(dir, { recursive: true, force: true })
   }
-})
-
-test('real host method trials capture independent tool evidence, compare and require human review', { skip: !existsSync(manifest) }, async () => {
-  const req = createRequire(resolve(manifest)), load = name => import(pathToFileURL(req.resolve(name)).href)
-  const { Context } = await load('@deepseek-ai/cordis')
-  const { SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt')
-  const { CommandRuntime } = await load('@deepseek-ai/dsh-commands')
-  const { SessionStore } = await load('@deepseek-ai/dsh-session')
-  const { ToolRuntime } = await load('@deepseek-ai/dsh-tools')
-  const { createUserMessage, createToolResultMessage } = await load('@deepseek-ai/dsh-llm')
-  const ctx = new Context(), sessions = new SessionStore(ctx)
-  new SystemPrompt(ctx, { includeHarnessIdentity: false, includeRuntimeContext: true })
-  const commands = new CommandRuntime(ctx), tools = new ToolRuntime(ctx)
-  const handle = apply(ctx, { database: ':memory:' }), signal = new AbortController().signal
-  const skill = { title: '先复现后修复', preconditions: ['已有失败用例'], steps: ['检查日志'], checks: ['原失败用例通过'], counterexamples: ['不可复现时先收集证据'] }
-  const invoke = async (session, name, args) => {
-    const result = await tools.execute({ callId: name, name, arguments: args, agent: { session }, signal })
-    assert.equal(result.isError, false, JSON.stringify(result))
-    return JSON.parse(result.content.find(block => block.type === 'text').text)
-  }
-  const command = async (session, text) => {
-    const result = (await commands.execute({ session }, `/learn ${text}`, [], signal)).result
-    assert.equal(result.kind, 'success', result.text); return result.text
-  }
-  const user = (session, text) => session.append('user/message', createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }), { surfaceOp: 'append' })
-  const result = (session, id, name, text) => {
-    session.append('tool/call', { turn: 1, step: 1, callId: id, name, arguments: '{}' })
-    session.append('tool/result', { turn: 1, step: 1, message: createToolResultMessage({ callId: id, content: [{ type: 'text', text }], isError: false }) }, { surfaceOp: 'append' })
-  }
-  try {
-    const first = sessions.create('method-base', { meta: { cwd: process.cwd() } })
-    const key = (await command(first, `skill ${JSON.stringify(skill)}`)).split('：')[1]
-    await command(first, `accept ${key}`)
-    const run = async (session, baseline) => {
-      session.append('turn/start', { turn: 1 }); user(session, '修复原失败用例并验证回归')
-      session.append('step/start', { turn: 1, step: 1 })
-      const registration = await invoke(session, 'learning_trial', { id: key, goal: '原失败用例及回归通过', change: '按日志定位配置错误', ...(baseline ? { baseline } : {}) })
-      assert.deepEqual(JSON.parse(registration.skill), skill)
-      result(session, 'self', 'learning_get', 'SENTINEL_SELF_TOOL')
-      result(session, 'test', 'test_runner', '原失败用例及 12 个回归用例通过')
-      const evidence = await invoke(session, 'learning_evidence', {})
-      assert(!JSON.stringify(evidence.sources).includes('SENTINEL_SELF_TOOL'))
-      const observed = evidence.sources.find(e => e.role === 'tool')
-      assert(observed.text.includes('12 个回归'))
-      const report = await invoke(session, 'learning_result', { id: registration.trial.id, report: JSON.stringify({ verdict: 'helped', note: '观察到通过；归因由人工核对', sourceIds: [observed.id] }) })
-      assert.equal(report.review, null)
-      session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
-      const completed = JSON.parse(await command(session, `trial ${report.id}`))
-      assert.equal(completed.observed.complete, 1)
-      assert.equal(completed.observed.tool_calls, 1); assert.equal(completed.observed.steps, 1)
-      return { id: report.id, observed }
-    }
-    const base = await run(first)
-    const second = sessions.create('method-next', { meta: { cwd: process.cwd() } })
-    const next = await run(second, base.id)
-    const assessed = JSON.parse(await command(second, `assess ${next.id} helped 人工核实条件一致且结果质量合格`))
-    assert.equal(assessed.review, 'helped'); assert.equal(assessed.comparison.blockers.length, 0)
-    const full = await invoke(second, 'learning_get', { id: key })
-    assert.equal(full.performance.passedSessions, 1); assert.equal(full.status, 'trial')
-    const proposal = await invoke(second, 'learning_propose', { kind: 'skill', text: JSON.stringify({ ...skill, title: '改进的诊断方法' }), sources: JSON.stringify([next.observed.id]) })
-    assert.equal(proposal.status, 'candidate')
-    for (const args of [
-      { kind: 'skill', text: 'invalid skill', sources: JSON.stringify([next.observed.id]) },
-      { kind: 'skill', text: JSON.stringify(skill), sources: JSON.stringify([base.observed.id]) },
-    ]) assert.equal((await tools.execute({ callId: 'bad', name: 'learning_propose', arguments: args, agent: { session: second }, signal })).isError, true)
-    const status = JSON.parse(await command(second, 'status'))
-    assert.equal(status.metrics.find(m => m.key === 'contained_errors')?.value ?? 0, 0)
-    assert.equal(status.observations.turns, 2)
-  } finally { await handle.stop() }
-})
-
-test('real DSH routes run the full evolution pipeline, expose status and inject the verified method', { skip: !existsSync(manifest) }, async () => {
-  const req = createRequire(resolve(manifest)), load = name => import(pathToFileURL(req.resolve(name)).href)
-  const { Context } = await load('@deepseek-ai/cordis')
-  const { SystemPrompt } = await load('@deepseek-ai/dsh-system-prompt')
-  const { CommandRuntime } = await load('@deepseek-ai/dsh-commands')
-  const { SessionStore } = await load('@deepseek-ai/dsh-session')
-  const { ToolRuntime } = await load('@deepseek-ai/dsh-tools')
-  const { LlmRuntime, LlmAdapter, createUserMessage } = await load('@deepseek-ai/dsh-llm')
-  const ctx = new Context(), sessions = new SessionStore(ctx)
-  const prompts = new SystemPrompt(ctx, { includeHarnessIdentity: false, includeRuntimeContext: true }), fixture = fixtureModel(), routes = []
-  const commands = new CommandRuntime(ctx), tools = new ToolRuntime(ctx), llm = new LlmRuntime(ctx)
-  class LocalAdapter extends LlmAdapter {
-    async *stream(options) {
-      routes.push(options.model)
-      const data = JSON.parse(options.messages[0].content[0].text)
-      const result = await fixture.generate({ phase: data.phase ?? 'execute', data })
-      yield { type: 'reasoning-delta', text: 'PRIVATE_REASONING' }
-      yield { type: 'text-delta', text: JSON.stringify(result) }
-      yield { type: 'usage', usage: { inputTokens: 100, outputTokens: 40 } }
-      yield { type: 'finish', reason: { kind: 'stop' } }
-    }
-  }
-  const unregister = llm.registerAdapter(['soul-evo-fixture'], new LocalAdapter())
-  const folder = mkdtempSync(join(tmpdir(), 'soul-evo-host-')), contract = join(folder, 'suite.json')
-  writeFileSync(contract, JSON.stringify(suite()))
-  const handle = apply(ctx, { database: ':memory:', evolution: true, evolutionProvider: 'soul-evo-fixture', evolutionModel: 'executor', evolutionEditorModel: 'editor' })
-  try {
-    const session = sessions.create('evolution-host', { meta: { cwd: folder } }), agent = { session }, signal = new AbortController().signal
-    const registered = await commands.execute(agent, `/learn evolve register ${contract}`, [], signal)
-    assert.equal(registered.result.kind, 'success', registered.result.text)
-    const start = await tools.execute({ callId: 'start', name: 'learning_evolve', arguments: { suite: 'numbers' }, agent, signal })
-    assert.equal(start.isError, false, JSON.stringify(start))
-    assert.equal(handle.evolution.running, null)
-    assert.equal(JSON.parse(start.content[0].text).paidExecution, 'user_command_only')
-    const launched = await commands.execute(agent, '/learn evolve run numbers', [], signal)
-    assert.equal(launched.result.kind, 'success', launched.result.text)
-    const runId = JSON.parse(launched.result.text).id
-    await handle.evolution.running
-    const status = await tools.execute({ callId: 'status', name: 'learning_evolution_status', arguments: { id: runId }, agent, signal })
-    assert.equal(status.isError, false)
-    const run = JSON.parse(status.content[0].text).runs[0]
-    assert.equal(run.state, 'awaiting_review', JSON.stringify(run))
-    assert(routes.includes('executor')); assert(routes.includes('editor'))
-    session.append('user/message', createUserMessage({ content: [{ type: 'text', text: '请规范化数字数组' }], source: { kind: 'user' } }), { surfaceOp: 'append' })
-    const assembly = await prompts.assemble({ agent, scope: agent })
-    assert(!assembly.contexts.some(c => c.text.includes(run.memory)))
-    await commands.execute(agent, `/learn accept ${run.memory}`, [], signal)
-    handle.store.feedback(run.memory, run.scope, 'user-one', 'pass', '真实任务通过')
-    handle.store.feedback(run.memory, run.scope, 'user-two', 'pass', '不同会话真实任务通过')
-    const reviewed = await prompts.assemble({ agent, scope: agent })
-    assert(reviewed.contexts.some(c => c.text.includes(run.memory) && c.text.includes('fixed_suite')))
-    assert(!JSON.stringify(handle.evolution.inspect(run.scope, run.id)).includes('PRIVATE_REASONING'))
-    const stats = JSON.parse((await commands.execute(agent, '/learn status', [], signal)).result.text)
-    assert.equal(stats.metrics.find(m => m.key === 'contained_errors')?.value ?? 0, 0)
-  } finally { await handle.stop(); unregister(); rmSync(folder, { recursive: true, force: true }) }
 })

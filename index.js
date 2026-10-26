@@ -1,12 +1,17 @@
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Store } from './src/store.js'
-import { Learner, hostGenerate, skillText } from './src/learner.js'
-import { bounded, clean, human, integer, projectScope, textBlocks } from './src/util.js'
-import { Evolution, evolutionSettings } from './src/evolution.js'
-import { evolutionGenerate } from './src/evolution-model.js'
-import { apply as applyHarness, settings as harnessSettings } from './src/harness-evolution/index.js'
+import { Evolve } from './src/evolve.js'
+import { budgetSettings } from './src/budget.js'
+import { Recorder, divergenceOf, isCorrection, trajectoryText, repeatCount, EMPTY_METRICS } from './src/observe.js'
+import { diagnose } from './src/diagnose.js'
+import { readDefaults } from './src/harness.js'
+import { turnCounter } from './src/gate.js'
+import { hostProbe } from './src/host-probe.js'
+import { createHostRunner } from './src/host-runner.js'
+import { projectScope, bounded, boolean, integer, human, textBlocks, fail } from './src/util.js'
+import { sizeReport, COMPONENTS } from './src/tree.js'
 
 export const name = 'dsh-soul'
 export const inject = ['tools', 'systemPrompt', 'commands', 'llm']
@@ -14,282 +19,347 @@ export const inject = ['tools', 'systemPrompt', 'commands', 'llm']
 export function settings(input = {}) {
   const profileMatch = fileURLToPath(import.meta.url).replaceAll('\\', '/').match(/\/profiles\/([^/]+)\/node_modules\//)
   const profile = input.profile ?? profileMatch?.[1] ?? (input.database ? 'explicit-database' : null)
-  if (!profile) throw new Error('无法确定 profile；请明确配置 profile 或独立 database 路径，拒绝回落到共享 development 库')
+  if (!profile) throw new Error('无法确定 profile；请显式配置 profile 或独立 database 路径，拒绝回落到共享库')
   if (!/^[a-zA-Z0-9_-]{1,80}$/.test(profile)) throw new Error('profile 标识无效')
-  for (const key of ['enabled', 'learning']) if (input[key] !== undefined && typeof input[key] !== 'boolean') throw new Error(`${key} 必须是布尔值`)
-  const learningMode = input.learningMode ?? 'efficiency'
-  if (!['efficiency', 'economy'].includes(learningMode)) throw new Error('learningMode 必须是 efficiency 或 economy')
-  const efficient = learningMode === 'efficiency'
+
+  const enabled = boolean(input.enabled, false, 'enabled')
   const config = {
-    enabled: input.enabled ?? true, learning: input.learning ?? false, profile, learningMode,
-    // Keep the pre-rename namespace so existing memories and daily budgets survive.
-    database: input.database ?? join(process.env.DSH_HOME?.trim() || join(homedir(), '.dsh'), 'dsh-learning', profile, 'memory.sqlite'),
-    provider: input.provider ?? '', model: input.model ?? '', reasoningEffort: input.reasoningEffort ?? '',
-    dailyCalls: integer(input.dailyCalls, efficient ? 12 : 4, 0, 100),
-    maxInputBytes: integer(input.maxInputBytes, efficient ? 18000 : 12000, 2000, 32000),
-    maxOutputTokens: integer(input.maxOutputTokens, efficient ? 1600 : 600, 200, 4000),
-    memoryBytes: integer(input.memoryBytes, 1800, 500, 6000),
-    idleMs: integer(input.idleMs, efficient ? 10000 : 30000, 1000, 3600000),
-    timeoutMs: integer(input.timeoutMs, 60000, 100, 120000),
-    evolutionConfig: evolutionSettings(input),
+    enabled,
+    profile,
+    learning: boolean(input.learning, false, 'learning'),
+    database: input.database ?? join(process.env.DSH_HOME?.trim() || join(homedir(), '.dsh'), 'dsh-soul', profile, 'evolve.sqlite'),
+    // Evolution never inherits the learning route: a silent fallback is how an intended
+    // "strong editor model" turns into "whatever the background job uses".
+    provider: input.provider ?? '',
+    model: input.model ?? '',
+    reasoningEffort: input.reasoningEffort ?? '',
+    injectHarness: boolean(input.injectHarness, true, 'injectHarness'),
+    harnessFolder: input.harnessFolder ?? '.dsh-soul/harness',
+    checks: Array.isArray(input.checks) ? input.checks : [],
+    budget: budgetSettings(input),
   }
-  if (config.learning && (!config.provider || !config.model)) throw new Error('后台学习需要明确设置 provider 和 model；可选择适合任务的强模型或经济模型')
-  const harness = input.harnessEvolution ?? {}
-  if (!harness || typeof harness !== 'object' || Array.isArray(harness)) throw new Error('harnessEvolution 必须是配置对象')
-  const harnessDatabase = harness.database ?? (config.database === ':memory:' ? ':memory:' : `${config.database}.harness.sqlite`)
-  if (config.database !== ':memory:' && harnessDatabase !== ':memory:' && resolve(harnessDatabase) === resolve(config.database)) throw new Error('harnessEvolution.database 必须与记忆数据库分开')
-  config.harnessConfig = { ...harness, profile: config.profile, database: harnessDatabase }
-  harnessSettings(config.harnessConfig)
+  if (config.learning) throw new Error('独立版不提供后台记忆提炼')
+  if (enabled && (!config.provider || !config.model)) throw new Error('开启演化需要显式配置 provider 与 model')
+  if (input.checks !== undefined && (!Array.isArray(input.checks) || input.checks.some(c => !c || typeof c.name !== 'string' || !Array.isArray(c.argv) || !c.argv.length || c.argv.some(a => typeof a !== 'string') || !c.argv[0]))) throw new Error('checks 必须包含 name 和非空字符串数组 argv')
   return config
 }
 
-const HELP = `DSH Soul 成长记忆（evolve run 会启动模型试验；其余管理命令不调用模型）
-/learn remember 记住的内容                 当前项目事实，立即生效
-/learn prefer 表达偏好                      当前项目偏好，立即生效
-/learn prefer --profile 长期表达偏好         同一 profile 通用偏好
-/learn search 关键词                        查有效记忆
-/learn list [candidate|trial|active|deprecated]
-/learn inbox                              候选和试用技能摘要、来源与下一步
-/learn show ID                             来源和反馈
-/learn accept ID                           接受记忆；技能仅进入试用
-/learn revise ID 新内容                     修订为新版本，旧版失效
-/learn forget ID                           删除及关联派生记录
-/learn skill {"title":"...","preconditions":["..."],"steps":["..."],"checks":["..."],"counterexamples":[]}
-/learn feedback ID pass|fail 使用结果说明    当前会话作为一次独立试用；2个会话通过才激活，失败即停用
-/learn trials [技能ID]                     查看最近方法使用与观察指标
-/learn trial 试用ID                        查看前后差异、证据和归因限制
-/learn assess 试用ID helped|neutral|harmed|uncertain 审核理由
-/learn review                              将近期证据排入学习队列（按配置后台处理）
-/learn status                              查看预算、待处理及调用 usage
-/learn evolve example memory|javascript    在项目中创建验证套件示例，不覆盖已有文件
-/learn evolve register 验证套件.json        注册当前项目固定任务及验收条件
-/learn evolve run 套件ID                    用户启动付费试验；通过后生成候选，需人工审核
-/learn evolve list                         当前项目已授权验证套件
-/learn evolve estimate 套件ID               查看调用范围和输入/输出上限
-/learn evolve status [运行ID]               阶段、额度与结果
-/learn evolve show 运行ID                   执行证据、策略与实际 usage
-/learn evolve cancel [运行ID]               停止当前进化任务
-/learn evolve rollback 套件ID               回退当前已激活的进化方法
-/learn evolve unregister 套件ID             移除套件、进化技能及试验正文
-候选不会自动变成你的偏好。后台学习需在 bundle 中配置 learning/provider/model。
-0.8 真实宿主演化：配置 harnessEvolution.enabled/provider/model 后使用 /evolve help；通过检查的策略会进入真实任务试用。`
+const HELP = `DSH Soul — 真实宿主 harness 演化（单变量编辑 / 真实任务试用 / 在线基线）
+/evolve status             当前版本、每轮固定税、额度、影子窗口
+/evolve diagnose [n]       查看最近 n 轮观察的诊断结果，不花费模型调用
+/evolve run                手动对最近一次分歧发起一次精炼
+/evolve diff [A] [B]       两版组件差异，默认当前 stable 与最近影子版本
+/evolve log [n]            审计账本
+/evolve explain <rev>      某版本凭什么被采纳，含证据与闸门
+/evolve rollback [rev]     回滚，默认回到父版本
+/evolve watch              待决影子窗口
+/evolve tree               8 个组件的大小与激活方式
+/evolve lint               校验当前树（锚定区、上限、白名单）
+/evolve export [目录]      把当前 harness 导出到项目内供人工审阅
 
-export function command(store, raw, session) {
-  const scope = projectScope(session), sessionId = String(session.id)
-  const parsed = raw.trim().match(/^(\S+)(?:\s+([\s\S]*))?$/)
-  const verb = parsed?.[1] || 'help', text = parsed?.[2] || ''
-  const rest = text.split(/\s+/)
-  if (verb === 'help') return HELP
-  if (verb === 'status') return JSON.stringify(store.stats(scope), null, 2)
-  if (verb === 'inbox') return JSON.stringify(store.inbox(scope), null, 2)
-  if (verb === 'trials') return JSON.stringify(store.experience.list(scope, text), null, 2)
-  if (verb === 'trial') {
-    const row = store.experience.get(text, scope)
-    if (!row) throw new Error('试用不存在或不属于当前项目')
-    return JSON.stringify(row, null, 2)
-  }
-  if (verb === 'assess') {
-    const [key, verdict] = rest
-    return JSON.stringify(store.experience.assess(key, scope, verdict, text.replace(/^\S+\s+\S+\s*/, '')), null, 2)
-  }
-  if (verb === 'list') return JSON.stringify(store.search(scope, '', { status: text || 'active', limit: 20 }), null, 2)
-  if (verb === 'search') return JSON.stringify(store.search(scope, text, { limit: 12 }), null, 2)
-  if (verb === 'show') {
-    const row = store.get(text, scope)
-    if (!row) throw new Error('记忆不存在或不属于当前范围')
-    return JSON.stringify({ ...row, evidence: row.sources.map(key => store.event(key)) }, null, 2)
-  }
-  if (verb === 'remember' || verb === 'prefer') {
-    const global = text.startsWith('--profile ')
-    const target = global ? 'profile' : scope
-    return `已记录：${store.remember(target, verb === 'prefer' ? 'preference' : 'fact', global ? text.slice(10) : text, sessionId)}`
-  }
-  if (verb === 'skill') return `技能候选：${store.remember(scope, 'skill', skillText(text), sessionId)}`
-  if (verb === 'accept') return `状态：${store.accept(text, scope)}`
-  if (verb === 'forget') return `已删除 ${store.forget(text, scope)} 条记忆及关联来源；宿主原聊天记录不在插件删除范围内。`
-  if (verb === 'revise') {
-    const [key] = rest
-    const old = store.get(key, scope)
-    const body = text.slice(key.length).trimStart()
-    return `新版本：${store.revise(key, scope, old?.kind === 'skill' ? skillText(body) : body, sessionId)}`
-  }
-  if (verb === 'feedback') {
-    const [key, verdict] = rest
-    const note = text.replace(/^\S+\s+\S+\s*/, '')
-    return `状态：${store.feedback(key, scope, sessionId, verdict, note)}`
-  }
-  if (verb === 'review') {
-    store.capture({ eventId: `review:${Date.now()}`, session: sessionId, scope, role: 'command', text: '用户请求整理近期可复用经验。', priority: 1 })
-    return `已排队：${store.enqueue(sessionId, scope) ?? '无新增证据'}。后台学习关闭时不会调用模型。`
-  }
-  throw new Error('未知子命令，使用 /learn help')
+演化默认关闭。开启需在 bundle 中显式配置 enabled: true 与 provider/model。`
+
+const output = {
+  schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'], additionalProperties: false },
+  render: (_args, value) => [{ type: 'text', text: value.text }],
 }
-
-const output = { schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'], additionalProperties: false },
-  render: (_args, value) => [{ type: 'text', text: value.text }] }
 const str = description => ({ type: 'string', description })
 const tools = [
-  { name: 'learning_search', description: '查当前范围的有效记忆和相关试用技能卡片。partial 必须用 learning_get 或 learning_trial 读全文及反例后使用；trial 未验证充分，只能作待检查方案。不存在时不编造。', properties: { query: str('关键词；中文可用') }, required: ['query'] },
-  { name: 'learning_get', description: '按 ID 查看当前范围记忆及其来源，包含技能的条件、步骤、检查与反例。', properties: { id: str('记忆 ID') }, required: ['id'] },
-  { name: 'learning_propose', description: '提出有来源的记忆或结构化技能候选，不激活、不覆盖偏好。技能只提炼实际证据，保留适用条件、检查及反例；不能把模型自评当成效果。用 /learn inbox 审核。', properties: { kind: { type: 'string', enum: ['preference', 'fact', 'episode', 'skill'] }, text: str('简短内容；skill 为含 title/preconditions/steps/checks/counterexamples 的 JSON 字符串'), sources: str('可选：learning_evidence 返回的当前会话来源 ID 的 JSON 数组；默认最近用户消息') }, required: ['kind', 'text'] },
-  { name: 'learning_trial', description: '采用已接受的技能前登记方法使用，返回完整技能。只登记，不执行额外任务。goal 为具体成功标准，change 为本次方法变化；有同目标的历史基线才传 baseline。优先复用有效方法，质量优先于速度。', properties: { id: str('技能 ID'), goal: str('本任务目标与成功标准'), change: str('本次采用或改变的方法'), baseline: str('可选：已经完成且同目标的试用 ID') }, required: ['id', 'goal', 'change'] },
-  { name: 'learning_evidence', description: '查看当前会话最近用户/工具观察及当前轮次指标，供候选或试用报告引用。工具未报错、运行结束不代表任务成功；不重复执行操作来制造证据。', properties: {}, required: [] },
-  { name: 'learning_result', description: '记录当前会话的技能使用报告，模型判断保持未审核。用 learning_evidence 的本轮来源，区分 helped/neutral/harmed/uncertain；缺基线或多项变更不能声称因果。不能激活技能。', properties: { id: str('试用 ID'), report: str('JSON：{"verdict":"helped|neutral|harmed|uncertain","note":"观察和限制","sourceIds":["本轮来源ID"]}') }, required: ['id', 'report'] },
-  { name: 'learning_evolve', description: '为已注册套件返回付费试验建议和用量预估；不启动模型调用。只有用户 /learn evolve run 命令能启动，固定测试通过只生成待审核候选。', properties: { suite: str('已注册套件 ID') }, required: ['suite'] },
-  { name: 'learning_evolution_status', description: '查看本项目已授权的进化套件和最近执行状态；指定 id 时查看运行摘要。', properties: { id: str('可选：运行 ID') }, required: [] },
+  {
+    name: 'evolve_status',
+    description: '查看当前项目的 harness 版本、每轮固定税、额度、影子窗口与最近 episode。不调用模型、不花钱。',
+    properties: {}, required: [],
+  },
+  {
+    name: 'evolve_diagnose',
+    description: '对最近观察到的一次分歧做归因，返回目标组件与依据。不调用模型、不花钱。用于判断值不值得精炼。',
+    properties: { episodeTurn: str('可选：指定观察序号；默认最近一次') }, required: [],
+  },
+  {
+    name: 'evolve_request',
+    description: '请求对最近一次已归因的分歧发起一次精炼（会花费模型调用探测）。只有在同类任务重复出现时才值得。返回是否有资格启动，不直接执行。',
+    properties: { confirm: str('必须传入 "confirm" 表示你知道这会消耗额度') }, required: ['confirm'],
+  },
+  {
+    name: 'evolve_tree',
+    description: '列出 8 个 harness 组件的字节数、上限与激活方式，用于判断固定税是否膨胀。',
+    properties: {}, required: [],
+  },
 ]
+
+const describe = agent => ({ session: agent.session, scope: projectScope(agent.session) })
 
 export function apply(ctx, input = {}) {
   if (input.enabled === false) return
   const config = settings(input)
   if (!config.enabled) return
+
   const store = new Store(config.database)
-  const pending = new Map(), lastHuman = new Map(), active = new Set(), disposers = []
-  let lastActivity = Date.now(), lastMaintenance = 0, disposed = false, timer, harness
-  const llm = config.learning || config.evolutionConfig.enabled ? (typeof ctx.get === 'function' ? ctx.get('llm') : ctx.llm) : null
-  if ((config.learning || config.evolutionConfig.enabled) && !llm?.stream) { store.close(); throw new Error('学习/进化缺少 DSH llm 服务') }
-  const learner = new Learner(store, config.learning ? hostGenerate(llm, config) : null, config)
-  const evolution = new Evolution(store, config.evolutionConfig.enabled ? evolutionGenerate(llm, config.evolutionConfig) : null, config.evolutionConfig)
-  const safe = fn => (...args) => { try { return fn(...args) } catch { try { store.metric('contained_errors') } catch {} } }
-  const listen = (event, handler) => disposers.push(ctx.on(event, handler))
-  const describe = agent => ({ session: agent.session, scope: projectScope(agent.session) })
-  const observeUser = (session, message, eventId) => {
-    if (!human(message) || session.header?.origin === 'subagent') return
-    const text = textBlocks(message.content)
-    if (!text.trim()) return
-    if (eventId === undefined && pending.get(String(session.id)) !== bounded(text, 2000)) lastHuman.delete(String(session.id))
-    pending.set(String(session.id), bounded(text, 2000))
-    lastActivity = Date.now()
-    // Pre-step provides the admitted query; only the durable event provides a source ID.
-    if (eventId === undefined) return
-    const priority = /以后|记住|纠正|不对|别再|下次|remember|from now on|correction/i.test(text) ? 2 : 0
-    const key = store.capture({ eventId, session: String(session.id), scope: projectScope(session), role: 'user', text, priority })
-    if (key) { lastHuman.set(String(session.id), key); store.experience.trackSource(String(session.id), projectScope(session), key) }
+  const recorder = new Recorder()
+  const disposers = []
+  const recent = new Map()      // session -> last finished observation
+  const lastTurn = new Map()    // session -> { intent } to detect corrections
+  let disposed = false
+
+  const llm = typeof ctx.get === 'function' ? ctx.get('llm') : ctx.llm
+  if (!llm?.stream) { store.close(); throw new Error('演化需要宿主的 llm 服务') }
+
+  const generate = async ({ system, data, phase, signal, onUsage }) => {
+    const text = JSON.stringify(data)
+    let body = '', finish
+    for await (const chunk of llm.stream({
+      provider: config.provider, model: config.model,
+      ...(config.reasoningEffort ? { reasoningEffort: config.reasoningEffort } : {}),
+      system,
+      messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+      tools: [], maxTokens: 2400, signal,
+    })) {
+      signal?.throwIfAborted()
+      if (chunk.type === 'text-delta') body += chunk.text
+      if (chunk.type === 'usage') onUsage?.(chunk.usage)
+      if (chunk.type === 'finish') finish = chunk.reason?.kind
+      if (Buffer.byteLength(body) > 40000) throw fail('output_limit')
+    }
+    if (finish !== 'stop') throw fail(finish === 'max-tokens' ? 'truncated' : 'provider_failure')
+    const cleaned = body.trim().replace(/^```(?:json)?\s*|\s*```$/g, '')
+    try { return JSON.parse(cleaned) } catch { throw fail('invalid_json') }
   }
+
+  // Capability and clean-worktree checks run before any paid editor call.
+  const runner = createHostRunner(ctx, { requestTimeoutMs: config.budget.requestTimeoutMs })
+  const execute = hostProbe({
+        spawn: runner.spawn, capability: runner.capability,
+        provider: config.provider, model: config.model,
+        reasoningEffort: config.reasoningEffort, steps: config.budget.probeSteps,
+      })
+
+  const evolve = new Evolve({ store, config, generate, execute, logger: () => {} })
+  const safe = fn => (...args) => { try { return fn(...args) } catch { /* observation must never break a turn */ } }
+  const listen = (event, handler) => disposers.push(ctx.on(event, handler))
+
   try {
-    // Observe accepted user input before assembly; never mutate the admission decision.
+    // ---- observation ------------------------------------------------------
     listen('agent/pre-step', async (payload, next) => {
       const decision = await next()
-      const messages = decision?.messages ?? payload.messages
-      if (decision?.kind !== 'reject') safe(() => {
-        for (const message of messages ?? []) observeUser(payload.agent.session, message)
+      if (decision?.kind !== 'reject' && payload.agent.session.header?.origin !== 'subagent') safe(() => {
+        const sid = String(payload.agent.session.id)
+        const previous = lastTurn.get(sid)
+        const messages = decision?.messages ?? payload.messages ?? []
+        for (const message of messages) {
+          if (!human(message)) continue
+          const text = textBlocks(message.content)
+          if (!text.trim()) continue
+          const correction = !!previous?.intent && isCorrection(text)
+          const intent = correction ? previous.intent : text
+          lastTurn.set(sid, { intent: bounded(intent, 2000) })
+          if (!recorder.get(sid)) {
+            recorder.start(sid, { scope: projectScope(payload.agent.session), turn: Date.now(), intent })
+          }
+          if (correction) {
+            recorder.markCorrection(sid)
+            const state = recorder.get(sid)
+            state.text = bounded(`${intent}\n用户纠正：${text}`, 2000)
+            // The correction refers to the preceding task, even when its wording differs.
+            evolve.observe({ scope: state.scope, taskKey: state.taskKey, corrections: 1, toolErrors: 0, complete: true })
+          }
+        }
       })()
       return decision
     })
-    listen('agent/status', safe(({ agent, status }) => {
-      if (status === 'running') active.add(String(agent.session.id)); else active.delete(String(agent.session.id))
-      lastActivity = Date.now()
-    }))
-    listen('agent/disposed', safe(({ agent }) => {
-      const key = String(agent.session.id)
-      store.experience.interrupt(key)
-      pending.delete(key); lastHuman.delete(key); active.delete(key)
-    }))
+
     listen('session/event', safe((session, event) => {
       if (disposed || session.header?.origin === 'subagent') return
-      const scope = projectScope(session), sid = String(session.id)
-      store.experience.observe(sid, scope, event.seq, event.type, event.data)
-      if (event.type === 'user/message') observeUser(session, event.data, event.seq)
-      if (event.type === 'assistant/message' && !event.data.interrupted) {
-        const text = textBlocks(event.data.message?.content)
-        if (text.trim()) store.capture({ eventId: event.seq, session: sid, scope, role: 'assistant', text })
-      }
-      if (event.type === 'tool/result') {
-        const message = event.data.message
-        // Only retain bounded successful observations during a registered method trial.
-        // Soul's own tool results are not independent evidence of task success.
-        const toolName = store.experience.toolName(sid, scope, message?.toolCallId)
-        if (!toolName?.startsWith('learning_') && (message?.isError || (toolName && store.experience.wantsObservation(sid, scope)))) {
-          const key = store.capture({ eventId: event.seq, session: sid, scope, role: 'tool',
-            text: `工具观察（${message?.isError ? '错误' : '未报告工具错误，不等于任务成功'}）：${bounded(textBlocks(message?.content) || '无可读结果', 1600)}`, priority: message?.isError ? 1 : 0 })
-          store.experience.trackSource(sid, scope, key)
-        }
-      }
+      const sid = String(session.id)
       if (event.type === 'turn/end') {
-        store.enqueue(sid, scope); lastActivity = Date.now()
-      }
-    }))
-    disposers.push(ctx.systemPrompt.context({ name: 'dsh-soul:memory', order: 950, text: ({ agent }) => {
-      if (!agent || disposed || agent.session.header?.origin === 'subagent') return ''
-      try { return store.recall(projectScope(agent.session), pending.get(String(agent.session.id)) ?? '', config.memoryBytes) }
-      catch { return '' }
-    } }))
-    for (const definition of tools) disposers.push(ctx.tools.register({
-      name: definition.name, description: definition.description, output,
-      parameters: { type: 'object', properties: definition.properties, required: definition.required, additionalProperties: false },
-      async execute(args, exec) {
-        exec?.signal?.throwIfAborted()
-        if (!exec?.agent?.session) throw new Error('需要当前 DSH 会话')
-        for (const key of definition.required) if (typeof args?.[key] !== 'string' || !args[key].trim()) throw new Error('缺少工具参数')
-        if (Object.keys(args).some(key => !(key in definition.properties))) throw new Error('不支持的参数')
-        for (const key of Object.keys(args)) if (typeof args[key] !== 'string') throw new Error('工具参数必须是文字')
-        const { session, scope } = describe(exec.agent)
-        let value
-        if (definition.name === 'learning_evolve') value = evolution.estimate(scope, args.suite)
-        else if (definition.name === 'learning_evolution_status') value = { suites: evolution.list(scope), runs: evolution.status(scope, args.id) }
-        else if (definition.name === 'learning_search') value = store.discover(scope, clean(args.query, 2000))
-        else if (definition.name === 'learning_get') {
-          const row = store.get(args.id, scope)
-          value = row ? { ...row, evidence: row.sources.slice(0, 4).map(key => {
-            const e = store.event(key)
-            return e ? { ...e, text: bounded(e.text, 1800) } : null
-          }).filter(Boolean) } : { error: '记忆不存在或不属于当前范围' }
-        }
-        else if (definition.name === 'learning_trial') value = store.experience.start({ memory: args.id, scope, session: String(session.id), goal: args.goal, change: args.change, baseline: args.baseline })
-        else if (definition.name === 'learning_evidence') value = store.experience.evidence(String(session.id), scope)
-        else if (definition.name === 'learning_result') value = store.experience.report(args.id, scope, String(session.id), args.report)
-        else {
-          if (!['preference', 'fact', 'episode', 'skill'].includes(args.kind)) throw new Error('候选类型无效')
-          const source = lastHuman.get(String(session.id))
-          const sourceIds = args.sources ? JSON.parse(args.sources) : source ? [source] : []
-          if (!Array.isArray(sourceIds) || !sourceIds.length || sourceIds.length > 12) throw new Error('需要 1–12 条当前会话来源')
-          for (const key of sourceIds) {
-            const e = store.event(key)
-            if (!e || e.session !== String(session.id) || e.scope !== scope || !['user', 'tool'].includes(e.role)) throw new Error('来源必须是当前会话的用户表达或工具观察')
+        recorder.observe(sid, event.type, event.data)
+        const state = recorder.end(sid)
+        if (state) {
+          turnCounter(store, state.scope).bump()
+          const divergence = divergenceOf(state)
+          recent.set(sid, { state, divergence })
+          if (divergence) {
+            store.db.prepare('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)')
+              .run(`last:${state.scope}`, JSON.stringify({ taskKey: state.taskKey, text: bounded(state.text, 600), at: Date.now() }))
           }
-          if (args.kind === 'preference' && !sourceIds.some(key => store.event(key).role === 'user')) throw new Error('偏好必须引用用户表达')
-          const key = store.tx(() => store.add({ scope, kind: args.kind, text: args.kind === 'skill' ? skillText(args.text) : args.text, sourceIds }))
-          value = { id: key, status: store.get(key, scope).status }
+          const key = `observations:${state.scope}`
+          const rows = JSON.parse(store.db.prepare('SELECT value FROM meta WHERE key=?').get(key)?.value ?? '[]')
+          if (divergence) rows.push({ task_key: state.taskKey, created: Date.now(), state: 'observed' })
+          store.db.prepare('INSERT OR REPLACE INTO meta VALUES (?,?)').run(key, JSON.stringify(rows.slice(-200)))
+          evolve.observe({ scope: state.scope, taskKey: state.taskKey, corrections: state.corrections,
+            toolErrors: state.toolErrors, complete: state.complete })
         }
-        return { text: JSON.stringify(value) }
-      },
+        return
+      }
+      recorder.observe(sid, event.type, event.data)
     }))
-    disposers.push(ctx.commands.register({ name: 'learn', description: '管理成长记忆、技能与进化任务（evolve run 会调用模型）', input: { hint: 'help / remember / prefer / search / status / evolve' }, recordInput: false,
+
+    listen('agent/disposed', safe(({ agent }) => {
+      const sid = String(agent.session.id)
+      recorder.turns.delete(sid); lastTurn.delete(sid); recent.delete(sid)
+    }))
+
+    // ---- harness injection ------------------------------------------------
+    // Only the four every-call components are injected, and each is its own context so a
+    // stable component keeps its cache prefix while the volatile one changes.
+    if (config.injectHarness) {
+      for (const [key, spec, order] of [['C1', COMPONENTS.C1, 900], ['C2', COMPONENTS.C2, 910], ['C4', COMPONENTS.C4, 920], ['C3', COMPONENTS.C3, 950]]) {
+        disposers.push(ctx.systemPrompt.context({
+          name: `dsh-soul:${key}`, order, interpolate: false,
+          text: ({ agent }) => {
+            if (!agent || disposed || agent.session.header?.origin === 'subagent') return ''
+            const cwd = agent.session.header?.cwd
+            if (!cwd) return ''
+            try {
+              const current = evolve.current(projectScope(agent.session))
+              return current?.files?.[spec.path] ?? ''
+            } catch { return '' }
+          },
+        }))
+      }
+    }
+
+    // ---- tools ------------------------------------------------------------
+    for (const definition of tools) {
+      disposers.push(ctx.tools.register({
+        name: definition.name, description: definition.description, output,
+        parameters: { type: 'object', properties: definition.properties, required: definition.required, additionalProperties: false },
+        async execute(args, exec) {
+          exec?.signal?.throwIfAborted()
+          if (!exec?.agent?.session) throw new Error('需要当前 DSH 会话')
+          for (const key of Object.keys(args ?? {})) if (!(key in definition.properties)) throw new Error('不支持的参数')
+          for (const key of definition.required) if (typeof args?.[key] !== 'string') throw new Error(`缺少参数 ${key}`)
+          const { session, scope } = describe(exec.agent)
+          const current = evolve.current(scope)
+          let value
+          if (definition.name === 'evolve_status') value = { ...evolve.status(scope), hostProbe: runner.capability(session && exec.agent) }
+          else if (definition.name === 'evolve_tree') value = current ? sizeReport(current.files) : sizeReport(readDefaults())
+          else if (definition.name === 'evolve_diagnose') {
+            const observation = recent.get(String(session.id))
+            value = observation?.divergence
+              ? { ...diagnose(observation.divergence), taskKey: observation.state.taskKey,
+                  repeats: repeatCount(JSON.parse(store.db.prepare('SELECT value FROM meta WHERE key=?').get(`observations:${scope}`)?.value ?? '[]'), observation.state.taskKey, config.budget.repeatWindowMs),
+                  note: '归因是规则表结果，零模型调用；是否值得精炼看重复次数是否达到阈值' }
+              : { error: '当前会话最近一轮没有可归因的分歧' }
+          } else {
+            const observation = recent.get(String(session.id))
+            if (!observation?.divergence) value = { started: false, reason: 'no_divergence' }
+            else {
+              const repeats = repeatCount(JSON.parse(store.db.prepare('SELECT value FROM meta WHERE key=?').get(`observations:${scope}`)?.value ?? '[]'), observation.state.taskKey, config.budget.repeatWindowMs)
+              value = repeats < config.budget.repeatThreshold
+                ? { started: false, reason: 'insufficient_repetition', repeats, need: config.budget.repeatThreshold,
+                    note: '一次性任务不进化；同类任务重复出现才值得花额度' }
+                : { started: false, reason: 'requires_host_command',
+                    next: '/evolve run', target: diagnose(observation.divergence).target,
+                    note: '工具不直接消耗额度；只有用户命令能启动付费探测' }
+            }
+          }
+          return { text: JSON.stringify(value) }
+        },
+      }))
+    }
+
+    // ---- command ----------------------------------------------------------
+    disposers.push(ctx.commands.register({
+      name: 'evolve', description: '查看与回滚 harness 自演化状态（run 会消耗模型额度）',
+      input: { hint: 'status / tree / diagnose / diff / log / rollback' }, recordInput: false,
       handler: async ({ agent, rawInput, signal }) => {
         try {
           signal?.throwIfAborted()
-          if (/^evolve(?:\s|$)/.test(rawInput.trim())) return { kind: 'success', text: JSON.stringify(await evolution.command(rawInput.trim().slice(6), agent.session, projectScope(agent.session)), null, 2) }
-          if (rawInput.trim() === 'status') return { kind: 'success', text: JSON.stringify({
-            learning: config.learning, learningMode: config.learningMode, provider: config.provider, model: config.model,
-            limits: { dailyCalls: config.dailyCalls, maxEvidenceBytes: config.maxInputBytes, maxOutputTokens: config.maxOutputTokens, memoryBytes: config.memoryBytes },
-            harnessEvolution: { enabled: !!config.harnessConfig.enabled, command: '/evolve status', database: config.harnessConfig.database },
-            ...store.stats(projectScope(agent.session)),
-          }, null, 2) }
-          const result = command(store, rawInput, agent.session)
-          if (evolution.active && evolution.active.epoch !== store.epoch()) await evolution.cancel(evolution.active.scope, evolution.active.id)
-          return { kind: 'success', text: result }
+          const text = String(rawInput ?? '').trim()
+          const [verb = 'status', ...args] = text.split(/\s+/)
+          const { scope } = describe(agent)
+          const cwd = agent.session.header?.cwd
+          if (cwd) {
+            evolve.ensure(scope, readDefaults())
+          }
+          if (verb === 'help') return { kind: 'success', text: HELP }
+          if (verb === 'status') return { kind: 'success', text: JSON.stringify({ ...evolve.status(scope), hostProbe: runner.capability(agent) }, null, 2) }
+          if (verb === 'tree') {
+            const current = evolve.current(scope)
+            const report = sizeReport(current?.files ?? readDefaults())
+            return { kind: 'success', text: JSON.stringify(report, null, 2) }
+          }
+          if (verb === 'watch') return { kind: 'success', text: JSON.stringify(store.openWatches(scope), null, 2) }
+          if (verb === 'log') {
+            const n = Number(args[0]) || 20
+            return { kind: 'success', text: JSON.stringify(store.ledger(scope, Math.min(200, n)), null, 2) }
+          }
+          if (verb === 'diagnose') {
+            const observation = recent.get(String(agent.session.id))
+            if (!observation?.divergence) return { kind: 'success', text: '当前会话最近一轮没有可归因的分歧。' }
+            const repeats = repeatCount(JSON.parse(store.db.prepare('SELECT value FROM meta WHERE key=?').get(`observations:${scope}`)?.value ?? '[]'), observation.state.taskKey, config.budget.repeatWindowMs)
+            return { kind: 'success', text: JSON.stringify({ ...diagnose(observation.divergence), repeats,
+              threshold: config.budget.repeatThreshold, trajectory: trajectoryText(observation.state) }, null, 2) }
+          }
+          if (verb === 'run') {
+            if (!config.injectHarness) return { kind: 'error', text: 'injectHarness 已关闭，无法把候选应用到真实任务。' }
+            const observation = recent.get(String(agent.session.id))
+            if (!observation?.divergence) return { kind: 'error', text: '没有可归因的分歧，不启动。' }
+            const repeats = repeatCount(JSON.parse(store.db.prepare('SELECT value FROM meta WHERE key=?').get(`observations:${scope}`)?.value ?? '[]'), observation.state.taskKey, config.budget.repeatWindowMs)
+            if (repeats < config.budget.repeatThreshold) {
+              return { kind: 'error', text: `同类任务仅重复 ${repeats} 次（阈值 ${config.budget.repeatThreshold}），一次性任务不进化。` }
+            }
+            const result = await evolve.start({
+              scope, taskKey: observation.state.taskKey, trigger: 'user_command',
+              divergence: observation.divergence, metrics: observation.state,
+              trajectory: trajectoryText(observation.state), task: observation.state.text,
+              cwd, checks: config.checks, parent: agent,
+            })
+            return { kind: result.started ? 'success' : 'error', text: JSON.stringify(result, null, 2) }
+          }
+          if (verb === 'diff') {
+            const [a, b] = args
+            const to = b ? store.rev(b, scope) : store.latest(scope, ['shadow', 'stable'])
+            const from = a ? store.rev(a, scope) : (to?.parent ? store.rev(to.parent, scope) : null)
+            if (!to || !from) return { kind: 'error', text: '没有可比较的两个版本。' }
+            const { diffTrees } = await import('./src/tree.js')
+            return { kind: 'success', text: JSON.stringify(diffTrees(store.materialize(from.id), store.materialize(to.id)), null, 2) }
+          }
+          if (verb === 'explain') {
+            const rev = args[0] ?? store.latest(scope, ['shadow', 'stable'])?.id
+            if (!rev) return { kind: 'error', text: '没有版本。' }
+            const rows = store.ledger(scope, 500).filter(r => r.rev === rev)
+            return { kind: 'success', text: JSON.stringify({ rev, entries: rows }, null, 2) }
+          }
+          if (verb === 'rollback') {
+            const result = evolve.rollback(scope, args[0] ?? null)
+            return { kind: result.ok ? 'success' : 'error', text: JSON.stringify(result, null, 2) }
+          }
+          if (verb === 'lint') {
+            const current = evolve.current(scope)
+            const { checkStructure } = await import('./src/gate.js')
+            const files = current?.files ?? readDefaults()
+            const result = checkStructure({ target: 'C1', base: files, next: files })
+            return { kind: 'success', text: JSON.stringify({ ok: result.ok, violations: result.violations, tax: result.tax }, null, 2) }
+          }
+          if (verb === 'export') {
+            const current = evolve.current(scope)
+            const target = args[0] ?? '.dsh-soul/export'
+            if (!cwd) return { kind: 'error', text: '需要项目工作目录。' }
+            const { installTree } = await import('./src/probe.js')
+            const base = await installTree(cwd, current?.files ?? readDefaults(), { folder: target })
+            return { kind: 'success', text: `已导出到 ${base}` }
+          }
+          return { kind: 'error', text: '未知子命令，使用 /evolve help' }
+        } catch (error) {
+          return { kind: 'error', text: bounded(error?.message ?? '执行失败', 500) }
         }
-        catch (e) { return { kind: 'error', text: bounded(e.message, 500) } }
       },
     }))
-    harness = applyHarness(ctx, config.harnessConfig)
-    timer = setInterval(() => {
-      if (disposed || active.size || Date.now() - lastActivity < config.idleMs) return
-      if (Date.now() - lastMaintenance > 3600000) { safe(() => store.maintain())(); lastMaintenance = Date.now() }
-      if (config.learning && !evolution.running && !harness?.evolve.running) learner.tick().catch(() => {})
-    }, Math.min(5000, config.idleMs))
-    timer.unref?.()
+
     const stop = async () => {
       if (disposed) return
-      disposed = true; clearInterval(timer)
+      disposed = true
       for (const dispose of disposers.reverse()) if (typeof dispose === 'function') dispose()
-      try { await Promise.all([learner.stop(), evolution.stop(), harness?.stop()]) } finally { store.close() }
+      await evolve.stop()
+      runner.stop()
+      store.close()
     }
-    // Cordis accepts a disposer (not a plain diagnostic object) as startup result.
-    return Object.assign(stop, { store, learner, evolution, harness, stop, config })
-  } catch (e) {
-    clearInterval(timer)
+    return Object.assign(stop, { store, evolve, stop, config, recorder, recent })
+  } catch (error) {
     for (const dispose of disposers.reverse()) if (typeof dispose === 'function') dispose()
-    store.close(); throw e
+    runner.stop()
+    store.close()
+    throw error
   }
 }

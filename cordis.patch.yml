@@ -3,13 +3,6 @@
       name: dsh-soul
       inject: [tools, systemPrompt, commands, llm]
       config:
-        enabled: true
-        learning: false
-        evolution: false
-        harnessEvolution:
-          enabled: false
-          provider: ''
-          model: ''
+        enabled: false
         provider: ''
         model: ''
-        learningMode: efficiency

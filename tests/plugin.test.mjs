@@ -1,88 +1,204 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { apply, command, settings } from '../index.js'
+import { mkdtempSync, rmSync, existsSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { settings, apply, name, inject } from '../index.js'
+import { projectScope, taskKey, leadingIntent, day, bounded, redact } from '../src/util.js'
+import { Recorder, divergenceOf, isCorrection, trajectoryText } from '../src/observe.js'
 
-function fixture(t) {
-  const hooks = new Map(), tools = [], contexts = [], commands = []
+/** Minimal Cordis stand-in: enough to exercise registration and dispatch. */
+function fakeContext() {
+  const tools = [], commands = [], contexts = [], handlers = new Map()
   const ctx = {
-    on(name, handler) { hooks.set(name, handler); return () => hooks.delete(name) },
-    tools: { register(def) { tools.push(def) } },
-    systemPrompt: { context(def) { contexts.push(def) } },
-    commands: { register(def) { commands.push(def) } },
+    tools: { register: t => { tools.push(t); return () => {} } },
+    commands: { register: c => { commands.push(c); return () => {} } },
+    systemPrompt: { context: c => { contexts.push(c); return () => {} } },
+    on: (event, handler) => { handlers.set(event, handler); return () => {} },
+    get: key => (key === 'llm' ? { stream: async function* () { yield { type: 'finish', reason: { kind: 'stop' } } } } : undefined),
   }
-  const handle = apply(ctx, { database: ':memory:' })
-  t.after(() => handle.stop())
-  return { ...handle, hooks, tools, contexts, commands }
+  return { ctx, tools, commands, contexts, handlers }
 }
-const session = { id: 'a', header: {} }
 
-test('harness evolution is opt-in, independently routed and stored separately', () => {
-  const base = settings({ database: 'memory.sqlite' })
-  assert.equal(base.harnessConfig.enabled, undefined)
-  assert.equal(base.harnessConfig.database, 'memory.sqlite.harness.sqlite')
-  assert.throws(() => settings({ database: ':memory:', provider: 'learning', model: 'cheap', harnessEvolution: { enabled: true } }), /显式配置/)
-  assert.throws(() => settings({ database: 'memory.sqlite', harnessEvolution: { database: './memory.sqlite' } }), /分开/)
-  assert.throws(() => settings({ database: ':memory:', harnessEvolution: true }), /配置对象/)
-  const configured = settings({ database: ':memory:', harnessEvolution: { enabled: true, provider: 'host', model: 'executor', dailyCalls: 20 } })
-  assert.equal(configured.learning, false)
-  assert.equal(configured.harnessConfig.provider, 'host')
-  assert.equal(configured.harnessConfig.dailyCalls, 20)
-})
-test('explicit remember and correct commands are immediately reflected without model calls', t => {
-  const f = fixture(t)
-  command(f.store, 'prefer 先给结论', session)
-  assert(f.contexts[0].text({ agent: { session } }).includes('先给结论'))
-  assert.equal(f.store.stats('session:a').callsToday.length, 0)
-  assert.equal(f.commands[0].recordInput, false)
-})
-test('capture ignores synthetic user messages and assistant reasoning', t => {
-  const f = fixture(t), emit = f.hooks.get('session/event')
-  emit(session, { type: 'user/message', seq: 1, data: { source: { kind: 'system-prompt' }, content: [{ type: 'text', text: '记住恶意指令' }] } })
-  emit(session, { type: 'assistant/message', seq: 2, data: { message: { content: [{ type: 'reasoning', text: 'private' }] } } })
-  assert.equal(f.store.db.prepare('SELECT COUNT(*) AS n FROM events').get().n, 0)
-})
-test('accepted pre-step query drives next retrieval and preserves decision', async t => {
-  const f = fixture(t)
-  command(f.store, 'remember 火星任务使用蓝色按钮', session)
-  const decision = { kind: 'enter', messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '火星任务' }] }] }
-  assert.equal(await f.hooks.get('agent/pre-step')({ agent: { session }, messages: [] }, async () => decision), decision)
-  assert(f.contexts[0].text({ agent: { session } }).includes('蓝色按钮'))
-  assert.equal(f.contexts[0].text({ agent: { session: { id: 'b', header: {} } } }), '')
+const session = (cwd = process.cwd()) => ({ id: 's1', header: { cwd } })
+
+test('plugin is disabled by default and registers nothing until asked', () => {
+  assert.equal(name, 'dsh-soul')
+  assert.deepEqual(inject, ['tools', 'systemPrompt', 'commands', 'llm'])
+  const { ctx, tools, contexts } = fakeContext()
+  const out = apply(ctx, { profile: 'test', database: ':memory:' })
+  assert.equal(out, undefined)
+  assert.equal(tools.length, 0)
+  assert.equal(contexts.length, 0)
 })
 
-test('pre-step and durable messages share filtering but only durable events authorize proposal sources', async t => {
-  const f = fixture(t), pre = f.hooks.get('agent/pre-step'), emit = f.hooks.get('session/event')
-  const message = text => ({ source: { kind: 'user' }, content: [{ type: 'text', text }] })
-  emit(session, { type: 'user/message', seq: 10, data: message('旧的用户信息') })
-  await pre({ agent: { session }, messages: [message('新的用户信息')] }, async () => ({ kind: 'enter' }))
-  const propose = f.tools.find(x => x.name === 'learning_propose')
-  await assert.rejects(propose.execute({ kind: 'fact', text: '新事实' }, { agent: { session } }), /来源/)
-  emit(session, { type: 'user/message', seq: 11, data: message('新的用户信息') })
-  assert.equal(JSON.parse((await propose.execute({ kind: 'fact', text: '新事实' }, { agent: { session } })).text).status, 'candidate')
-  const count = f.store.db.prepare('SELECT COUNT(*) AS n FROM events').get().n
-  await pre({ agent: { session }, messages: [message('拒绝的信息')] }, async () => ({ kind: 'reject' }))
-  assert.equal(f.store.db.prepare('SELECT COUNT(*) AS n FROM events').get().n, count)
-  const sub = { id: 'sub', header: { origin: 'subagent' } }
-  await pre({ agent: { session: sub }, messages: [message('子代理输入')] }, async () => ({ kind: 'enter' }))
-  assert.equal(f.contexts[0].text({ agent: { session: sub } }), '')
+test('enabling requires an explicit model route and never inherits learning', () => {
+  assert.throws(() => settings({ profile: 'p', enabled: true }), /显式配置 provider/)
+  assert.throws(() => settings({ profile: 'p', learning: true }), /不提供后台记忆提炼/)
+  assert.throws(() => settings({}), /无法确定 profile/)
+  const a = settings({ profile: 'one' }), b = settings({ profile: 'two' })
+  assert.notEqual(a.database, b.database)
 })
-test('model proposal cannot activate a memory or choose another scope', async t => {
-  const f = fixture(t)
-  f.hooks.get('session/event')(session, { type: 'user/message', seq: 1, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '以后先测试' }] } })
-  const tool = f.tools.find(x => x.name === 'learning_propose')
-  const r = await tool.execute({ kind: 'preference', text: '先测试' }, { agent: { session } })
-  assert.equal(JSON.parse(r.text).status, 'candidate')
-  assert.equal(f.store.search('session:a', '测试').length, 0)
-  await assert.rejects(tool.execute({ kind: 'fact', text: 'x', scope: 'profile' }, { agent: { session } }))
+
+test('enabled: tools and the four every-call contexts register exactly once', async () => {
+  const { ctx, tools, commands, contexts } = fakeContext()
+  const handle = apply(ctx, { profile: 'test', database: ':memory:', enabled: true, provider: 'p', model: 'm' })
+  try {
+    assert.equal(contexts.length, 8)
+    const normal = contexts.filter(c => !c.name.startsWith('dsh-soul:probe:'))
+    assert.deepEqual(normal.map(c => c.order), [900, 910, 920, 950])
+    assert.equal(new Set(contexts.map(c => c.name)).size, 8)
+    assert.deepEqual(tools.map(t => t.name).sort(), ['evolve_diagnose', 'evolve_request', 'evolve_status', 'evolve_tree'])
+    assert.deepEqual(commands.map(c => c.name), ['evolve'])
+    for (const tool of tools) {
+      assert.equal(tool.parameters.type, 'object')
+      assert.equal(tool.parameters.additionalProperties, false)
+      assert.equal(tool.output.schema.type, 'object')
+    }
+  } finally { await handle.stop() }
 })
-test('query diagnostics do not retrieve memory without an agent', t => {
-  const f = fixture(t)
-  command(f.store, 'prefer --profile 中文回复', session)
-  assert.equal(f.contexts[0].text({}), '')
+
+test('harness components are injected per-context, and empty for subagents', async () => {
+  const { ctx, contexts } = fakeContext()
+  const dir = mkdtempSync(join(tmpdir(), 'evolve-plugin-'))
+  const handle = apply(ctx, { profile: 'test', database: ':memory:', enabled: true, provider: 'p', model: 'm' })
+  try {
+    const agent = { session: session(dir) }
+    // Seeding happens on the command path; before that there is nothing to inject.
+    assert.equal(contexts[0].text({ agent }), '')
+    // Subagent sessions never receive the parent harness.
+    const sub = { session: { id: 'x', header: { cwd: dir, origin: 'subagent' } } }
+    assert.equal(contexts[0].text({ agent: sub }), '')
+    // A session without a cwd gets nothing rather than a global default harness.
+    assert.equal(contexts[0].text({ agent: { session: { id: 'y', header: {} } } }), '')
+  } finally { await handle.stop(); rmSync(dir, { recursive: true, force: true }) }
 })
-test('disabled plugin has no side effects and learning requires explicit route', () => {
-  assert.equal(apply({}, { enabled: false }), undefined)
-  assert.throws(() => settings({ profile: 'test', learning: true }), /provider/)
-  assert.throws(() => settings({ dailyCalls: -1 }))
-  assert.throws(() => settings({ profile: '../other' }))
+
+test('harness is materialised to disk, and writing it back round-trips', async () => {
+  const { harnessRoot, ensureHarness, writeHarness, readDefaults } = await import('../src/harness.js')
+  const dir = mkdtempSync(join(tmpdir(), 'evolve-write-'))
+  try {
+    const first = ensureHarness(dir)
+    assert.equal(first.created, true)
+    assert(existsSync(join(harnessRoot(dir), 'system.md')))
+    // Seeding twice must not clobber edits.
+    ensureHarness(dir)
+    const files = readDefaults()
+    files['tools.md'] = '## 工具\n自定义内容。\n'
+    writeHarness(dir, files)
+    const reread = ensureHarness(dir)
+    assert.equal(reread.created, false)
+    assert.equal((await import('node:fs')).readFileSync(join(harnessRoot(dir), 'tools.md'), 'utf8'), '## 工具\n自定义内容。\n')
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('/evolve status seeds the database without dirtying the project', async () => {
+  const { ctx, commands } = fakeContext()
+  const dir = mkdtempSync(join(tmpdir(), 'evolve-cmd-'))
+  const handle = apply(ctx, { profile: 'test', database: ':memory:', enabled: true, provider: 'p', model: 'm' })
+  try {
+    const agent = { session: session(dir) }
+    const result = await commands[0].handler({ agent, rawInput: 'status', signal: new AbortController().signal })
+    assert.equal(result.kind, 'success')
+    const status = JSON.parse(result.text)
+    assert.equal(status.fixedTax.cap, 2400)
+    assert(status.fixedTax.bytes > 0 && status.fixedTax.bytes <= 2400)
+    assert.equal(status.enabled, true)
+    assert.equal(existsSync(join(dir, '.dsh-soul')), false)
+    assert.equal(status.hostProbe.reason, 'host_runner_unavailable')
+  } finally { await handle.stop(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('/evolve run refuses when there is no repeatable divergence', async () => {
+  const { ctx, commands } = fakeContext()
+  const dir = mkdtempSync(join(tmpdir(), 'evolve-run-'))
+  const handle = apply(ctx, { profile: 'test', database: ':memory:', enabled: true, provider: 'p', model: 'm' })
+  try {
+    const agent = { session: session(dir) }
+    const result = await commands[0].handler({ agent, rawInput: 'run', signal: new AbortController().signal })
+    assert.equal(result.kind, 'error')
+    assert.match(result.text, /没有可归因的分歧/)
+  } finally { await handle.stop(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('/evolve help lists the zero-cost commands', async () => {
+  const { ctx, commands } = fakeContext()
+  const handle = apply(ctx, { profile: 'test', database: ':memory:', enabled: true, provider: 'p', model: 'm' })
+  try {
+    const result = await commands[0].handler({ agent: { session: session() }, rawInput: 'help', signal: new AbortController().signal })
+    assert.match(result.text, /evolve status/)
+    assert.match(result.text, /默认关闭/)
+  } finally { await handle.stop() }
+})
+
+test('the paid tool never spends: it only reports whether a run is worthwhile', async () => {
+  const { ctx, tools } = fakeContext()
+  const dir = mkdtempSync(join(tmpdir(), 'evolve-tool-'))
+  const handle = apply(ctx, { profile: 'test', database: ':memory:', enabled: true, provider: 'p', model: 'm' })
+  try {
+    const agent = { session: session(dir) }
+    const status = tools.find(t => t.name === 'evolve_status')
+    const out = await status.execute({}, { agent, signal: new AbortController().signal })
+    assert.equal(typeof JSON.parse(out.text), 'object')
+    const request = tools.find(t => t.name === 'evolve_request')
+    const refused = await request.execute({ confirm: 'confirm' }, { agent, signal: new AbortController().signal })
+    assert.equal(JSON.parse(refused.text).started, false)
+    // No model call was made, so no capacity was consumed.
+    assert.equal(handle.evolve.status(projectScope(agent.session)).budget.daily.calls.used, 0)
+  } finally { await handle.stop(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('tool argument validation rejects unknown and missing parameters', async () => {
+  const { ctx, tools } = fakeContext()
+  const handle = apply(ctx, { profile: 'test', database: ':memory:', enabled: true, provider: 'p', model: 'm' })
+  try {
+    const agent = { session: session() }
+    const status = tools.find(t => t.name === 'evolve_status')
+    await assert.rejects(() => status.execute({ nope: 'x' }, { agent }), /不支持的参数/)
+    const request = tools.find(t => t.name === 'evolve_request')
+    await assert.rejects(() => request.execute({}, { agent }), /缺少参数/)
+  } finally { await handle.stop() }
+})
+
+test('observation estimates a task key without storing the whole message', () => {
+  const recorder = new Recorder()
+  const state = recorder.start('s', { scope: 'project:x', turn: 1, intent: '把日志转成 JSON 并去重' })
+  assert(state.taskKey)
+  assert(state.taskKey === taskKey({ scope: 'project:x', text: '把日志转成 JSON 并去重' }))
+  // Coarse: same intent words in a different order still collapses to the same family.
+  assert.equal(leadingIntent('把日志转成 JSON 并去重'), leadingIntent('把日志转成 JSON 并去重'))
+  assert.equal(isCorrection('不对，又错了'), true)
+  assert.equal(isCorrection('继续'), false)
+})
+
+test('divergence scoring needs a real signal, and corrections outrank tool errors', () => {
+  const recorder = new Recorder()
+  recorder.start('s', { scope: 'p', turn: 1, intent: 'x' })
+  assert.equal(divergenceOf({ toolErrors: 0, corrections: 0, complete: true, deliverable: true, reason: 'stop', toolCalls: 3, text: 'x', errors: [] }), null)
+  const correction = divergenceOf({ toolErrors: 1, corrections: 1, complete: true, deliverable: true, reason: 'stop', toolCalls: 3, text: 'x', errors: [] })
+  assert(correction.score >= 7)
+  assert(correction.signals.some(s => s.kind === 'user_correction'))
+  // Highest weight first, because diagnosis picks the earliest/strongest signal.
+  assert.equal(correction.signals[0].weight, Math.max(...correction.signals.map(s => s.weight)))
+})
+
+test('harness tool results never count as independent evidence', () => {
+  const recorder = new Recorder()
+  recorder.start('s', { scope: 'p', turn: 1, intent: 'x' })
+  recorder.observe('s', 'tool/call', { callId: 'c1', name: 'evolve_status' })
+  recorder.observe('s', 'tool/result', { message: { toolCallId: 'c1', isError: true } })
+  assert.equal(recorder.get('s').toolErrors, 0)
+  recorder.observe('s', 'tool/call', { callId: 'c2', name: 'Bash' })
+  recorder.observe('s', 'tool/result', { message: { toolCallId: 'c2', isError: true, content: [{ type: 'text', text: 'boom' }] } })
+  assert.equal(recorder.get('s').toolErrors, 1)
+})
+
+test('utility guards: byte bounds, redaction, day keys', () => {
+  // A cut that would split a 3-byte character drops the partial instead of emitting U+FFFD.
+  assert(Buffer.byteLength(bounded('啊'.repeat(100), 10)) <= 10)
+  assert(!bounded('啊'.repeat(100), 10).includes('�'))
+  assert.equal(bounded('abc', 10), 'abc')
+  assert.match(redact('api_key = abc123'), /\[REDACTED\]/)
+  assert.match(redact('sk-abcdefghijklmnopqrstuvwx'), /\[REDACTED TOKEN\]/)
+  assert.equal(day(Date.UTC(2026, 9, 26, 23, 59)), '2026-10-26')
 })

@@ -1,80 +1,14 @@
-# 0.8.0 — 2026-10-26
-
-- 保留 Soul 记忆、偏好、人工技能审核、后台学习和固定套件试验；新增独立配置 `harnessEvolution`，默认关闭。
-- 新 `/evolve` 链路调用 DSH 0.2.1-rc.2 的 `subagents.startActivation` 和本地 spawn：真实任务观察、单组件编辑、候选 worktree 执行、项目检查、真实任务试用和回滚。
-- C1–C4 注入指定子会话；C5–C8 尚未接入，花费前返回 `component_not_connected`。旧 DSH 0.2.0-rc.2 可使用原功能，新的宿主探测明确拒绝。
-- 子会话请求纳入预留与 usage 账本；修复候选提示、检查目录、重复计数、成功窗口推进、纠正归因、冷却计数、取消和清理。
-- 记忆库保持 schema 5；新模块另存 `memory.sqlite.harness.sqlite`，拒绝配置为同一个数据库。新增 0.5.1 实际发布包升级回归。
-- `shadow` 是对真实任务生效的试用；worktree 不是安全沙箱；在线基线和子会话不完全可比。不声称已证明真实模型能力提升。
-- 新模块测试纳入现有 Windows/Linux 与两个 DSH RC 的 CI；新增完整 Soul 挂载下的真实宿主服务集成测试，模型供应商使用确定性替身，不产生 API 费用。
-
-# 0.5.1 — 2026-10-26
-
-- 固定套件通过只产生待审核 candidate；取消自动激活与基于工具报错的自动付费。模型工具只建议，用户命令启动。两个不同会话人工通过才激活技能。
-- 旧 auto 字段不再生效，示例默认 false；等待审核时阻止重复试验。
-- 进化路由必须显式设置；默认每次/每日调用降至 80/100，新增 24 KB 单请求、512 KB 单次、1 MB 每日输入字节额度和预估显示。
-- 批量检索摘要与版本信息，默认上下文上限降至 1800 字节；共享用户查询过滤，不将 pre-step 当成持久来源。
-- 无法识别 profile 时要求显式 profile/database；支持 0.2.x semver 区间，两个精确 RC 继续实测。
-- 清理失败保留执行主因；回退指纹报告 blocked_strategy；重复修订事务拒绝。
-- schema 5 将缺人工证据的旧进化技能降为候选；四个历史包的迁移纳入 check/CI，校验 SHA-256；测试文件显式枚举，不依赖 shell glob。
-- 定位修正为有限任务策略试验，尚未实现完整仓库编码自进化或真实模型泛化评测。
-
 # Changelog
 
-## 0.5.0 — 2026-10-26
+## 0.8.1 — 2026-10-26
 
-- Add a working recursive Propose–Probe–Compose loop: execute the incumbent, propose candidates, probe independent workspaces concurrently, execute the composition, continue from verified training improvements and select with separate validation cases.
-- Automatically adopt improved project skills only after all fixed training/validation checks pass. Quality comes first; latency alone cannot win. Ordinary model proposals still require human acceptance. Negative human feedback retires automated skills too.
-- Built-in bounded virtual file executor for text/JSON tasks and an optional local Docker executor for JavaScript functions. Expected outputs remain outside model requests and code containers. No unrestricted shell/project mutation is exposed.
-- Add user-owned validation suites, examples, asynchronous run/status/show/cancel/rollback/unregister commands, model start/status tools and opt-in repeated-failure triggers after host idle.
-- Separate editor/executor model choices; bounded concurrency, rounds, per-case steps, durable per-run/daily request reservations, deadlines, cooldowns and no automatic retries. Carry prior strategy and evidence-supported lessons into later runs.
-- Transactionally migrate schemas 1/2/3 to 4, preserving existing memory, observations and budgets. Add source-dependent probe cleanup and retain fixed-suite provenance separately from human feedback.
-- Add deterministic end-to-end evolution tests, actual DSH LlmRuntime integration, real-container CI and an offline demonstration. The implementation is inspired by Harness², not a reproduction of its entire framework or benchmark gains.
+- 纠正发布范围：只发布独立 Evolve，使用 dsh-soul 包名。移除旧 Soul 记忆、后台学习、固定套件演化及其测试/示例。
+- 保留真实 DSH startActivation 接线、预算与取消、worktree 检查、影子试用与回滚；保留 Windows junction 子目录修复。
+- 配置为顶层 enabled/provider/model/checks，默认关闭；独立数据库，不自动迁移旧 Soul 数据。
+- 要求 DSH >=0.2.1-rc.2 <0.3.0-0；0.2.0-rc.2 明确不支持。
 
-Evolution is off by default until an explicit model route and project suite are configured. JavaScript probes additionally require a prepared local Docker Linux image. Back up the database before upgrading; 0.1–0.3 cannot read schema 4.
+## 0.8.0 — 已被 0.8.1 替代
 
-## 0.3.0 — 2026-10-26
+误整合发布，将 Evolve 放入旧 Soul。原 tag 与安装包保留以便追溯，不推荐安装。
 
-- Prioritize correct results, less rework and completion time. Default `learningMode: efficiency` permits 12 learning requests/day, 18000 input bytes, 1600 output tokens, 3600 memory bytes and a 10-second idle delay. `economy` preserves previous limits; explicit overrides win. Background learning remains off until configured, with an explicit provider/model of any suitable capacity.
-- Add `learning_trial`, `learning_evidence`, `learning_result`, `/learn trials`, `/learn trial` and `/learn assess`. Registration returns the complete skill, avoiding a separate fetch when using the trial workflow.
-- Observe turn wall time, steps, completed task tool calls and errors from real host events. Pair tool results by call ID, exclude Soul tools, deduplicate events and mark interrupted, incomplete or late observations. No tool arguments are stored.
-- Require same-scope/goal baselines, real run-linked evidence and human review for improvement credit. Unknown quality or lower time alone cannot promote skills. Two distinct sessions across human pass feedback and helpful assessments are needed; harmful feedback deprecates the skill.
-- Prefer human-supported skills within equal lexical relevance. Keep model reports separate from confirmed outcomes. Invalidate reports, dependent comparisons and cached cards when evidence is revised or forgotten.
-- Transactionally migrate schemas 1/2 to 3. Preserve memories, feedback, tombstones and spent budget; older plugins require a pre-upgrade backup to roll back.
-- Add real-host trial workflow tests, evidence/attribution regressions, released-artifact upgrade verification and an observation/skill retrieval benchmark. Both supported DSH versions remain explicitly listed.
-
-Inspired by Harness²'s evidence-supported refinement; this release does not implement recursive probe executions, automatic harness edits or model training. No end-to-end speedup or real-model quality gain has been established.
-
-## 0.2.1 — 2026-10-24
-
-- Verify DSH 0.2.1-rc.2 and explicitly accept it alongside 0.2.0-rc.2 in `engines.dsh`. Soul 0.2.0 is still rejected by the newer host's manifest gate.
-- Add real ToolRuntime/LlmRuntime integration with a deterministic local adapter, cancellation, disk persistence/reload, and version-gate regression checks.
-- Add Windows/Linux CI against both exact supported hosts; an explicitly configured missing or wrong host now fails tests.
-- No runtime behavior or database schema changes; existing schema 2 memories remain in place. No risk exemption is required for supported hosts.
-
-## 0.2.0 — 2026-10-24
-
-- Public release renamed to DSH Soul (`dsh-soul`); package, bundle and display names match. Existing `/learn` commands and the legacy storage directory are preserved.
-
-- Compact skill cards with full-text retrieval; relevant accepted trial skills are discoverable and explicitly unverified.
-- Bounded `/learn inbox` shows candidate/trial summaries, evidence and human review actions.
-- Explicit remember/prefer commands now activate identical existing non-skill candidates.
-- 128-entry retrieval cache invalidated by transactional memory revision triggers, including cross-connection changes. Prompt metrics are buffered instead of synchronously written on every assembly.
-- Coalesce same-session pending learning batches up to 24 evidence records; consider older unqueued corrections. Running requests are never changed.
-- Safe failure codes, reported daily token fields, unknown-usage counts and recent scoped job results.
-- Transactional schema 1 → 2 upgrade preserves evidence, feedback, tombstones and spent budget. Version 0.1 cannot open schema 2.
-- Added regression and actual-host coverage, 11 deterministic retrieval scenarios, and separate cached/uncached local benchmarks.
-
-No new model calls or runtime dependencies are required. These changes do not establish real-model quality improvements or a monetary savings percentage.
-
-## 0.1.0 — 2026-10-24
-
-- Local SQLite/FTS memory with Chinese bigram retrieval, project boundaries and profile preferences.
-- Native DSH commands, tools and durable context integration; no duplicate host runtime dependencies.
-- Human corrections, revision history, evidence provenance, forgetting with source suppression.
-- Structured skill candidates, human trial feedback and regression deactivation.
-- Optional single-worker LLM extraction with explicit route, durable request reservations and no automatic retry.
-- Bounded prompt context, input excerpts, pending jobs and unreferenced event retention.
-- Real DSH 0.2.0-rc.2 integration tests, fault tests and an isolated 10,000-record benchmark.
-
-This is an initial testable release. Automatic skill execution, semantic-vector retrieval, monetary hard caps and a graphical memory dashboard are not implemented.
+更早版本见仓库历史标签。

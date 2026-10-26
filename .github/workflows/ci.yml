@@ -3,18 +3,6 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
-  sandbox:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
-      - run: docker pull node:24-alpine
-      - run: node --test tests/docker.test.mjs
-        env:
-          DSH_SOUL_DOCKER_IMAGE: node:24-alpine
-          DSH_SOUL_TEST_SECRET: should-not-enter-probes
   test:
     strategy:
       matrix:
@@ -26,7 +14,7 @@ jobs:
         with:
           node-version: '24'
       - run: npm run check
-      - run: npm run demo:harness
+      - run: npm run demo
       - run: npm pack --dry-run
   host:
     strategy:
@@ -43,7 +31,7 @@ jobs:
       - name: Install isolated host services
         run: npm install --prefix work/host --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org @deepseek-ai/dsh@${{ matrix.dsh }}
       - name: Check against the exact host version (missing host fails)
-        run: npm run check
+        run: npm run test:host
         env:
           DSH_TEST_PACKAGE: ${{ github.workspace }}/work/host/node_modules/@deepseek-ai/dsh/package.json
           DSH_TEST_VERSION: ${{ matrix.dsh }}

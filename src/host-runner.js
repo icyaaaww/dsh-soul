@@ -15,7 +15,7 @@ export function createHostRunner(ctx, { backend = 'spawn', requestTimeoutMs = 60
     return { ok: true, backend, api: 'subagents.startActivation', supportedTargets: ['C1', 'C2', 'C3', 'C4'] }
   }
   for (const [path, order] of [['system.md', 900], ['guardrails.md', 910], ['tools.md', 920], ['memory.md', 950]]) {
-    disposers.push(ctx.systemPrompt.context({ name: `dsh-soul-harness:probe:${path}`, order, interpolate: false,
+    disposers.push(ctx.systemPrompt.context({ name: `dsh-soul:probe:${path}`, order, interpolate: false,
       text: ({ agent }) => pending.get(String(agent?.id))?.files[path] ?? '' }))
   }
   disposers.push(ctx.on('session/event', (session, event) => {

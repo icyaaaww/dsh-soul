@@ -9,15 +9,15 @@
  *
  * This proves the loop works. It does NOT prove the plugin improves a real agent.
  */
-import { Store } from '../src/harness-evolution/src/store.js'
-import { Evolve } from '../src/harness-evolution/src/evolve.js'
-import { budgetSettings } from '../src/harness-evolution/src/budget.js'
-import { diagnose } from '../src/harness-evolution/src/diagnose.js'
-import { sizeReport } from '../src/harness-evolution/src/tree.js'
+import { Store } from '../src/store.js'
+import { Evolve } from '../src/evolve.js'
+import { budgetSettings } from '../src/budget.js'
+import { diagnose } from '../src/diagnose.js'
+import { sizeReport } from '../src/tree.js'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
-const dir = fileURLToPath(new URL('../src/harness-evolution/harness/default/', import.meta.url))
+const dir = fileURLToPath(new URL('../harness/default/', import.meta.url))
 const files = {}
 for (const name of ['system.md', 'guardrails.md', 'memory.md', 'tools.md', 'subagents.md']) {
   files[name] = readFileSync(dir + name, 'utf8')

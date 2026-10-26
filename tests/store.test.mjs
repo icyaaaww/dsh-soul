@@ -157,10 +157,11 @@ test('an explicit human command may reintroduce a forgotten fact without enablin
   assert.equal(s.get(second, 'p').status, 'active')
   assert(s.blocked(`event:${oldSource}`))
 })
-test('revision always has a distinct version even when another memory has identical text', t => {
+test('revision refuses duplicate live fingerprints and rolls back without changing either memory', t => {
   const s = setup(t), a = s.remember('p', 'fact', '旧值', 's'), b = s.remember('p', 'fact', '新值', 's')
-  const revised = s.revise(a, 'p', '新值', 's')
-  assert.notEqual(revised, b)
-  assert.equal(s.get(revised, 'p').supersedes, a)
-  assert.equal(s.get(revised, 'p').version, 2)
+  const before = s.db.prepare('SELECT COUNT(*) AS n FROM events').get().n
+  assert.throws(() => s.revise(a, 'p', '新值', 's'), { code: 'duplicate_memory' })
+  assert.equal(s.db.prepare('SELECT COUNT(*) AS n FROM events').get().n, before)
+  assert.equal(s.get(a, 'p').status, 'active'); assert.equal(s.get(b, 'p').status, 'active')
+  assert.equal(s.db.prepare("SELECT COUNT(*) AS n FROM memories WHERE fingerprint=? AND status!='deprecated'").get(s.get(b, 'p').fingerprint).n, 1)
 })

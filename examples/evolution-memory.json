@@ -4,7 +4,7 @@
   "title": "数字数组规范化",
   "keywords": ["数字数组", "去重排序"],
   "runtime": "memory",
-  "auto": true,
+  "auto": false,
   "seed": {
     "title": "读取并规范化数字数组",
     "preconditions": ["input.json 是由有限数字组成的 JSON 数组"],

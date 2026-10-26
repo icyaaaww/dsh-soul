@@ -202,7 +202,8 @@ test('real host compatibility gate accepts the release and rejects untested vers
   if (version === '0.2.1-rc.2') {
     const old = { ...pkg, version: '0.2.0', engines: { ...pkg.engines, dsh: '0.2.0-rc.2' } }
     assert.equal(evaluatePluginCompatibility(old, {}, version).requirements['engines.dsh'], '0.2.0-rc.2')
-    for (const unsupported of ['0.2.1-rc.1', '0.2.1', '0.3.0']) {
+    for (const compatible of ['0.2.1-rc.3', '0.2.1', '0.2.2-rc.1', '0.2.9']) assert.equal(evaluatePluginCompatibility(pkg, {}, compatible), undefined)
+    for (const unsupported of ['0.2.0-rc.1', '0.3.0-rc.1', '0.3.0']) {
       assert(evaluatePluginCompatibility(pkg, {}, unsupported))
     }
   }
@@ -309,16 +310,25 @@ test('real DSH routes run the full evolution pipeline, expose status and inject 
     assert.equal(registered.result.kind, 'success', registered.result.text)
     const start = await tools.execute({ callId: 'start', name: 'learning_evolve', arguments: { suite: 'numbers' }, agent, signal })
     assert.equal(start.isError, false, JSON.stringify(start))
-    const runId = JSON.parse(start.content[0].text).id
+    assert.equal(handle.evolution.running, null)
+    assert.equal(JSON.parse(start.content[0].text).paidExecution, 'user_command_only')
+    const launched = await commands.execute(agent, '/learn evolve run numbers', [], signal)
+    assert.equal(launched.result.kind, 'success', launched.result.text)
+    const runId = JSON.parse(launched.result.text).id
     await handle.evolution.running
     const status = await tools.execute({ callId: 'status', name: 'learning_evolution_status', arguments: { id: runId }, agent, signal })
     assert.equal(status.isError, false)
     const run = JSON.parse(status.content[0].text).runs[0]
-    assert.equal(run.state, 'adopted', JSON.stringify(run))
+    assert.equal(run.state, 'awaiting_review', JSON.stringify(run))
     assert(routes.includes('executor')); assert(routes.includes('editor'))
     session.append('user/message', createUserMessage({ content: [{ type: 'text', text: '请规范化数字数组' }], source: { kind: 'user' } }), { surfaceOp: 'append' })
     const assembly = await prompts.assemble({ agent, scope: agent })
-    assert(assembly.contexts.some(c => c.text.includes(run.memory) && c.text.includes('fixed_suite')))
+    assert(!assembly.contexts.some(c => c.text.includes(run.memory)))
+    await commands.execute(agent, `/learn accept ${run.memory}`, [], signal)
+    handle.store.feedback(run.memory, run.scope, 'user-one', 'pass', '真实任务通过')
+    handle.store.feedback(run.memory, run.scope, 'user-two', 'pass', '不同会话真实任务通过')
+    const reviewed = await prompts.assemble({ agent, scope: agent })
+    assert(reviewed.contexts.some(c => c.text.includes(run.memory) && c.text.includes('fixed_suite')))
     assert(!JSON.stringify(handle.evolution.inspect(run.scope, run.id)).includes('PRIVATE_REASONING'))
     const stats = JSON.parse((await commands.execute(agent, '/learn status', [], signal)).result.text)
     assert.equal(stats.metrics.find(m => m.key === 'contained_errors')?.value ?? 0, 0)

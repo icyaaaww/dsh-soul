@@ -36,6 +36,23 @@ test('accepted pre-step query drives next retrieval and preserves decision', asy
   assert(f.contexts[0].text({ agent: { session } }).includes('蓝色按钮'))
   assert.equal(f.contexts[0].text({ agent: { session: { id: 'b', header: {} } } }), '')
 })
+
+test('pre-step and durable messages share filtering but only durable events authorize proposal sources', async t => {
+  const f = fixture(t), pre = f.hooks.get('agent/pre-step'), emit = f.hooks.get('session/event')
+  const message = text => ({ source: { kind: 'user' }, content: [{ type: 'text', text }] })
+  emit(session, { type: 'user/message', seq: 10, data: message('旧的用户信息') })
+  await pre({ agent: { session }, messages: [message('新的用户信息')] }, async () => ({ kind: 'enter' }))
+  const propose = f.tools.find(x => x.name === 'learning_propose')
+  await assert.rejects(propose.execute({ kind: 'fact', text: '新事实' }, { agent: { session } }), /来源/)
+  emit(session, { type: 'user/message', seq: 11, data: message('新的用户信息') })
+  assert.equal(JSON.parse((await propose.execute({ kind: 'fact', text: '新事实' }, { agent: { session } })).text).status, 'candidate')
+  const count = f.store.db.prepare('SELECT COUNT(*) AS n FROM events').get().n
+  await pre({ agent: { session }, messages: [message('拒绝的信息')] }, async () => ({ kind: 'reject' }))
+  assert.equal(f.store.db.prepare('SELECT COUNT(*) AS n FROM events').get().n, count)
+  const sub = { id: 'sub', header: { origin: 'subagent' } }
+  await pre({ agent: { session: sub }, messages: [message('子代理输入')] }, async () => ({ kind: 'enter' }))
+  assert.equal(f.contexts[0].text({ agent: { session: sub } }), '')
+})
 test('model proposal cannot activate a memory or choose another scope', async t => {
   const f = fixture(t)
   f.hooks.get('session/event')(session, { type: 'user/message', seq: 1, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '以后先测试' }] } })
@@ -52,7 +69,7 @@ test('query diagnostics do not retrieve memory without an agent', t => {
 })
 test('disabled plugin has no side effects and learning requires explicit route', () => {
   assert.equal(apply({}, { enabled: false }), undefined)
-  assert.throws(() => settings({ learning: true }), /provider/)
+  assert.throws(() => settings({ profile: 'test', learning: true }), /provider/)
   assert.throws(() => settings({ dailyCalls: -1 }))
   assert.throws(() => settings({ profile: '../other' }))
 })

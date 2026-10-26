@@ -4,7 +4,7 @@ import { fail } from './evolution-suite.js'
 export function evolutionGenerate(llm, config) {
   return async ({ system, data, phase, signal, onUsage }) => {
     const json = JSON.stringify(data)
-    if (Buffer.byteLength(json) > 96000) throw fail('input_limit')
+    if (Buffer.byteLength(json) + Buffer.byteLength(system) > config.maxInputBytes) throw fail('input_limit')
     let text = '', finish
     for await (const chunk of llm.stream({
       provider: config.provider, model: phase === 'execute' ? config.model : config.editorModel,

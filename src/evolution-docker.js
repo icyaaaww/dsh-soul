@@ -45,7 +45,7 @@ export async function prepareDocker(image, signal) {
 export async function executeJavaScript(prepared, { files, input, signal, timeoutMs = 10000 }) {
   if (!files.has('solution.mjs')) return { ok: false, output: '', error: 'missing_solution' }
   const folder = await mkdtemp(join(tmpdir(), 'dsh-soul-probe-')), container = `dsh-soul-${randomUUID()}`
-  let created = false, creationAttempted = false
+  let created = false, creationAttempted = false, outcome, primaryError
   try {
     await chmod(folder, 0o755)
     if (folder.includes(',')) throw fail('sandbox_unavailable', 'Docker 临时目录不能包含逗号')
@@ -66,11 +66,11 @@ export async function executeJavaScript(prepared, { files, input, signal, timeou
       { signal, env: prepared.env, input: JSON.stringify(input), timeoutMs })
     const inspected = await cli([...prepared.args, 'inspect', '--format', '{{.State.Running}} {{.State.ExitCode}} {{.State.OOMKilled}}', container], { signal, env: prepared.env })
     const ok = execution.code === 0 && inspected.code === 0 && inspected.stdout.trim() === 'false 0 false'
-    return { ok, output: execution.stdout, error: ok ? null : 'program_error' }
+    outcome = { ok, output: execution.stdout, error: ok ? null : 'program_error' }
   } catch (error) {
-    if (signal.aborted) throw signal.reason
-    if (created && ['sandbox_timeout', 'sandbox_output_limit'].includes(error.code)) return { ok: false, output: '', error: error.code }
-    throw error
+    if (signal.aborted) primaryError = signal.reason
+    else if (created && ['sandbox_timeout', 'sandbox_output_limit'].includes(error.code)) outcome = { ok: false, output: '', error: error.code }
+    else primaryError = error
   } finally {
     // Remove only our exact random container, and wait for cleanup before releasing this probe.
     let cleanupError
@@ -83,7 +83,16 @@ export async function executeJavaScript(prepared, { files, input, signal, timeou
         }
       } catch { cleanupError = fail('sandbox_cleanup', `无法确认试验容器已清理：${container}`) }
     }
-    await rm(folder, { recursive: true, force: true })
-    if (cleanupError) throw cleanupError
+    try { await rm(folder, { recursive: true, force: true }) }
+    catch { cleanupError ??= fail('sandbox_cleanup', '无法清理本次临时文件') }
+    outcome = finishProbe(outcome, primaryError, cleanupError)
   }
+  return outcome
+}
+
+export function finishProbe(outcome, primaryError, cleanupError) {
+  if (primaryError) { if (cleanupError) primaryError.cleanupError = cleanupError; throw primaryError }
+  // Cleanup failure stops the experiment, while preserving the primary execution diagnosis.
+  if (cleanupError) throw Object.assign(fail(outcome?.error ?? 'sandbox_cleanup'), { cleanupError })
+  return outcome
 }

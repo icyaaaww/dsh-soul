@@ -1,0 +1,18 @@
+[
+  {
+    "file": "dsh-learning-0.1.0.tgz",
+    "sha256": "9ece4c40c2696e6cdd97f282ce2357aa87de5819864f5f0b94c24cb249f5805c"
+  },
+  {
+    "file": "dsh-soul-0.2.1.tgz",
+    "sha256": "6fe027c781912eb915cfbc866228be6b457cf840d808db5a9113ea06a2e39ed9"
+  },
+  {
+    "file": "dsh-soul-0.3.0.tgz",
+    "sha256": "2028486a66e57bb8d1d71551b140081e08185caa8097dcd87f5ef19a9ce531f3"
+  },
+  {
+    "file": "dsh-soul-0.5.0.tgz",
+    "sha256": "59f84c368bf95f537051f0d1041b7f26c9e0f82dff82457575f740275eac24ca"
+  }
+]

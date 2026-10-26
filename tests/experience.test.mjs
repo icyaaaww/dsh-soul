@@ -38,13 +38,13 @@ function fixture(t) {
 }
 
 test('efficiency mode has capacity for complete evidence; explicit overrides and economy remain available', () => {
-  const c = settings()
+  const c = settings({ profile: 'test' })
   assert.equal(c.learningMode, 'efficiency'); assert.equal(c.learning, false)
   assert.equal(c.dailyCalls, 12); assert.equal(c.maxOutputTokens, 1600); assert.equal(c.idleMs, 10000)
-  assert.equal(settings({ learningMode: 'economy' }).maxOutputTokens, 600)
-  assert.equal(settings({ learningMode: 'efficiency', dailyCalls: 1, maxOutputTokens: 2200 }).dailyCalls, 1)
-  assert.throws(() => settings({ learningMode: 'aggressive' }))
-  assert.throws(() => settings({ learning: true }), /provider/)
+  assert.equal(settings({ profile: 'test', learningMode: 'economy' }).maxOutputTokens, 600)
+  assert.equal(settings({ profile: 'test', learningMode: 'efficiency', dailyCalls: 1, maxOutputTokens: 2200 }).dailyCalls, 1)
+  assert.throws(() => settings({ profile: 'test', learningMode: 'aggressive' }))
+  assert.throws(() => settings({ profile: 'test', learning: true }), /provider/)
 })
 
 test('observed run metrics are idempotent, exclude Soul tools and are not task-success verdicts', t => {

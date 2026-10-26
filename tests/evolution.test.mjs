@@ -9,21 +9,24 @@ import { suiteContract, executeProbe } from '../src/evolution-suite.js'
 import { evolutionGenerate } from '../src/evolution-model.js'
 import { fixtureModel, suite, method } from './evolution-fixture.mjs'
 
-const config = overrides => evolutionSettings({ evolution: true, provider: 'fixture', model: 'executor', evolutionEditorModel: 'editor', ...overrides })
+const config = overrides => evolutionSettings({ evolution: true, evolutionProvider: 'fixture', evolutionModel: 'executor', evolutionEditorModel: 'editor', evolutionMaxCalls: 160, evolutionDailyCalls: 400, ...overrides })
 function setup(t, options = {}, settings = {}) {
   const s = new Store(':memory:'), model = fixtureModel(options), e = new Evolution(s, model.generate, config(settings))
   e.register('p', suite()); t.after(async () => { await e.stop(); s.close() })
-  return { s, e, model, run: async () => { const run = e.start('p', 'numbers', 'session'); await e.running; return e.inspect('p', run.id) } }
+  return { s, e, model, approve: run => { s.accept(run.memory, 'p'); s.feedback(run.memory, 'p', 'human-1', 'pass', '真实任务通过'); s.feedback(run.memory, 'p', 'human-2', 'pass', '不同会话真实任务通过') }, run: async () => { const run = e.start('p', 'numbers', 'session'); await e.running; return e.inspect('p', run.id) } }
 }
 
-test('full proposal/probe/composition/recursion/holdout loop executes independent files and auto-adopts verified skill', async t => {
+test('full recursive loop produces a non-injected candidate; only human acceptance and distinct sessions activate it', async t => {
   const f = setup(t, { latency: 1 }), run = await f.run()
-  assert.equal(run.state, 'adopted', JSON.stringify(run))
+  assert.equal(run.state, 'awaiting_review', JSON.stringify(run))
   assert.equal(run.summary.baseline.passed, 0); assert.equal(run.summary.selected.passed, 2)
   assert.equal(run.summary.validation.selected.passed, 2)
   assert.equal(run.round, 2)
   assert(run.probes.some(p => p.label === 'r1-composed' && p.results.every(r => r.pass)))
   assert(run.probes.some(p => p.label === 'r1-candidate1' && p.results.some(r => !r.pass)))
+  assert.equal(f.s.get(run.memory, 'p').status, 'candidate')
+  assert.equal(f.s.recall('p', '数字数组', 6000), '')
+  f.approve(run)
   assert.equal(f.s.get(run.memory, 'p').status, 'active')
   assert.equal(f.s.get(run.memory, 'p').origin, 'evolution')
   assert(f.s.recall('p', '数字数组', 6000).includes('fixed_suite'))
@@ -68,7 +71,7 @@ test('a second recursive round uses the first winner and can improve it again', 
     return original(request)
   }
   const run = await f.run()
-  assert.equal(run.state, 'adopted')
+  assert.equal(run.state, 'awaiting_review')
   assert.equal(run.round, 2)
   assert(run.probes.some(p => p.label === 'r2-composed' && p.results.every(r => r.pass)))
 })
@@ -119,7 +122,7 @@ test('call reservations are bounded despite concurrent probes and failure preser
 test('a useful winner reaches holdout before another round could consume the run or daily allowance', async t => {
   for (const limits of [{ evolutionMaxCalls: 60 }, { evolutionDailyCalls: 60 }]) {
     const f = setup(t, {}, limits), run = await f.run()
-    assert.equal(run.state, 'adopted')
+    assert.equal(run.state, 'awaiting_review')
     assert.equal(run.round, 1)
     assert.equal(f.model.requests.filter(r => r.phase === 'propose').length, 1)
     assert.equal(run.summary.validation.selected.passed, 2)
@@ -152,6 +155,7 @@ test('non-cooperative request timeout records unknown usage and keeps the incumb
 
 test('changed/forgotten sources invalidate in-flight adoption and erase dependent probe text', async t => {
   const f = setup(t), first = await f.run()
+  f.approve(first)
   let unblock, started
   const admitted = new Promise(resolve => { started = resolve })
   f.e.generate = request => { started(); return new Promise(resolve => { unblock = () => resolve({ actions: [{ type: 'finish', answer: 'late' }] }) }) }
@@ -175,15 +179,11 @@ test('suite edits invalidate prior automated skills; unregister removes suite, s
   assert(f.s.db.prepare('SELECT COUNT(*) AS n FROM evo_calls').get().n > 0)
 })
 
-test('automatic runs require explicit suite opt-in, matching scope/keywords and persistent cooldown', async t => {
+test('legacy auto opt-in never starts paid work from errors or keywords', async t => {
   const f = setup(t)
-  assert.equal(f.e.automatic('q', 's', '数字数组'), null)
-  assert.equal(f.e.automatic('p', 's', '写一封信'), null)
-  assert(f.e.automatic('p', 's', '数字数组排序失败'))
-  await f.e.running
-  assert.equal(f.e.automatic('p', 's', '数字数组'), null)
-  f.e.register('p', suite({ auto: false }))
-  assert.equal(f.e.automatic('p', 's', '数字数组'), null)
+  assert.equal(f.e.automatic('p', 's', '数字数组排序失败'), null)
+  assert.throws(() => f.e.start('p', 'numbers', 's', { automatic: true }), /付费试验/)
+  assert.equal(f.model.requests.length, 0)
 })
 
 test('restart preserves budgets and refuses concurrent profile workers; expired work is not resumed', async () => {
@@ -213,6 +213,7 @@ test('real stream wrapper uses separate editor route, excludes reasoning and rej
 
 test('negative human feedback immediately retires an automatically validated method', async t => {
   const f = setup(t), run = await f.run()
+  f.approve(run)
   f.s.feedback(run.memory, 'p', 'real-user', 'fail', '真实任务出现回归')
   assert.equal(f.e.current('p', 'numbers'), undefined)
   assert.equal(f.s.recall('p', '数字数组'), '')
@@ -243,6 +244,7 @@ test('bundled examples copy without overwriting and register for the current pro
 
 test('rollback restores the previous verified version after an efficiency improvement', async t => {
   const f = setup(t), first = await f.run(), original = f.e.generate
+  f.approve(first)
   f.e.generate = async request => {
     if (request.phase === 'propose') return { candidates: [method('numeric unique efficient'), method('numeric unique efficient alternative')] }
     if (request.phase === 'compose') return { strategy: method('numeric unique efficient composed'), lesson: {
@@ -254,8 +256,10 @@ test('rollback restores the previous verified version after an efficiency improv
     return original(request)
   }
   const second = await f.run()
-  assert.equal(second.state, 'adopted', JSON.stringify(second))
+  assert.equal(second.state, 'awaiting_review', JSON.stringify(second))
   assert.notEqual(second.memory, first.memory)
+  assert.equal(f.e.current('p', 'numbers').memory, first.memory)
+  f.approve(second)
   assert.equal(f.s.get(first.memory, 'p').status, 'deprecated')
   assert.equal(f.e.current('p', 'numbers').parent, first.memory)
   const reverted = f.e.rollback('p', 'numbers')

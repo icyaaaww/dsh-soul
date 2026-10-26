@@ -18,7 +18,7 @@ export class Store {
     this.db = new DatabaseSync(path)
     this.db.exec(`PRAGMA busy_timeout=100; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;`)
     const version = this.db.prepare('PRAGMA user_version').get().user_version
-    if (version > 4) { this.db.close(); throw new Error('记忆库版本高于插件支持版本') }
+    if (version > 5) { this.db.close(); throw new Error('记忆库版本高于插件支持版本') }
     try { this.db.exec(`
       BEGIN IMMEDIATE;
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -59,11 +59,19 @@ export class Store {
         UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='retrieval_revision'; END;
       ${EXPERIENCE_SCHEMA}
       ${EVOLUTION_SCHEMA}
-      PRAGMA user_version=4;
+      PRAGMA user_version=5;
       COMMIT;
     `) } catch (error) { this.db.close(); throw error }
     this.revisionQuery = this.db.prepare("SELECT value FROM meta WHERE key='retrieval_revision'")
     this.experience = new Experience(this)
+    if (version < 5) this.tx(() => {
+      for (const row of this.db.prepare("SELECT id,status FROM memories WHERE origin='evolution' AND status IN ('active','trial')").all()) {
+        if (this.experience.summary(row.id).passedSessions < 2) {
+          this.db.prepare("UPDATE memories SET status='candidate' WHERE id=?").run(row.id)
+          this.db.prepare("UPDATE evo_versions SET state='pending_review' WHERE memory=?").run(row.id)
+        } else this.experience.recalculate(row.id)
+      }
+    })
   }
   close() { try { this.experience.interrupt(); this.flushMetrics() } finally { this.cache.clear(); this.db.close() } }
   tx(fn) {
@@ -106,7 +114,7 @@ export class Store {
     if (!Array.isArray(sourceIds) || !sourceIds.length || sourceIds.length > 12) throw new Error('记忆必须引用来源')
     text = clean(text, kind === 'skill' ? 3200 : 1800)
     const fingerprint = hash(`${scope}:${kind}:${text.normalize('NFKC')}`)
-    if (this.blocked(`memory:${fingerprint}`) && origin !== 'human') throw new Error('此内容已经遗忘，拒绝重新生成')
+    if (this.blocked(`memory:${fingerprint}`) && origin !== 'human') throw Object.assign(new Error('此内容已被遗忘或回退，拒绝重新生成'), { code: 'blocked_strategy' })
     for (const source of sourceIds) {
       const e = this.event(source)
       if (!e || (e.scope !== scope && !(scope === 'profile' && origin === 'human')))
@@ -121,7 +129,8 @@ export class Store {
       const row = this.get(parent, scope)
       if (!row || row.status === 'deprecated') throw new Error('派生记忆的父来源无效')
     }
-    const old = supersedes ? null : this.db.prepare('SELECT id FROM memories WHERE fingerprint=? AND status!=?').get(fingerprint, 'deprecated')
+    const old = this.db.prepare('SELECT id FROM memories WHERE fingerprint=? AND status!=?').get(fingerprint, 'deprecated')
+    if (supersedes && old) throw Object.assign(new Error('修订内容与现有有效记忆重复，请保留已有记忆'), { code: 'duplicate_memory' })
     if (old) {
       for (const source of sourceIds) this.db.prepare('INSERT OR IGNORE INTO sources VALUES (?,?)').run(old.id, source)
       for (const parent of parentIds) if (parent !== old.id) this.db.prepare('INSERT OR IGNORE INTO links VALUES (?,?)').run(parent, old.id)
@@ -156,15 +165,19 @@ export class Store {
       ORDER BY bm25(search),m.updated DESC,m.id LIMIT ?`).all(match, scope, status, limit)
   }
   discover(scope, query, { includeTrials = true, limit = 6 } = {}) {
-    const active = this.experience.rank(this.search(scope, query, { limit: Math.min(30, limit * 3) }), query).slice(0, limit)
-    const hasTrials = includeTrials && query.trim() && this.db.prepare("SELECT 1 FROM memories WHERE (scope=? OR scope='profile') AND status='trial' AND kind='skill' LIMIT 1").get(scope)
-    const trials = hasTrials ? this.experience.rank(this.search(scope, query, { status: 'trial', limit: 6 }).filter(r => r.kind === 'skill'), query).slice(0, 2) : []
+    const activeRows = this.search(scope, query, { limit: Math.min(30, limit * 3) })
+    const trialRows = includeTrials && query.trim() ? this.search(scope, query, { status: 'trial', limit: 6 }).filter(r => r.kind === 'skill') : []
+    const ids = [...activeRows, ...trialRows].filter(r => r.kind === 'skill').map(r => r.id)
+    const summaries = this.experience.summaries(ids)
+    const versions = new Map(ids.length ? this.db.prepare(`SELECT memory,suite,run FROM evo_versions WHERE memory IN (${ids.map(() => '?').join(',')})`).all(...ids).map(r => [r.memory, { suite: r.suite, run: r.run }]) : [])
+    const active = this.experience.rank(activeRows, query, summaries).slice(0, limit)
+    const trials = this.experience.rank(trialRows, query, summaries).slice(0, 2)
     return [...active, ...trials].map(row => {
       const item = card(row)
       if (row.kind === 'skill') {
-        const p = this.experience.summary(row.id)
+        const p = summaries.get(row.id)
         if (Object.values(p).some(Boolean)) item.evidence = p
-        const verified = this.db.prepare('SELECT suite,run FROM evo_versions WHERE memory=? AND state=?').get(row.id, 'current')
+        const verified = versions.get(row.id)
         if (verified) item.verification = { ...verified, kind: 'fixed_suite', note: '仅验证套件内任务，不是人工确认或普遍能力证明' }
       }
       return item

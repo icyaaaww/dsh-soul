@@ -9,17 +9,20 @@ import { prepareDocker, executeJavaScript } from './evolution-docker.js'
 export function evolutionSettings(input) {
   if (input.evolution !== undefined && typeof input.evolution !== 'boolean') throw new Error('evolution 必须是布尔值')
   const c = {
-    enabled: input.evolution ?? false, provider: input.evolutionProvider ?? input.provider ?? '',
-    model: input.evolutionModel ?? input.model ?? '', editorModel: input.evolutionEditorModel ?? input.evolutionModel ?? input.model ?? '',
+    enabled: input.evolution ?? false, provider: input.evolutionProvider ?? '',
+    model: input.evolutionModel ?? '', editorModel: input.evolutionEditorModel ?? input.evolutionModel ?? '',
     reasoningEffort: input.evolutionReasoningEffort ?? '',
     rounds: integer(input.evolutionMaxRounds, 2, 1, 5), candidates: integer(input.evolutionCandidates, 2, 2, 4),
     concurrency: integer(input.evolutionConcurrency, 2, 1, 4), maxSteps: integer(input.evolutionMaxSteps, 6, 1, 20),
-    maxCalls: integer(input.evolutionMaxCalls, 160, 8, 1000), dailyCalls: integer(input.evolutionDailyCalls, 400, 0, 4000),
+    maxCalls: integer(input.evolutionMaxCalls, 80, 8, 1000), dailyCalls: integer(input.evolutionDailyCalls, 100, 0, 4000),
+    maxInputBytes: integer(input.evolutionMaxInputBytes, 24000, 4000, 96000),
+    runInputBytes: integer(input.evolutionRunInputBytes, 512000, 8000, 96000000),
+    dailyInputBytes: integer(input.evolutionDailyInputBytes, 1000000, 0, 384000000),
     maxTokens: integer(input.evolutionMaxTokens, 2400, 256, 8000), timeoutMs: integer(input.evolutionTimeoutMs, 180000, 100, 3600000),
     requestTimeoutMs: integer(input.evolutionRequestTimeoutMs, 60000, 50, 180000), cooldownMs: integer(input.evolutionCooldownMs, 3600000, 1000, 86400000),
     dockerImage: input.evolutionDockerImage ?? '', sandboxTimeoutMs: integer(input.evolutionSandboxTimeoutMs, 10000, 1000, 60000),
   }
-  if (c.enabled && (!c.provider || !c.model || !c.editorModel)) throw new Error('自我进化需要明确配置 evolutionProvider/evolutionModel 或 provider/model')
+  if (c.enabled && (!c.provider || !c.model || !c.editorModel)) throw new Error('进化需要明确配置 evolutionProvider/evolutionModel，不继承 learning 路由')
   return c
 }
 
@@ -42,7 +45,7 @@ export function better(a, b) {
 }
 const brief = rows => rows.map(({ trace, answer, ...r }) => ({ ...r, answer: bounded(redact(answer), 800),
   trace: trace.slice(-4).map(t => Object.fromEntries(Object.entries(t).map(([k, v]) => [k, typeof v === 'string' ? bounded(redact(v), 600) : v]))) }))
-const codes = new Set(['cancelled', 'timeout', 'request_timeout', 'provider_failure', 'invalid_json', 'invalid_strategy', 'invalid_contract', 'truncated', 'input_limit', 'output_limit', 'run_budget', 'daily_budget', 'source_changed', 'invalid_lesson', 'sandbox_unavailable', 'sandbox_cleanup', 'sandbox_timeout', 'sandbox_output_limit'])
+const codes = new Set(['cancelled', 'timeout', 'request_timeout', 'provider_failure', 'invalid_json', 'invalid_strategy', 'invalid_contract', 'truncated', 'input_limit', 'input_budget', 'output_limit', 'run_budget', 'daily_budget', 'source_changed', 'invalid_lesson', 'sandbox_unavailable', 'sandbox_cleanup', 'sandbox_timeout', 'sandbox_output_limit', 'program_error', 'blocked_strategy', 'duplicate_strategy'])
 
 export class Evolution {
   constructor(store, generate, config) {
@@ -61,11 +64,11 @@ export class Evolution {
       const old = this.db.prepare('SELECT * FROM evo_suites WHERE scope=? AND id=?').get(scope, contract.value.id)
       if (old?.hash === contract.hash) return { id: contract.value.id, unchanged: true }
       if (!old && this.db.prepare('SELECT COUNT(*) AS n FROM evo_suites WHERE scope=?').get(scope).n >= 20) throw fail('suite_limit')
-      for (const v of this.db.prepare("SELECT memory FROM evo_versions WHERE scope=? AND suite=? AND state='current'").all(scope, contract.value.id)) this.retire(v.memory)
+      for (const v of this.db.prepare("SELECT memory FROM evo_versions WHERE scope=? AND suite=? AND state IN ('current','pending_review')").all(scope, contract.value.id)) this.retire(v.memory)
       this.db.prepare('INSERT INTO evo_suites VALUES (?,?,?,?,?,NULL) ON CONFLICT(scope,id) DO UPDATE SET contract=excluded.contract,hash=excluded.hash,created=excluded.created,last_started=NULL')
         .run(scope, contract.value.id, contract.text, contract.hash, this.store.now())
       return { id: contract.value.id, train: contract.value.cases.filter(c => c.split === 'train').length,
-        validation: contract.value.cases.filter(c => c.split === 'validation').length, auto: contract.value.auto }
+        validation: contract.value.cases.filter(c => c.split === 'validation').length, auto: false, ignoredLegacyAuto: contract.value.auto }
     })
   }
   retire(memory) {
@@ -76,7 +79,7 @@ export class Evolution {
   list(scope) {
     return this.db.prepare('SELECT id,contract,last_started FROM evo_suites WHERE scope=? ORDER BY id').all(scope).map(r => {
       const c = JSON.parse(r.contract)
-      return { id: r.id, title: c.title, keywords: c.keywords, runtime: c.runtime, auto: c.auto, cases: c.cases.length, lastStarted: r.last_started,
+      return { id: r.id, title: c.title, keywords: c.keywords, runtime: c.runtime, auto: false, ignoredLegacyAuto: c.auto, cases: c.cases.length, lastStarted: r.last_started,
         current: this.current(scope, r.id)?.memory ?? null }
     })
   }
@@ -100,6 +103,7 @@ export class Evolution {
         .map(r => ({ ...r, usage: r.usage ? JSON.parse(r.usage) : null })) }
   }
   start(scope, suiteId, session, { automatic = false } = {}) {
+    if (automatic) throw fail('manual_only', '工具错误不能授权付费试验，请使用 /learn evolve run')
     if (this.closed || !this.config.enabled || !this.generate) throw fail('disabled', '请先配置并开启 evolution')
     if (this.running) throw fail('busy', '已有进化任务正在运行')
     const e = this.store.tx(() => {
@@ -108,8 +112,8 @@ export class Evolution {
       if (this.db.prepare('SELECT COUNT(*) AS n FROM evo_runs').get().n >= 10000) throw fail('run_limit', '进化记录已达上限，请先整理套件或等待保留期清理')
       const row = this.db.prepare('SELECT * FROM evo_suites WHERE scope=? AND id=?').get(scope, suiteId)
       if (!row) throw fail('not_found', '先用 /learn evolve register 路径 注册本项目验证套件')
+      if (this.db.prepare("SELECT 1 FROM evo_versions v JOIN memories m ON m.id=v.memory WHERE v.scope=? AND v.suite=? AND v.state='pending_review' AND m.status IN ('candidate','trial')").get(scope, suiteId)) throw fail('review_pending', '已有待审核候选；先查看 inbox，接受试用或遗忘后再运行')
       const suite = JSON.parse(row.contract), now = this.store.now()
-      if (automatic && (!suite.auto || (row.last_started != null && now - row.last_started < this.config.cooldownMs))) throw fail('cooldown')
       if (this.db.prepare('SELECT COUNT(*) AS n FROM evo_calls WHERE day=?').get(day(now)).n >= this.config.dailyCalls) throw fail('daily_budget')
       const key = id(), epoch = this.store.epoch()
       this.db.prepare("INSERT INTO evo_runs(id,scope,suite,suite_hash,owner,session,state,phase,created,lease,epoch) VALUES (?,?,?,?,?,?,'running','baseline',?,?,?)")
@@ -123,10 +127,19 @@ export class Evolution {
     return { id: e.id, state: 'running', next: `/learn evolve show ${e.id}` }
   }
   automatic(scope, session, query) {
-    const suite = this.list(scope).find(s => s.auto && s.keywords.some(w => query.toLowerCase().includes(w.toLowerCase())))
-    if (!suite) return null
-    try { return this.start(scope, suite.id, session, { automatic: true }) }
-    catch (error) { if (['busy', 'disabled', 'daily_budget', 'cooldown'].includes(error.code)) return null; throw error }
+    return null // Legacy auto flags never authorize paid work in 0.5.1.
+  }
+  estimate(scope, suiteId) {
+    const row = this.db.prepare('SELECT contract FROM evo_suites WHERE scope=? AND id=?').get(scope, suiteId)
+    if (!row) throw fail('not_found')
+    const suite = JSON.parse(row.contract), train = suite.cases.filter(c => c.split === 'train').length
+    const probes = train * (1 + this.config.rounds * (this.config.candidates + 1)) + 2 * (suite.cases.length - train)
+    return { suite: suiteId, command: `/learn evolve run ${suiteId}`, paidExecution: 'user_command_only',
+      estimate: { fullPlanCalls: { min: probes + 2 * this.config.rounds, max: probes * this.config.maxSteps + 2 * this.config.rounds },
+        runCallCap: this.config.maxCalls, dailyCallCap: this.config.dailyCalls,
+        runInputByteCap: this.config.runInputBytes, dailyInputByteCap: this.config.dailyInputBytes,
+        runOutputTokenCap: this.config.maxCalls * this.config.maxTokens,
+        note: '完整计划范围，可能提前停止或触及额度；字节不等于 token。价格未知，不是货币硬预算；宿主重试另计。' } }
   }
   check(e) {
     e.controller.signal.throwIfAborted()
@@ -136,12 +149,18 @@ export class Evolution {
   }
   async request(e, input) {
     this.check(e)
+    const inputBytes = Buffer.byteLength(input.system) + Buffer.byteLength(JSON.stringify(input.data))
+    if (inputBytes > this.config.maxInputBytes) throw fail('input_limit')
     const key = this.store.tx(() => {
       const now = this.store.now()
       if (this.db.prepare('SELECT COUNT(*) AS n FROM evo_calls WHERE run=?').get(e.id).n >= this.config.maxCalls) throw fail('run_budget')
       if (this.db.prepare('SELECT COUNT(*) AS n FROM evo_calls WHERE day=?').get(day(now)).n >= this.config.dailyCalls) throw fail('daily_budget')
+      const sizes = this.db.prepare(`SELECT COALESCE(SUM(CASE WHEN c.run=? THEN b.bytes ELSE 0 END),0) AS run,
+        COALESCE(SUM(CASE WHEN c.day=? THEN b.bytes ELSE 0 END),0) AS day FROM evo_calls c JOIN evo_request_sizes b ON b.call=c.id WHERE c.day=? OR c.run=?`).get(e.id, day(now), day(now), e.id)
+      if (sizes.run + inputBytes > this.config.runInputBytes || sizes.day + inputBytes > this.config.dailyInputBytes) throw fail('input_budget')
       const key = id()
       this.db.prepare("INSERT INTO evo_calls VALUES (?,?,?,?,?,'reserved',NULL)").run(key, e.id, day(now), input.phase, now)
+      this.db.prepare('INSERT INTO evo_request_sizes VALUES (?,?)').run(key, inputBytes)
       return key
     })
     const timeout = new AbortController(), timer = setTimeout(() => timeout.abort(fail('request_timeout')), this.config.requestTimeoutMs)
@@ -253,10 +272,11 @@ export class Evolution {
       if (!all.every(r => r.pass) || !better(all, baseAll)) { state = 'rejected'; reason = 'validation_failed'; return }
       this.phase(e, 'adopt', this.db.prepare('SELECT round FROM evo_runs WHERE id=?').get(e.id).round)
       memory = this.publish(e, current.strategy, previous, summary)
-      state = 'adopted'; reason = 'verified_improvement'
+      state = 'awaiting_review'; reason = 'fixed_suite_passed_requires_review'
     } catch (error) {
       reason = codes.has(error.code) ? error.code : 'invalid_strategy'
-      state = ['cancelled', 'timeout', 'source_changed'].includes(reason) ? 'interrupted' : 'failed'
+      if (error.cleanupError) summary.failure = { primary: error.code, cleanup: error.cleanupError.code }
+      state = ['blocked_strategy', 'duplicate_strategy'].includes(reason) ? 'rejected' : ['cancelled', 'timeout', 'source_changed'].includes(reason) ? 'interrupted' : 'failed'
     } finally {
       clearTimeout(timer)
       if (e.epoch !== this.store.epoch()) {
@@ -272,15 +292,14 @@ export class Evolution {
       if (previous && (this.store.get(previous.memory, e.scope)?.status !== 'active')) throw fail('source_changed')
       const text = skillText({ ...strategy, title: clean(`${e.suite.title}：${strategy.title}`, 200),
         preconditions: [clean(`仅适用 ${e.suite.keywords.join('、')}；自动验证范围 ${e.suite.id}，不代表任意任务成功`, 300), ...strategy.preconditions].slice(0, 12) })
-      skillText(clean(text, 3200)) // Redaction must not leave malformed JSON in an automatically activated skill.
+      skillText(clean(text, 3200)) // Persist only well-formed redacted candidate JSON.
       const source = this.store.capture({ eventId: `evolution:${e.id}`, session: e.session, scope: e.scope, role: 'tool',
         text: `隔离任务执行与固定验收通过；run=${e.id}；${JSON.stringify(summary)}`, priority: 0 })
       const memory = this.store.add({ scope: e.scope, kind: 'skill', text, sourceIds: [source], origin: 'evolution',
         parentIds: previous ? [previous.memory] : [] })
-      if (memory === previous?.memory || this.db.prepare('SELECT 1 FROM evo_versions WHERE memory=?').get(memory)) throw fail('invalid_strategy')
-      if (previous) this.retire(previous.memory)
-      this.db.prepare("UPDATE memories SET status='active',updated=? WHERE id=?").run(this.store.now(), memory)
-      this.db.prepare("INSERT INTO evo_versions VALUES (?,?,?,?,?,?,'current',?)")
+      const saved = this.db.prepare('SELECT origin,status FROM memories WHERE id=?').get(memory)
+      if (saved.origin !== 'evolution' || saved.status !== 'candidate' || memory === previous?.memory || this.db.prepare('SELECT 1 FROM evo_versions WHERE memory=?').get(memory)) throw fail('duplicate_strategy')
+      this.db.prepare("INSERT INTO evo_versions VALUES (?,?,?,?,?,?,'pending_review',?)")
         .run(memory, e.scope, e.suite.id, e.suiteHash, e.id, previous?.memory ?? null, this.store.now())
       return memory
     })
@@ -302,6 +321,8 @@ export class Evolution {
       this.db.prepare("UPDATE evo_versions SET state='rolled_back' WHERE memory=?").run(current.memory)
       const parent = current.parent ? this.store.get(current.parent, scope) : null
       if (parent && !this.store.blocked(`memory:${parent.fingerprint}`) && parent.sources.length &&
+          parent.performance.passedSessions >= 2 &&
+          this.db.prepare('SELECT 1 FROM evo_versions WHERE memory=? AND suite_hash=?').get(parent.id, current.suite_hash) &&
           !parent.feedback.some(f => f.verdict === 'fail') &&
           !this.db.prepare("SELECT 1 FROM trials WHERE memory=? AND review='harmed'").get(parent.id)) {
         this.db.prepare("UPDATE memories SET status='active',updated=? WHERE id=?").run(this.store.now(), parent.id)
@@ -329,9 +350,12 @@ export class Evolution {
       return this.register(scope, await readFile(path, 'utf8'))
     }
     if (verb === 'run') return this.start(scope, value, String(session.id))
+    if (verb === 'estimate') return this.estimate(scope, value)
     if (verb === 'list') return this.list(scope)
     if (verb === 'status') return { enabled: this.config.enabled, route: { provider: this.config.provider, model: this.config.model, editorModel: this.config.editorModel },
-      limits: this.config, callsToday: this.db.prepare('SELECT COUNT(*) AS n FROM evo_calls WHERE day=?').get(day(this.store.now())).n, runs: this.status(scope, value) }
+      limits: this.config, estimates: this.list(scope).map(s => this.estimate(scope, s.id)),
+      inputBytesToday: this.db.prepare('SELECT COALESCE(SUM(b.bytes),0) AS n FROM evo_request_sizes b JOIN evo_calls c ON c.id=b.call WHERE c.day=?').get(day(this.store.now())).n,
+      callsToday: this.db.prepare('SELECT COUNT(*) AS n FROM evo_calls WHERE day=?').get(day(this.store.now())).n, runs: this.status(scope, value) }
     if (verb === 'show') return this.inspect(scope, value)
     if (verb === 'cancel') return this.cancel(scope, value)
     if (verb === 'rollback') return this.rollback(scope, value)

@@ -4,7 +4,7 @@
   "title": "数字数组规范化函数",
   "keywords": ["数字数组", "去重排序函数"],
   "runtime": "javascript",
-  "auto": true,
+  "auto": false,
   "seed": {
     "title": "实现数组规范化函数",
     "preconditions": ["输入是由有限数字组成的数组"],

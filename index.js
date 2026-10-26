@@ -11,8 +11,9 @@ export const name = 'dsh-soul'
 export const inject = ['tools', 'systemPrompt', 'commands', 'llm']
 
 export function settings(input = {}) {
-  const profileMatch = fileURLToPath(import.meta.url).replaceAll('\\', '/').match(/\/profiles\/([^/]+)\//)
-  const profile = input.profile ?? profileMatch?.[1] ?? 'development'
+  const profileMatch = fileURLToPath(import.meta.url).replaceAll('\\', '/').match(/\/profiles\/([^/]+)\/node_modules\//)
+  const profile = input.profile ?? profileMatch?.[1] ?? (input.database ? 'explicit-database' : null)
+  if (!profile) throw new Error('无法确定 profile；请明确配置 profile 或独立 database 路径，拒绝回落到共享 development 库')
   if (!/^[a-zA-Z0-9_-]{1,80}$/.test(profile)) throw new Error('profile 标识无效')
   for (const key of ['enabled', 'learning']) if (input[key] !== undefined && typeof input[key] !== 'boolean') throw new Error(`${key} 必须是布尔值`)
   const learningMode = input.learningMode ?? 'efficiency'
@@ -26,7 +27,7 @@ export function settings(input = {}) {
     dailyCalls: integer(input.dailyCalls, efficient ? 12 : 4, 0, 100),
     maxInputBytes: integer(input.maxInputBytes, efficient ? 18000 : 12000, 2000, 32000),
     maxOutputTokens: integer(input.maxOutputTokens, efficient ? 1600 : 600, 200, 4000),
-    memoryBytes: integer(input.memoryBytes, efficient ? 3600 : 2400, 500, 6000),
+    memoryBytes: integer(input.memoryBytes, 1800, 500, 6000),
     idleMs: integer(input.idleMs, efficient ? 10000 : 30000, 1000, 3600000),
     timeoutMs: integer(input.timeoutMs, 60000, 100, 120000),
     evolutionConfig: evolutionSettings(input),
@@ -55,12 +56,13 @@ const HELP = `DSH Soul 成长记忆（evolve run 会启动模型试验；其余�
 /learn status                              查看预算、待处理及调用 usage
 /learn evolve example memory|javascript    在项目中创建验证套件示例，不覆盖已有文件
 /learn evolve register 验证套件.json        注册当前项目固定任务及验收条件
-/learn evolve run 套件ID                    异步启动提出→试验→组合→验证→递归→采用
+/learn evolve run 套件ID                    用户启动付费试验；通过后生成候选，需人工审核
 /learn evolve list                         当前项目已授权验证套件
+/learn evolve estimate 套件ID               查看调用范围和输入/输出上限
 /learn evolve status [运行ID]               阶段、额度与结果
 /learn evolve show 运行ID                   执行证据、策略与实际 usage
 /learn evolve cancel [运行ID]               停止当前进化任务
-/learn evolve rollback 套件ID               回退自动采用的方法
+/learn evolve rollback 套件ID               回退当前已激活的进化方法
 /learn evolve unregister 套件ID             移除套件、进化技能及试验正文
 候选不会自动变成你的偏好。后台学习需在 bundle 中配置 learning/provider/model。`
 
@@ -125,15 +127,16 @@ const tools = [
   { name: 'learning_trial', description: '采用已接受的技能前登记方法使用，返回完整技能。只登记，不执行额外任务。goal 为具体成功标准，change 为本次方法变化；有同目标的历史基线才传 baseline。优先复用有效方法，质量优先于速度。', properties: { id: str('技能 ID'), goal: str('本任务目标与成功标准'), change: str('本次采用或改变的方法'), baseline: str('可选：已经完成且同目标的试用 ID') }, required: ['id', 'goal', 'change'] },
   { name: 'learning_evidence', description: '查看当前会话最近用户/工具观察及当前轮次指标，供候选或试用报告引用。工具未报错、运行结束不代表任务成功；不重复执行操作来制造证据。', properties: {}, required: [] },
   { name: 'learning_result', description: '记录当前会话的技能使用报告，模型判断保持未审核。用 learning_evidence 的本轮来源，区分 helped/neutral/harmed/uncertain；缺基线或多项变更不能声称因果。不能激活技能。', properties: { id: str('试用 ID'), report: str('JSON：{"verdict":"helped|neutral|harmed|uncertain","note":"观察和限制","sourceIds":["本轮来源ID"]}') }, required: ['id', 'report'] },
-  { name: 'learning_evolve', description: '对用户已注册的本项目验证套件启动真正的方法进化：独立执行候选、组合、回归验证后择优采用。重复失败或缺少可靠方法时使用；简单任务直接做。不修改验收规则或执行宿主命令。启动后用 learning_evolution_status 查询，不重复启动。', properties: { suite: str('已注册套件 ID') }, required: ['suite'] },
+  { name: 'learning_evolve', description: '为已注册套件返回付费试验建议和用量预估；不启动模型调用。只有用户 /learn evolve run 命令能启动，固定测试通过只生成待审核候选。', properties: { suite: str('已注册套件 ID') }, required: ['suite'] },
   { name: 'learning_evolution_status', description: '查看本项目已授权的进化套件和最近执行状态；指定 id 时查看运行摘要。', properties: { id: str('可选：运行 ID') }, required: [] },
 ]
 
 export function apply(ctx, input = {}) {
+  if (input.enabled === false) return
   const config = settings(input)
   if (!config.enabled) return
   const store = new Store(config.database)
-  const pending = new Map(), lastHuman = new Map(), active = new Set(), failures = new Map(), autoQueue = new Map(), disposers = []
+  const pending = new Map(), lastHuman = new Map(), active = new Set(), disposers = []
   let lastActivity = Date.now(), lastMaintenance = 0, disposed = false, timer
   const llm = config.learning || config.evolutionConfig.enabled ? (typeof ctx.get === 'function' ? ctx.get('llm') : ctx.llm) : null
   if ((config.learning || config.evolutionConfig.enabled) && !llm?.stream) { store.close(); throw new Error('学习/进化缺少 DSH llm 服务') }
@@ -142,12 +145,15 @@ export function apply(ctx, input = {}) {
   const safe = fn => (...args) => { try { return fn(...args) } catch { try { store.metric('contained_errors') } catch {} } }
   const listen = (event, handler) => disposers.push(ctx.on(event, handler))
   const describe = agent => ({ session: agent.session, scope: projectScope(agent.session) })
-  const rememberUser = (session, message, eventId) => {
+  const observeUser = (session, message, eventId) => {
     if (!human(message) || session.header?.origin === 'subagent') return
     const text = textBlocks(message.content)
     if (!text.trim()) return
+    if (eventId === undefined && pending.get(String(session.id)) !== bounded(text, 2000)) lastHuman.delete(String(session.id))
     pending.set(String(session.id), bounded(text, 2000))
     lastActivity = Date.now()
+    // Pre-step provides the admitted query; only the durable event provides a source ID.
+    if (eventId === undefined) return
     const priority = /以后|记住|纠正|不对|别再|下次|remember|from now on|correction/i.test(text) ? 2 : 0
     const key = store.capture({ eventId, session: String(session.id), scope: projectScope(session), role: 'user', text, priority })
     if (key) { lastHuman.set(String(session.id), key); store.experience.trackSource(String(session.id), projectScope(session), key) }
@@ -158,7 +164,7 @@ export function apply(ctx, input = {}) {
       const decision = await next()
       const messages = decision?.messages ?? payload.messages
       if (decision?.kind !== 'reject') safe(() => {
-        for (const message of messages) if (human(message)) pending.set(String(payload.agent.session.id), bounded(textBlocks(message.content), 2000))
+        for (const message of messages ?? []) observeUser(payload.agent.session, message)
       })()
       return decision
     })
@@ -169,14 +175,13 @@ export function apply(ctx, input = {}) {
     listen('agent/disposed', safe(({ agent }) => {
       const key = String(agent.session.id)
       store.experience.interrupt(key)
-      pending.delete(key); lastHuman.delete(key); active.delete(key); failures.delete(key)
+      pending.delete(key); lastHuman.delete(key); active.delete(key)
     }))
     listen('session/event', safe((session, event) => {
       if (disposed || session.header?.origin === 'subagent') return
       const scope = projectScope(session), sid = String(session.id)
-      if (event.type === 'turn/start') failures.set(sid, 0)
       store.experience.observe(sid, scope, event.seq, event.type, event.data)
-      if (event.type === 'user/message') rememberUser(session, event.data, event.seq)
+      if (event.type === 'user/message') observeUser(session, event.data, event.seq)
       if (event.type === 'assistant/message' && !event.data.interrupted) {
         const text = textBlocks(event.data.message?.content)
         if (text.trim()) store.capture({ eventId: event.seq, session: sid, scope, role: 'assistant', text })
@@ -186,7 +191,6 @@ export function apply(ctx, input = {}) {
         // Only retain bounded successful observations during a registered method trial.
         // Soul's own tool results are not independent evidence of task success.
         const toolName = store.experience.toolName(sid, scope, message?.toolCallId)
-        if (toolName && !toolName.startsWith('learning_') && message?.isError) failures.set(sid, (failures.get(sid) ?? 0) + 1)
         if (!toolName?.startsWith('learning_') && (message?.isError || (toolName && store.experience.wantsObservation(sid, scope)))) {
           const key = store.capture({ eventId: event.seq, session: sid, scope, role: 'tool',
             text: `工具观察（${message?.isError ? '错误' : '未报告工具错误，不等于任务成功'}）：${bounded(textBlocks(message?.content) || '无可读结果', 1600)}`, priority: message?.isError ? 1 : 0 })
@@ -195,11 +199,6 @@ export function apply(ctx, input = {}) {
       }
       if (event.type === 'turn/end') {
         store.enqueue(sid, scope); lastActivity = Date.now()
-        if ((failures.get(sid) ?? 0) >= 2 && config.evolutionConfig.enabled) {
-          autoQueue.set(scope, { session: sid, query: pending.get(sid) ?? '' })
-          if (autoQueue.size > 16) autoQueue.delete(autoQueue.keys().next().value)
-        }
-        failures.delete(sid)
       }
     }))
     disposers.push(ctx.systemPrompt.context({ name: 'dsh-soul:memory', order: 950, text: ({ agent }) => {
@@ -218,7 +217,7 @@ export function apply(ctx, input = {}) {
         for (const key of Object.keys(args)) if (typeof args[key] !== 'string') throw new Error('工具参数必须是文字')
         const { session, scope } = describe(exec.agent)
         let value
-        if (definition.name === 'learning_evolve') value = evolution.start(scope, args.suite, String(session.id))
+        if (definition.name === 'learning_evolve') value = evolution.estimate(scope, args.suite)
         else if (definition.name === 'learning_evolution_status') value = { suites: evolution.list(scope), runs: evolution.status(scope, args.id) }
         else if (definition.name === 'learning_search') value = store.discover(scope, clean(args.query, 2000))
         else if (definition.name === 'learning_get') {
@@ -267,16 +266,12 @@ export function apply(ctx, input = {}) {
     timer = setInterval(() => {
       if (disposed || active.size || Date.now() - lastActivity < config.idleMs) return
       if (Date.now() - lastMaintenance > 3600000) { safe(() => store.maintain())(); lastMaintenance = Date.now() }
-      if (!evolution.running && autoQueue.size) {
-        const [scope, job] = autoQueue.entries().next().value; autoQueue.delete(scope)
-        safe(() => evolution.automatic(scope, job.session, job.query))()
-      }
       if (config.learning && !evolution.running) learner.tick().catch(() => {})
     }, Math.min(5000, config.idleMs))
     timer.unref?.()
     const stop = async () => {
       if (disposed) return
-      disposed = true; clearInterval(timer); autoQueue.clear()
+      disposed = true; clearInterval(timer)
       for (const dispose of disposers.reverse()) if (typeof dispose === 'function') dispose()
       await Promise.all([learner.stop(), evolution.stop()]); store.close()
     }

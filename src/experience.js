@@ -201,10 +201,20 @@ export class Experience {
     const passes = this.db.prepare(`SELECT COUNT(*) AS n FROM (
       SELECT trial AS session FROM feedback WHERE memory=? AND verdict='pass'
       UNION SELECT session FROM trials WHERE memory=? AND review='helped')`).get(memory, memory).n
-    const verified = this.db.prepare(`SELECT 1 FROM evo_versions v JOIN evo_suites s ON s.scope=v.scope AND s.id=v.suite
-      JOIN evo_runs r ON r.id=v.run WHERE v.memory=? AND v.state='current' AND s.hash=v.suite_hash
-      AND r.state='adopted' AND r.summary IS NOT NULL AND EXISTS(SELECT 1 FROM sources WHERE memory=v.memory)`).get(memory)
-    const status = failed ? 'deprecated' : passes >= 2 || verified ? 'active' : 'trial'
+    const status = failed ? 'deprecated' : passes >= 2 ? 'active' : 'trial'
+    const version = this.db.prepare('SELECT * FROM evo_versions WHERE memory=?').get(memory)
+    if (status === 'active' && version?.state === 'pending_review') {
+      const suite = this.db.prepare('SELECT hash FROM evo_suites WHERE scope=? AND id=?').get(version.scope, version.suite)
+      if (suite?.hash !== version.suite_hash) throw new Error('套件已改变，不能激活旧验证结果')
+      const current = this.db.prepare("SELECT memory FROM evo_versions WHERE scope=? AND suite=? AND state='current'").all(version.scope, version.suite)
+      if (current.some(v => v.memory !== version.parent)) throw new Error('当前方法已改变，请重新验证候选，不能覆盖较新的技能')
+      for (const prior of current) {
+        this.db.prepare("UPDATE memories SET status='deprecated' WHERE id=?").run(prior.memory)
+        this.db.prepare("UPDATE evo_versions SET state='superseded' WHERE memory=?").run(prior.memory)
+        // Superseding a method does not erase the real observations used as its comparison baseline.
+      }
+      this.db.prepare("UPDATE evo_versions SET state='current' WHERE memory=?").run(memory)
+    }
     this.db.prepare('UPDATE memories SET status=?,updated=? WHERE id=?').run(status, this.store.now(), memory)
     if (failed) this.db.prepare('INSERT OR IGNORE INTO tombstones VALUES (?,?)').run(`memory:${row.fingerprint}`, this.store.now())
   }
@@ -236,13 +246,20 @@ export class Experience {
     }
   }
   summary(memory) {
-    const counts = { helped: 0, neutral: 0, harmed: 0, uncertain: 0, pending: 0 }
-    for (const r of this.db.prepare('SELECT review,COUNT(*) AS n FROM trials WHERE memory=? AND reported IS NOT NULL GROUP BY review').all(memory)) counts[r.review ?? 'pending'] = r.n
-    counts.passedSessions = this.db.prepare(`SELECT COUNT(*) AS n FROM (SELECT trial AS session FROM feedback WHERE memory=? AND verdict='pass'
-      UNION SELECT session FROM trials WHERE memory=? AND review='helped')`).get(memory, memory).n
-    return counts
+    return this.summaries([memory]).get(memory)
   }
-  rank(rows, query) {
+  summaries(ids) {
+    ids = [...new Set(ids)]
+    const result = new Map(ids.map(key => [key, { helped: 0, neutral: 0, harmed: 0, uncertain: 0, pending: 0, passedSessions: 0 }]))
+    if (!ids.length) return result
+    const slots = ids.map(() => '?').join(',')
+    for (const r of this.db.prepare(`SELECT memory,review,COUNT(*) AS n FROM trials WHERE memory IN (${slots}) AND reported IS NOT NULL GROUP BY memory,review`).all(...ids)) result.get(r.memory)[r.review ?? 'pending'] = r.n
+    for (const r of this.db.prepare(`SELECT memory,COUNT(*) AS n FROM (
+      SELECT memory,trial AS session FROM feedback WHERE memory IN (${slots}) AND verdict='pass'
+      UNION SELECT memory,session FROM trials WHERE memory IN (${slots}) AND review='helped') GROUP BY memory`).all(...ids, ...ids)) result.get(r.memory).passedSessions = r.n
+    return result
+  }
+  rank(rows, query, summaries = this.summaries(rows.filter(r => r.kind === 'skill').map(r => r.id))) {
     const tokens = terms(query)
     const groups = new Map()
     const output = [...rows]
@@ -250,7 +267,7 @@ export class Experience {
     rows.forEach((r, index) => {
       if (r.kind !== 'skill') return
       const wordSet = new Set(terms(r.text)), coverage = tokens.filter(t => wordSet.has(t)).length
-      const group = groups.get(coverage) ?? []; group.push({ row: r, index, score: this.summary(r.id) }); groups.set(coverage, group)
+      const group = groups.get(coverage) ?? []; group.push({ row: r, index, score: summaries.get(r.id) }); groups.set(coverage, group)
     })
     for (const group of groups.values()) {
       const sorted = [...group].sort((a, b) => b.score.passedSessions - a.score.passedSessions ||

@@ -44,12 +44,12 @@ test('full evolution selects a JavaScript method using actual container outputs'
     const code = `export default xs => ${name.includes('unique') ? '[...new Set(xs)]' : '[...xs]'}.sort(${name.includes('numeric') ? '(a,b)=>a-b' : ''})`
     return { actions: [{ type: 'write', path: 'solution.mjs', text: code }, { type: 'finish', answer: 'done' }] }
   }
-  const e = new Evolution(s, generate, evolutionSettings({ evolution: true, provider: 'fixture', model: 'fixture', evolutionMaxRounds: 1,
+  const e = new Evolution(s, generate, evolutionSettings({ evolution: true, evolutionProvider: 'fixture', evolutionModel: 'fixture', evolutionMaxRounds: 1,
     evolutionDockerImage: image, evolutionTimeoutMs: 180000 }))
   try {
     e.register('p', contract); const run = e.start('p', 'numbers', 's'); await e.running
     const result = e.inspect('p', run.id)
-    assert.equal(result.state, 'adopted', JSON.stringify(result))
+    assert.equal(result.state, 'awaiting_review', JSON.stringify(result))
     assert.equal(result.summary.validation.selected.passed, 2)
   } finally { await e.stop(); s.close() }
 })

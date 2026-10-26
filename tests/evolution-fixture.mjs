@@ -1,5 +1,5 @@
 export const method = title => ({ title, preconditions: ['输入是数字数组'], steps: [title], checks: ['数值升序且无重复，输出 JSON'], counterexamples: ['非数字输入不适用'] })
-export const suite = (options = {}) => ({ version: 1, id: 'numbers', title: '数字数组规范化', keywords: ['数字数组'], seed: method('baseline'), auto: true,
+export const suite = (options = {}) => ({ version: 1, id: 'numbers', title: '数字数组规范化', keywords: ['数字数组'], seed: method('baseline'), auto: false,
   cases: [
     { id: 'duplicates', split: 'train', input: '规范化数字数组 TRAIN_A', files: { 'input.json': '[2,2,3]' }, checks: [{ target: 'file', path: 'result.json', kind: 'jsonEquals', expected: [2,3] }] },
     { id: 'order', split: 'train', input: '规范化数字数组 TRAIN_B', files: { 'input.json': '[10,2]' }, checks: [{ target: 'file', path: 'result.json', kind: 'jsonEquals', expected: [2,10] }] },

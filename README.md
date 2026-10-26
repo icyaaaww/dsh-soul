@@ -1,8 +1,32 @@
-# DSH Soul 0.5.1
+# DSH Soul 0.8.0
 
 为 DSH 提供长期记忆，以及**提出候选 → 独立执行 → 比较 → 组合 → 复测 → 递归改进 → 待审核候选**的方法进化流程。目标是结果正确、少返工、更快完成；模型成本由配置限制，不强制使用便宜模型。
 
-进化的对象是项目内的技能和工作策略，不是模型权重、身份或权限。0.5.1 提供受限任务的方法试验循环，仍不是对所有开放任务都能自行判定成功的通用自进化系统。
+进化的对象是项目内的技能和工作策略，不是模型权重、身份或权限。0.8 保留已有记忆与固定套件试验，新增真实 DSH 子会话执行的 harness 演化。它仍不能对所有开放任务自行判定成功。
+
+## 0.8：真实宿主演化
+
+新增 `/evolve` 命令：真实任务观察 → 单组件编辑 → Git worktree 中的 DSH 子会话探测 → 项目检查 → 真实任务试用 → 转正或回滚。已接通系统提示、护栏、记忆策略、工具指引（C1–C4）；C5–C8 尚未接入加载机制，启动前会拒绝。模型请求在发送前预留额度，包含执行子会话；取消、超时后等待资源清理。
+
+使用 **DSH 0.2.1-rc.2** 或兼容的 0.2.x、本地 spawn 后端及干净 Git 仓库。Soul 的原有记忆功能继续支持 0.2.0-rc.2；旧宿主不支持新的探测能力，启动前明确拒绝。
+
+新模块默认关闭，在现有 Soul 配置下单独启用，模型路由不继承后台学习：
+
+```yaml
+- id: dsh-soul
+  config:
+    harnessEvolution:
+      enabled: true
+      provider: your-registered-provider
+      model: your-model
+      checks:
+        - name: project-tests
+          argv: [node, --test]
+```
+
+`/evolve status` 检查宿主能力，`/evolve diagnose` 查看重复任务的分歧；达到阈值后由用户执行 `/evolve run`。通过检查的候选进入 **实际生效的 shadow 试用**，会影响真实任务，不是旁路隔离。项目测试和用户反馈只是有限证据，不证明泛化。worktree 不是安全沙箱。
+
+详细配置、预算、能力范围见 [0.8 宿主演化说明](docs/HARNESS-0.8.md)。原 `/learn`、后台学习和 `/learn evolve` 固定套件功能保留，配置与预算独立。请勿同时加载独立 `dsh-evolve` 插件，以免 `/evolve` 命令冲突。
 
 ## 安装与升级
 
@@ -14,12 +38,12 @@
 从本仓库 Releases 下载 TGZ，退出 DSH、备份记忆库后安装：
 
 ```powershell
-dsh plugin --profile web add 'C:\Downloads\dsh-soul-0.5.1.tgz'
+dsh plugin --profile web add 'C:\Downloads\dsh-soul-0.8.0.tgz'
 ```
 
 替换实际路径与 profile；桌面版使用其内置插件入口。重启后输入 `/learn help`。不通过 npm registry 发布。
 
-**本版数据库升级到 schema 5。**原记忆、来源、反馈、试用、遗忘指纹和额度保留；0.1–0.5.0 不能打开升级后的库，回退需恢复备份。默认目录仍是 `~/.dsh/dsh-learning/<profile>/memory.sqlite`，尊重 `DSH_HOME`。不要让不同插件版本同时写入同一库。
+**记忆库保持 0.5.1 的 schema 5。**原记忆、来源、反馈、试用、遗忘指纹和额度保留；0.1–0.5.0 不能打开升级后的库，回退需恢复备份。默认目录仍是 `~/.dsh/dsh-learning/<profile>/memory.sqlite`，尊重 `DSH_HOME`。新模块使用独立的 `memory.sqlite.harness.sqlite`（可用 `harnessEvolution.database` 指定），不会混用两种 schema。不要让不同插件版本同时写入同一库。
 
 0.5.0 自动激活但没有两个真实人工通过会话的进化技能，升级时退回 candidate；原记忆及证据保留。标准 profile 安装布局可识别 profile；其他布局必须显式配置 `profile` 或独立 `database`，否则报错，不再共用 development 库。
 
@@ -42,7 +66,7 @@ dsh plugin --profile web add 'C:\Downloads\dsh-soul-0.5.1.tgz'
 
 实际耗时会记录，但一次运行更快不能独自决定升级。质量相同时，至少两个用例减少模型调用或动作数，且没有逐用例资源/错误回退，才算效率改进。
 
-日常完整编码任务（真实仓库测试、构建、依赖、跨文件修改）仍不在当前执行器覆盖内。Soul 保留正常任务的记忆和人工反馈，但不能宣传为通用编码自进化；要扩展到此范围，需要另行实现仓库快照、项目验证命令、可重复基线及跨任务回归。
+本节的固定套件执行器不覆盖完整仓库编码任务。0.8 的 `/evolve` 已接入真实仓库子会话与项目检查，但在线基线和候选的环境仍不完全可比，依赖准备、任务正确性及跨任务回归仍需评估，不能宣传为通用编码自进化。
 
 ## 开启进化
 

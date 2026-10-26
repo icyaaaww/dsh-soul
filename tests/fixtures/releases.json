@@ -14,5 +14,9 @@
   {
     "file": "dsh-soul-0.5.0.tgz",
     "sha256": "59f84c368bf95f537051f0d1041b7f26c9e0f82dff82457575f740275eac24ca"
+  },
+  {
+    "file": "dsh-soul-0.5.1.tgz",
+    "sha256": "f6fde555b9acb803a51397589ae3685fac78e14e8523bb2cd813d163e0187d59"
   }
 ]

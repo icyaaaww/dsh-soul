@@ -1,11 +1,12 @@
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Store } from './src/store.js'
 import { Learner, hostGenerate, skillText } from './src/learner.js'
 import { bounded, clean, human, integer, projectScope, textBlocks } from './src/util.js'
 import { Evolution, evolutionSettings } from './src/evolution.js'
 import { evolutionGenerate } from './src/evolution-model.js'
+import { apply as applyHarness, settings as harnessSettings } from './src/harness-evolution/index.js'
 
 export const name = 'dsh-soul'
 export const inject = ['tools', 'systemPrompt', 'commands', 'llm']
@@ -33,6 +34,12 @@ export function settings(input = {}) {
     evolutionConfig: evolutionSettings(input),
   }
   if (config.learning && (!config.provider || !config.model)) throw new Error('后台学习需要明确设置 provider 和 model；可选择适合任务的强模型或经济模型')
+  const harness = input.harnessEvolution ?? {}
+  if (!harness || typeof harness !== 'object' || Array.isArray(harness)) throw new Error('harnessEvolution 必须是配置对象')
+  const harnessDatabase = harness.database ?? (config.database === ':memory:' ? ':memory:' : `${config.database}.harness.sqlite`)
+  if (config.database !== ':memory:' && harnessDatabase !== ':memory:' && resolve(harnessDatabase) === resolve(config.database)) throw new Error('harnessEvolution.database 必须与记忆数据库分开')
+  config.harnessConfig = { ...harness, profile: config.profile, database: harnessDatabase }
+  harnessSettings(config.harnessConfig)
   return config
 }
 
@@ -64,7 +71,8 @@ const HELP = `DSH Soul 成长记忆（evolve run 会启动模型试验；其余�
 /learn evolve cancel [运行ID]               停止当前进化任务
 /learn evolve rollback 套件ID               回退当前已激活的进化方法
 /learn evolve unregister 套件ID             移除套件、进化技能及试验正文
-候选不会自动变成你的偏好。后台学习需在 bundle 中配置 learning/provider/model。`
+候选不会自动变成你的偏好。后台学习需在 bundle 中配置 learning/provider/model。
+0.8 真实宿主演化：配置 harnessEvolution.enabled/provider/model 后使用 /evolve help；通过检查的策略会进入真实任务试用。`
 
 export function command(store, raw, session) {
   const scope = projectScope(session), sessionId = String(session.id)
@@ -137,7 +145,7 @@ export function apply(ctx, input = {}) {
   if (!config.enabled) return
   const store = new Store(config.database)
   const pending = new Map(), lastHuman = new Map(), active = new Set(), disposers = []
-  let lastActivity = Date.now(), lastMaintenance = 0, disposed = false, timer
+  let lastActivity = Date.now(), lastMaintenance = 0, disposed = false, timer, harness
   const llm = config.learning || config.evolutionConfig.enabled ? (typeof ctx.get === 'function' ? ctx.get('llm') : ctx.llm) : null
   if ((config.learning || config.evolutionConfig.enabled) && !llm?.stream) { store.close(); throw new Error('学习/进化缺少 DSH llm 服务') }
   const learner = new Learner(store, config.learning ? hostGenerate(llm, config) : null, config)
@@ -254,6 +262,7 @@ export function apply(ctx, input = {}) {
           if (rawInput.trim() === 'status') return { kind: 'success', text: JSON.stringify({
             learning: config.learning, learningMode: config.learningMode, provider: config.provider, model: config.model,
             limits: { dailyCalls: config.dailyCalls, maxEvidenceBytes: config.maxInputBytes, maxOutputTokens: config.maxOutputTokens, memoryBytes: config.memoryBytes },
+            harnessEvolution: { enabled: !!config.harnessConfig.enabled, command: '/evolve status', database: config.harnessConfig.database },
             ...store.stats(projectScope(agent.session)),
           }, null, 2) }
           const result = command(store, rawInput, agent.session)
@@ -263,20 +272,21 @@ export function apply(ctx, input = {}) {
         catch (e) { return { kind: 'error', text: bounded(e.message, 500) } }
       },
     }))
+    harness = applyHarness(ctx, config.harnessConfig)
     timer = setInterval(() => {
       if (disposed || active.size || Date.now() - lastActivity < config.idleMs) return
       if (Date.now() - lastMaintenance > 3600000) { safe(() => store.maintain())(); lastMaintenance = Date.now() }
-      if (config.learning && !evolution.running) learner.tick().catch(() => {})
+      if (config.learning && !evolution.running && !harness?.evolve.running) learner.tick().catch(() => {})
     }, Math.min(5000, config.idleMs))
     timer.unref?.()
     const stop = async () => {
       if (disposed) return
       disposed = true; clearInterval(timer)
       for (const dispose of disposers.reverse()) if (typeof dispose === 'function') dispose()
-      await Promise.all([learner.stop(), evolution.stop()]); store.close()
+      try { await Promise.all([learner.stop(), evolution.stop(), harness?.stop()]) } finally { store.close() }
     }
     // Cordis accepts a disposer (not a plain diagnostic object) as startup result.
-    return Object.assign(stop, { store, learner, evolution, stop, config })
+    return Object.assign(stop, { store, learner, evolution, harness, stop, config })
   } catch (e) {
     clearInterval(timer)
     for (const dispose of disposers.reverse()) if (typeof dispose === 'function') dispose()

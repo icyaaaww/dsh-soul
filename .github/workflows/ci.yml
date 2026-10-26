@@ -26,6 +26,7 @@ jobs:
         with:
           node-version: '24'
       - run: npm run check
+      - run: npm run demo:harness
       - run: npm pack --dry-run
   host:
     strategy:

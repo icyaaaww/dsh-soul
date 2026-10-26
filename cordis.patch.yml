@@ -6,6 +6,10 @@
         enabled: true
         learning: false
         evolution: false
+        harnessEvolution:
+          enabled: false
+          provider: ''
+          model: ''
         provider: ''
         model: ''
         learningMode: efficiency

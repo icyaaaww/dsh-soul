@@ -15,6 +15,19 @@ function fixture(t) {
   return { ...handle, hooks, tools, contexts, commands }
 }
 const session = { id: 'a', header: {} }
+
+test('harness evolution is opt-in, independently routed and stored separately', () => {
+  const base = settings({ database: 'memory.sqlite' })
+  assert.equal(base.harnessConfig.enabled, undefined)
+  assert.equal(base.harnessConfig.database, 'memory.sqlite.harness.sqlite')
+  assert.throws(() => settings({ database: ':memory:', provider: 'learning', model: 'cheap', harnessEvolution: { enabled: true } }), /显式配置/)
+  assert.throws(() => settings({ database: 'memory.sqlite', harnessEvolution: { database: './memory.sqlite' } }), /分开/)
+  assert.throws(() => settings({ database: ':memory:', harnessEvolution: true }), /配置对象/)
+  const configured = settings({ database: ':memory:', harnessEvolution: { enabled: true, provider: 'host', model: 'executor', dailyCalls: 20 } })
+  assert.equal(configured.learning, false)
+  assert.equal(configured.harnessConfig.provider, 'host')
+  assert.equal(configured.harnessConfig.dailyCalls, 20)
+})
 test('explicit remember and correct commands are immediately reflected without model calls', t => {
   const f = fixture(t)
   command(f.store, 'prefer 先给结论', session)

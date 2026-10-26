@@ -68,8 +68,13 @@ for (const archive of process.argv.slice(2)) {
     upgraded.experience.startRun('new-session', 'p', 1)
     assert(upgraded.experience.start({ memory: skill, scope: 'p', session: 'new-session', goal: '修复故障', change: '验证升级后试用' }).trial.id)
     upgraded.close(); upgraded = null
-    assert.throws(() => new OldStore(path), /版本/)
+    if (before < 5) assert.throws(() => new OldStore(path), /版本/)
+    else {
+      old = new OldStore(path)
+      assert.equal(old.get(preference, 'p').text, '先给结论')
+      old.close(); old = null
+    }
     console.log(JSON.stringify({ archive: resolve(archive), fromSchema: before, toSchema: 5, passed: true,
-      verified: ['memory', 'sources', 'feedback', 'tombstones', 'spent budget', 'new trial', 'integrity', 'old-version rejection'] }))
+      verified: ['memory', 'sources', 'feedback', 'tombstones', 'spent budget', 'new trial', 'integrity', before < 5 ? 'old-version rejection' : 'same-schema reopen'] }))
   } finally { old?.close(); upgraded?.close(); rmSync(folder, { recursive: true, force: true }) }
 }

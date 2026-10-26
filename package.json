@@ -1,7 +1,7 @@
 {
   "name": "dsh-soul",
-  "version": "0.5.1",
-  "description": "DSH memory and reviewed strategy experiments with isolated probes and fixed validation",
+  "version": "0.8.0",
+  "description": "DSH memory, reviewed strategy experiments and real-host harness evolution with worktree probes",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -30,6 +30,9 @@
   "files": [
     "index.js",
     "src/*.js",
+    "src/harness-evolution/index.js",
+    "src/harness-evolution/src/*.js",
+    "src/harness-evolution/harness/**",
     "locale/*.json",
     "examples/*.json",
     "docs/EVOLUTION-0.5.md",
@@ -37,13 +40,17 @@
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
-    "docs/VALIDATION-0.5.1.md"
+    "docs/VALIDATION-0.5.1.md",
+    "docs/HARNESS-0.8.md",
+    "docs/VALIDATION-0.8.md"
   ],
   "scripts": {
     "test": "node scripts/test.mjs",
     "bench": "node scripts/bench.mjs",
     "bench:experience": "node scripts/bench-experience.mjs",
     "demo:evolution": "node scripts/demo-evolution.mjs",
+    "demo:harness": "node scripts/demo-harness.mjs",
+    "test:harness-host": "node scripts/test-harness-host.mjs",
     "eval": "node scripts/eval.mjs",
     "check": "node --check index.js && npm test && npm run eval && npm run test:upgrade",
     "test:upgrade": "node scripts/check-upgrades.mjs"

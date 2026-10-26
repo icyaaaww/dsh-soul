@@ -10,6 +10,7 @@ import { fail } from '../src/util.js'
 
 test('candidate keeps project subdirectory; checks see its artifacts before cleanup', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'evolve-subdir-'))
+  const aliasRoot = mkdtempSync(join(tmpdir(), 'evolve-alias-'))
   const git = (...args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', windowsHide: true })
   let candidate
   try {
@@ -22,13 +23,21 @@ test('candidate keeps project subdirectory; checks see its artifacts before clea
       writeFileSync(join(cwd, 'result.txt'), 'ok')
       return { steps: 1, toolCalls: 1, toolErrors: 0, complete: true, durationMs: 1 }
     } })
-    const result = await execute({ root: join(dir, 'project'), files: { 'memory.md': 'candidate' }, signal: new AbortController().signal,
-      checks: [{ name: 'artifact', argv: [process.execPath, '-e', "require('fs').readFileSync('result.txt')"] }] })
+    const input = { root: join(dir, 'project'), files: { 'memory.md': 'candidate' }, signal: new AbortController().signal,
+      checks: [{ name: 'artifact', argv: [process.execPath, '-e', "require('fs').readFileSync('result.txt')"] }] }
+    const result = await execute(input)
     assert.equal(result.metrics.deliverable, true)
     assert.equal(existsSync(candidate), false); assert.equal(git('status', '--porcelain'), '')
+    const alias = join(aliasRoot, 'project-alias')
+    symlinkSync(join(dir, 'project'), alias, process.platform === 'win32' ? 'junction' : 'dir')
+    const aliased = await execute({ ...input, root: alias })
+    assert.equal(aliased.metrics.deliverable, true)
+    assert.equal(existsSync(candidate), false)
+    assert.equal(existsSync(join(dir, 'project', 'result.txt')), false)
+    assert.equal(git('status', '--porcelain'), '')
     writeFileSync(join(dir, 'uncommitted.txt'), 'dirty')
     await assert.rejects(() => execute.preflight({ cwd: dir, parent: {} }), error => error.code === 'dirty_worktree')
-  } finally { rmSync(dir, { recursive: true, force: true }) }
+  } finally { rmSync(aliasRoot, { recursive: true, force: true }); rmSync(dir, { recursive: true, force: true }) }
 })
 
 test('harness writes refuse path escapes and directory junctions', async () => {

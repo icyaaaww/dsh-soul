@@ -1,6 +1,6 @@
 import { fail } from './util.js'
-import { relative, join } from 'node:path'
-import { withWorktree, installTree, repoOf, isClean, runChecks } from './probe.js'
+import { join } from 'node:path'
+import { withWorktree, installTree, repoOf, prefixOf, isClean, runChecks } from './probe.js'
 
 /**
  * Real-host probe: run the candidate harness against an actual DSH subagent session inside a
@@ -19,9 +19,10 @@ export function hostProbe({ spawn, capability, provider, model, reasoningEffort 
       throw fail('not_a_repo', '候选探测需要干净的 git 仓库')
     }
 
+    const prefix = await prefixOf(root)
     // Separate checkout, not a security sandbox; host permissions still govern tools.
     return withWorktree(repo, async folder => {
-      const cwd = join(folder, relative(repo, root))
+      const cwd = join(folder, ...prefix.split('/'))
       await installTree(cwd, files, { folder: harnessFolder })
       const result = await spawn({
         cwd, task, signal, parent, files, reserve,

@@ -29,6 +29,14 @@ export async function repoOf(cwd) {
   } catch { return null }
 }
 
+/** Git resolves directory aliases itself; OS-relative paths can escape across junctions. */
+export async function prefixOf(cwd) {
+  const { stdout } = await run('git', ['-C', cwd, 'rev-parse', '--show-prefix'], { timeout: 8000 })
+  const prefix = stdout.trim().replace(/\/$/, '')
+  if (prefix && (isAbsolute(prefix) || /[:\\\0]/.test(prefix) || prefix.split('/').some(p => !p || p === '..' || p === '.'))) throw fail('invalid_project_prefix')
+  return prefix
+}
+
 /** True when the working tree has no uncommitted changes (required for a truthful replay). */
 export async function isClean(root) {
   try {

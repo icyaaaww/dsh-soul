@@ -4,7 +4,7 @@
 
 ## 已执行
 
-- 指定 DSH 0.2.1-rc.2 的真实宿主路径运行 npm run check：62 项全部通过，0 跳过。
+- 指定 DSH 0.2.1-rc.2 的真实宿主路径运行 npm run check：63 项全部通过，0 跳过。
 - DSH 0.2.0-rc.2：明确拒绝缺少 startActivation 的宿主；独立拒绝测试通过。
 - npm run demo：确定性成对探测、采纳闸门、额度记录、试用和回滚演示通过。
 - 实际 DSH 服务中验证 C1–C4 注入、C5 spawn 委派、C6 技能 provider 与原生 skill 加载、C7 JSON 脚本执行、C8 工具后建议。

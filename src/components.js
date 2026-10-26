@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { resolve } from 'node:path'
 import { bounded, fail, hash, projectScope } from './util.js'
@@ -60,7 +61,14 @@ export function createComponents(ctx, { current, enabled = () => true, audit = (
     return promise
   }
   const get = key => typeof ctx.get === 'function' ? ctx.get(key) : ctx[key]
-  const keyOf = cwd => { const key = resolve(cwd).replaceAll('\\', '/'); return process.platform === 'win32' ? key.toLowerCase() : key }
+  const keyOf = cwd => {
+    // The host canonicalizes cwd; Windows TEMP can contain an 8.3 alias and
+    // directory junctions can also make the same checkout have two spellings.
+    let path = resolve(cwd)
+    try { path = realpathSync.native(path) } catch (error) { if (error.code !== 'ENOENT') throw error }
+    const key = path.replaceAll('\\', '/')
+    return process.platform === 'win32' ? key.toLowerCase() : key
+  }
   let control, stopped = false, delegate
   const filesAt = cwd => {
     if (stopped || !cwd || !enabled()) return null

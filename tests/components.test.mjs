@@ -1,5 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, mkdirSync, symlinkSync, rmSync, realpathSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { runComponent, skillOf, createComponents } from '../src/components.js'
 import { lint } from '../src/tree.js'
 import { edit } from '../src/edit.js'
@@ -7,6 +10,25 @@ import { defaults } from './fixture.mjs'
 
 const skill = '---\nname: build-check\ndescription: 构建失败时检查依赖及命令\n---\n先检查依赖，再运行构建。'
 const hook = 'export const timeoutMs = 100; export const failOpen = true; export function run(x) { return {note:x.isError ? "停止重复失败" : "检查产物"} }'
+test('candidate components survive host cwd canonicalization through directory aliases', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'soul-component-alias-'))
+  const target = join(root, 'checkout'), alias = join(root, 'alias')
+  mkdirSync(target)
+  symlinkSync(target, alias, process.platform === 'win32' ? 'junction' : 'dir')
+  const runtime = createComponents({ tools: { register: () => () => {} }, on: () => () => {} }, { current: () => null })
+  try {
+    const files = { 'skills/build-check/SKILL.md': skill }
+    const release = runtime.lease(alias, files)
+    assert.equal(runtime.filesAt(realpathSync.native(target)), files)
+    assert.throws(() => runtime.lease(target, {}), /component_lease_busy/)
+    release()
+    assert.equal(runtime.filesAt(target), null)
+  } finally {
+    await runtime.stop()
+    rmSync(alias)
+    rmSync(root, { recursive: true, force: true })
+  }
+})
 test('editor can create a valid skill, script and hook in an initially empty component', async () => {
   for (const [target,path,text] of [['C6','skills/build-check/SKILL.md',skill],['C7','scripts/sum.mjs','export function run(x) { return x.a+x.b }'],['C8','hooks/check.mjs',hook]]) {
     const result = await edit({generate:async()=>({actions:[{type:'write',path:'harness/'+path,text},{type:'finish',why:'test'}]}),context:{target,files:defaults(),task:'x',evidence:[]},signal:new AbortController().signal})

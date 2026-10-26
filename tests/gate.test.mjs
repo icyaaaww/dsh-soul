@@ -70,36 +70,10 @@ test('A/B comparison never lets timing or step count alone win', () => {
   assert(compareMetrics(base, { ...base, deliverable: false, toolCalls: 1 }).regressions.some(r => r.includes('交付物')))
 })
 
-test('decision table: veto order, shadow-only, and the tax-only win', () => {
-  const structure = { ok: true, violations: [], tax: 900, report: {} }
-  const baseM = { toolErrors: 2, toolCalls: 9, steps: 5, complete: true, deliverable: true }
-
-  // A-layer failure vetoes even with good B-layer numbers.
-  const veto = decide({ structure, baseMetrics: baseM, nextMetrics: { ...baseM, toolErrors: 0 }, checks: [{ name: 'npm test', ok: false }], taxDelta: 0 })
-  assert.equal(veto.adopt, false)
-  assert(veto.reasons.some(r => r.includes('A 层失败')))
-
-  // B-layer regression vetoes.
-  const regress = decide({ structure, baseMetrics: baseM, nextMetrics: { ...baseM, toolErrors: 5 }, taxDelta: 0 })
-  assert.equal(regress.adopt, false)
-
-  // No directional improvement at all -> rejected, not "unchanged and adopted".
-  const flat = decide({ structure, baseMetrics: baseM, nextMetrics: { ...baseM }, taxDelta: 0 })
-  assert.equal(flat.adopt, false)
-
-  // A measurable fixed-tax reduction is an admissible improvement on its own.
-  const slim = decide({ structure, baseMetrics: baseM, nextMetrics: { ...baseM }, taxDelta: -400 })
-  assert.equal(slim.adopt, true)
-  assert(slim.reasons.some(r => r.includes('固定税下降')))
-
-  // Cooldown does not silently adopt: it demotes to shadow only.
-  const cool = decide({ structure, baseMetrics: baseM, nextMetrics: { ...baseM, toolErrors: 0 }, taxDelta: -100,
-    cooldown: { ok: false, have: 3, need: 20 } })
-  assert.equal(cool.adopt, false)
-  assert.equal(cool.shadow, true)
-
-  // Structure failure short-circuits everything.
-  const broken = decide({ structure: { ok: false, violations: ['x'], tax: 0 }, baseMetrics: baseM, nextMetrics: baseM, taxDelta: 0 })
-  assert.equal(broken.adopt, false)
-  assert.equal(broken.shadow, false)
+test('neither shorter prompts nor fewer steps permit adoption without paired verification', () => {
+  const structure = {ok:true,violations:[],tax:100}
+  const result = decide({structure,baseMetrics:{steps:10},nextMetrics:{steps:1},taxDelta:-900})
+  assert.equal(result.adopt, false)
+  assert.equal(result.reasons[0], 'insufficient_trials')
+  assert.equal(decide({structure:{ok:false,violations:['anchor']}}).adopt, false)
 })

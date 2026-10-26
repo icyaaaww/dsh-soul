@@ -8,7 +8,7 @@ import { defaults, fixtureEditor, fixtureExecutor, divergence, BASE_METRICS } fr
 
 const config = ({ budget: budgetOverrides = {}, ...extra } = {}) => ({
   enabled: true, provider: 'fixture', model: 'fixture-model', reasoningEffort: '',
-  autoAdopt: false, injectHarness: false, harnessFolder: '.dsh-soul/harness', checks: [],
+  autoAdopt: false, injectHarness: false, harnessFolder: '.dsh-soul/harness', checks: [{name: 'artifact', argv: [process.execPath, '-e', 'process.exit(0)']}],
   ...extra,
   // Built last so an override cannot replace the resolved budget with a partial object.
   budget: budgetSettings({ cooldownTurns: 0, ...budgetOverrides }),
@@ -33,7 +33,7 @@ function setup(t, { editor = fixtureEditor(), executor = fixtureExecutor(), cfg 
   return { store, evolve, editor, executor, start }
 }
 
-test('one episode: diagnose -> edit -> probe -> shadow, and the baseline is never re-run', async t => {
+test('one episode uses two paired baseline/candidate trials before shadow', async t => {
   const f = setup(t)
   const started = await f.start()
   assert.equal(started.started, true)
@@ -42,8 +42,8 @@ test('one episode: diagnose -> edit -> probe -> shadow, and the baseline is neve
 
   const episode = f.store.episode(started.episode, 'p')
   assert.equal(episode.state, 'shadow')
-  // Exactly one probe: the reference execution is the recorded trajectory, not a replay.
-  assert.equal(f.executor.calls.length, 1)
+  // Two matched pairs, with their execution order alternated.
+  assert.deepEqual(f.executor.calls.map(c => c.arm), ['baseline', 'candidate', 'candidate', 'baseline'])
   // Only one editor session.
   assert.equal(f.editor.requests.length, 1)
   assert.equal(f.editor.requests[0].phase, 'edit')
@@ -70,8 +70,8 @@ test('incomplete candidate and absent declared checks never enter shadow', async
   const first = await f.start()
   await f.evolve.running
   assert.equal(f.store.episode(first.episode, 'p').reason, 'probe_incomplete')
-  f.evolve.execute = fixtureExecutor().execute
-  const second = await f.start({ checks: [{ name: 'required', argv: ['node', '--test'] }] })
+  f.evolve.execute = async () => ({ metrics: { ...BASE_METRICS }, verification: 'fixture', checks: [] })
+  const second = await f.start()
   await f.evolve.running
   assert.equal(f.store.episode(second.episode, 'p').reason, 'missing_candidate_checks')
   assert.equal(f.evolve.current('p').state, 'stable')
@@ -117,11 +117,12 @@ test('an evidence read pulls the body in on demand, and only within the read bud
 
 test('a candidate that regresses the B layer is rejected, not adopted', async t => {
   const f = setup(t, { executor: fixtureExecutor({ toolErrors: 9 }) })
+  f.executor.execute = async ctx => ({ metrics: { ...BASE_METRICS, toolErrors: ctx.arm === 'baseline' ? 0 : 9 }, verification: 'fixture', checks: ctx.checks.map(c => ({name:c.name,ok:true})) })
   const started = await f.start()
   await f.evolve.running
   const episode = f.store.episode(started.episode, 'p')
   assert.equal(episode.state, 'rejected')
-  assert(episode.reason.includes('B 层劣化'))
+  assert(episode.reason.includes('tool_error_regression'))
   assert.equal(f.evolve.current('p').state, 'stable')
   assert.equal(f.store.openWatches('p').length, 0)
 })
@@ -152,20 +153,19 @@ test('anchor tampering from the editor is rejected', async t => {
   assert.equal(f.store.episode(started.episode, 'p').state, 'rejected')
 })
 
-test('fixed-tax reduction alone is adoptable: knowledge moves out of the per-turn path', async t => {
+test('fixed-tax reduction without verified improvement is rejected', async t => {
   const f = setup(t)
   // Editor shrinks tools.md; metrics are unchanged.
   f.editor.generate = async () => ({
     actions: [{ type: 'write', path: 'harness/tools.md', text: '## 工具使用\n读用 Read，找用 Grep。\n' },
       { type: 'finish', why: 'moved guidance into a skill' }],
   })
-  f.executor.execute = async () => ({ metrics: { ...BASE_METRICS }, transcript: '' })
+  f.executor.execute = async ctx => ({ metrics: { ...BASE_METRICS }, transcript: '', verification: 'fixture-snapshot', checks: ctx.checks.map(c => ({name:c.name,ok:true})) })
   const started = await f.start()
   await f.evolve.running
   const episode = f.store.episode(started.episode, 'p')
-  assert.equal(episode.state, 'shadow')
-  const current = f.evolve.current('p')
-  assert(current.state === 'shadow')
+  assert.equal(episode.state, 'rejected')
+  assert.equal(f.evolve.current('p').state, 'stable')
 })
 
 test('shadow window: real traffic promotes after the window, and a correction rolls back', async t => {
@@ -174,9 +174,9 @@ test('shadow window: real traffic promotes after the window, and a correction ro
   await f.evolve.running
   const rev = f.store.latest('p', ['shadow']).id
 
-  // Same task kind, clean turns: the window drains then promotes.
+  // Same task kind, explicitly verified turns: the window drains then promotes.
   for (let i = 0; i < 3; i++) {
-    f.evolve.observe({ scope: 'p', taskKey: 'task-1', corrections: 0, toolErrors: 0, complete: true })
+    f.evolve.observe({ scope: 'p', taskKey: 'task-1', corrections: 0, toolErrors: 0, complete: true, verified: true })
   }
   assert.equal(f.store.rev(rev, 'p').state, 'stable')
   // A decided window leaves the open set, so read the verdict from the table itself.
@@ -204,7 +204,7 @@ test('a window ignores unrelated task kinds instead of closing on noise', async 
   await f.start()
   await f.evolve.running
   const rev = f.store.latest('p', ['shadow']).id
-  f.evolve.observe({ scope: 'p', taskKey: 'other-task', corrections: 0, toolErrors: 0, complete: true })
+  f.evolve.observe({ scope: 'p', taskKey: 'other-task', corrections: 0, toolErrors: 0, complete: true, verified: true })
   assert.equal(f.store.openWatches('p')[0].remaining, 3, 'unrelated turns do not drain the window')
   assert.equal(f.store.rev(rev, 'p').state, 'shadow')
 })
@@ -214,7 +214,7 @@ test('verdict ordering: a correction beats any amount of good metrics', () => {
   assert.equal(verdictOf(window, { corrections: 1, toolErrors: 0, complete: true }), 'fail')
   assert.equal(verdictOf(window, { corrections: 0, toolErrors: 0, complete: false }), 'fail')
   assert.equal(verdictOf(window, { corrections: 0, toolErrors: 2, complete: true }), 'fail')
-  assert.equal(verdictOf({ remaining: 0, baseline: { toolErrors: 0 } }, { corrections: 0, toolErrors: 0, complete: true }), 'pass')
+  assert.equal(verdictOf({ remaining: 0, baseline: { toolErrors: 0 } }, { corrections: 0, toolErrors: 0, complete: true, verified: true }), 'pass')
 })
 
 test('budget is reserved before dispatch and never refunded on failure', async t => {
@@ -301,4 +301,33 @@ test('the store survives a reload with the same revision graph', async t => {
   assert.equal(check.integrity, 'ok')
   assert.equal(check.foreignKeys, 0)
   store.close()
+})
+
+test('identical project defaults have separate revision and activation state', () => {
+  const store = new Store(':memory:')
+  try {
+    const a = store.putRev('a',defaults(),{state:'stable'})
+    const b = store.putRev('b',defaults(),{state:'stable'})
+    assert.notEqual(a,b)
+    store.setRevState(a,'retired')
+    assert.equal(store.latest('b').id,b)
+    assert.throws(()=>store.putRev('a',defaults(),{state:'shadow'}),e=>e.code==='retired_revision')
+  } finally {store.close()}
+})
+
+test('silence cannot promote a trial and an unresolved trial blocks further paid evolution', async t => {
+  const f = setup(t)
+  await f.start(); await f.evolve.running
+  for(let i=0;i<20;i++) f.evolve.observe({scope:'p',taskKey:'task-1',corrections:0,toolErrors:0,complete:true})
+  assert.equal(f.evolve.current('p').state,'shadow')
+  assert.equal(f.store.openWatches('p')[0].remaining,3)
+  assert.equal((await f.start()).reason,'trial_pending')
+})
+
+test('missing outcome checks refuse before any editor request', async t => {
+  const f = setup(t)
+  const result = await f.start({checks:[]})
+  assert.equal(result.reason,'verification_required')
+  assert.equal(f.editor.requests.length,0)
+  assert.equal(f.store.recentEpisodes('p').length,0)
 })

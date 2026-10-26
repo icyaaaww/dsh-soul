@@ -1,7 +1,7 @@
 - insert:
     - id: dsh-soul
       name: dsh-soul
-      inject: [tools, systemPrompt, commands, llm]
+      inject: [tools, systemPrompt, commands, llm, skills]
       config:
         enabled: false
         provider: ''

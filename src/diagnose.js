@@ -11,6 +11,13 @@ import { fail } from './util.js'
 
 const RULES = [
   {
+    id: 'delegation',
+    when: d => d.signals.some(s => ['user_correction','tool_error'].includes(s.kind) && /子代理|子任务|委派|subagent|delegat/i.test(JSON.stringify(s.detail))),
+    target: 'C5',
+    why: '分歧发生在子任务划分、委派或结果回收，修订委派指引',
+    hint: '明确委派触发条件、输入、验收标准和回传内容；不得扩大宿主权限或递归上限',
+  },
+  {
     // Explicit caller-supplied evidence outranks every keyword heuristic: a hook may only be
     // proposed after the same invariant has been observed ignored more than once.
     id: 'repeated_invariant',

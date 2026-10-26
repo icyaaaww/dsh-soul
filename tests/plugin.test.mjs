@@ -24,7 +24,7 @@ const session = (cwd = process.cwd()) => ({ id: 's1', header: { cwd } })
 
 test('plugin is disabled by default and registers nothing until asked', () => {
   assert.equal(name, 'dsh-soul')
-  assert.deepEqual(inject, ['tools', 'systemPrompt', 'commands', 'llm'])
+  assert.deepEqual(inject, ['tools', 'systemPrompt', 'commands', 'llm', 'skills'])
   const { ctx, tools, contexts } = fakeContext()
   const out = apply(ctx, { profile: 'test', database: ':memory:' })
   assert.equal(out, undefined)
@@ -44,11 +44,11 @@ test('enabled: tools and the four every-call contexts register exactly once', as
   const { ctx, tools, commands, contexts } = fakeContext()
   const handle = apply(ctx, { profile: 'test', database: ':memory:', enabled: true, provider: 'p', model: 'm' })
   try {
-    assert.equal(contexts.length, 8)
+    assert.equal(contexts.length, 9)
     const normal = contexts.filter(c => !c.name.startsWith('dsh-soul:probe:'))
     assert.deepEqual(normal.map(c => c.order), [900, 910, 920, 950])
-    assert.equal(new Set(contexts.map(c => c.name)).size, 8)
-    assert.deepEqual(tools.map(t => t.name).sort(), ['evolve_diagnose', 'evolve_request', 'evolve_status', 'evolve_tree'])
+    assert.equal(new Set(contexts.map(c => c.name)).size, 9)
+    assert.deepEqual(tools.map(t => t.name).sort(), ['evolve_catalog', 'evolve_delegate', 'evolve_diagnose', 'evolve_request', 'evolve_script', 'evolve_status', 'evolve_tree'])
     assert.deepEqual(commands.map(c => c.name), ['evolve'])
     for (const tool of tools) {
       assert.equal(tool.parameters.type, 'object')

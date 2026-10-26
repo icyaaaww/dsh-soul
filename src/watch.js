@@ -1,10 +1,9 @@
 /**
  * Shadow adoption.
  *
- * This is the mechanism that makes verification free: an adopted revision serves real
- * traffic for a bounded window, and any Tier-D signal inside that window rolls it back.
- * Real tasks are a holdout set that refreshes itself, so a candidate fitted to yesterday's
- * evidence cannot survive tomorrow's work.
+ * Trial versions affect real traffic. Silence is not a correctness verdict; only
+ * explicit artifact verification drains the window. Negative observations can
+ * still reject immediately. Repeated trials are not a proof of generalization.
  *
  * Tier ordering is absolute: a user correction outranks any offline evidence.
  */
@@ -12,12 +11,12 @@
 export const VERDICTS = new Set(['pass', 'fail', 'pending'])
 
 /** Decide what a shadow window observed. Pure, so the rule is testable in isolation. */
-export function verdictOf(window, { corrections = 0, toolErrors = 0, complete = true } = {}) {
+export function verdictOf(window, { corrections = 0, toolErrors = 0, complete = true, verified = false } = {}) {
   if (corrections > 0) return 'fail'
   if (!complete) return 'fail'
   const base = window?.baseline ?? { toolErrors: 0 }
   if (toolErrors > base.toolErrors) return 'fail'
-  return window?.remaining > 0 ? 'pending' : 'pass'
+  return window?.remaining > 0 || !verified ? 'pending' : 'pass'
 }
 
 /**
@@ -25,16 +24,16 @@ export function verdictOf(window, { corrections = 0, toolErrors = 0, complete = 
  *
  * @returns {{rev:string, verdict:string}[]} decisions reached by this turn
  */
-export function fold(store, { scope, taskKey, corrections, toolErrors, complete }) {
+export function fold(store, { scope, taskKey, corrections, toolErrors, complete, verified = false }) {
   const decisions = []
   for (const window of store.openWatches(scope)) {
     if (window.verdict) continue
     // Only same-kind tasks count toward the window: an unrelated task says nothing about
     // whether this edit helped, and counting it would let the window close on noise.
     if (window.task_key !== taskKey && window.remaining > 0) continue
-    const after = corrections > 0 || toolErrors > 0 || !complete
+    const after = corrections > 0 || toolErrors > 0 || !complete || !verified
       ? window : store.consumeWatch(window.rev) ?? window
-    const verdict = verdictOf(after, { corrections, toolErrors, complete })
+    const verdict = verdictOf(after, { corrections, toolErrors, complete, verified })
     if (verdict === 'pending') continue
     store.decideWatch(window.rev, verdict)
     decisions.push({ rev: window.rev, verdict })

@@ -41,8 +41,8 @@ export function fixtureExecutor(metrics = {}) {
   return {
     calls,
     execute: async ctx => {
-      calls.push({ task: ctx.task, files: Object.keys(ctx.files) })
-      return { metrics: { toolErrors: 0, toolCalls: 5, steps: 3, complete: true, deliverable: true, durationMs: 1, ...metrics }, transcript: 'fixture probe' }
+      calls.push({ task: ctx.task, arm: ctx.arm, files: Object.keys(ctx.files) })
+      return { metrics: { toolErrors: 0, toolCalls: 5, steps: 3, complete: true, deliverable: true, durationMs: 1, ...metrics }, transcript: 'fixture probe', verification: 'fixture-snapshot', checks: ctx.checks.map(c => ({name: c.name, ok: ctx.arm !== 'baseline'})) }
     },
   }
 }

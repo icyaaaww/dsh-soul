@@ -1,9 +1,8 @@
 import { bounded, clean, hash, redact, taskKey, textBlocks, human, day } from './util.js'
 
 /**
- * Turn-level observation. This is the "free baseline" source: every trajectory the agent
- * already produced is kept as evidence, so a refinement episode never pays to re-run the
- * reference. Only the candidate is ever executed.
+ * Turn-level observation supplies diagnosis evidence. Adoption uses separate paired
+ * replays; these online metrics are never treated as a matched baseline.
  */
 
 /** B-layer metrics: deterministic, cheap, and comparable across turns. */
@@ -61,7 +60,7 @@ export class Recorder {
       if (!call || call.done) return
       call.done = true
       // Harness-observation tools are not independent evidence of task success.
-      if (call.name.startsWith('evolve_')) return
+      if (['evolve_status', 'evolve_diagnose', 'evolve_request', 'evolve_tree'].includes(call.name)) return
       state.toolCalls++
       if (data.message?.isError) {
         state.toolErrors++

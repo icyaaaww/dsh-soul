@@ -12,9 +12,12 @@ import { hostProbe } from './src/host-probe.js'
 import { createHostRunner } from './src/host-runner.js'
 import { projectScope, bounded, boolean, integer, human, textBlocks, fail } from './src/util.js'
 import { sizeReport, COMPONENTS } from './src/tree.js'
+import { createComponents } from './src/components.js'
+import { assertVerifier, validationSettings } from './src/validation.js'
+import { runChecks } from './src/probe.js'
 
 export const name = 'dsh-soul'
-export const inject = ['tools', 'systemPrompt', 'commands', 'llm']
+export const inject = ['tools', 'systemPrompt', 'commands', 'llm', 'skills']
 
 export function settings(input = {}) {
   const profileMatch = fileURLToPath(import.meta.url).replaceAll('\\', '/').match(/\/profiles\/([^/]+)\/node_modules\//)
@@ -36,6 +39,7 @@ export function settings(input = {}) {
     injectHarness: boolean(input.injectHarness, true, 'injectHarness'),
     harnessFolder: input.harnessFolder ?? '.dsh-soul/harness',
     checks: Array.isArray(input.checks) ? input.checks : [],
+    validationTrials: validationSettings(input).trials,
     budget: budgetSettings(input),
   }
   if (config.learning) throw new Error('独立版不提供后台记忆提炼')
@@ -47,7 +51,8 @@ export function settings(input = {}) {
 const HELP = `DSH Soul — 真实宿主 harness 演化（单变量编辑 / 真实任务试用 / 在线基线）
 /evolve status             当前版本、每轮固定税、额度、影子窗口
 /evolve diagnose [n]       查看最近 n 轮观察的诊断结果，不花费模型调用
-/evolve run                手动对最近一次分歧发起一次精炼
+/evolve run [C1–C8]        对最近分歧精炼；可显式指定目标组件
+/evolve verify             验收最近一次真实试用任务；通过才推进转正窗口
 /evolve diff [A] [B]       两版组件差异，默认当前 stable 与最近影子版本
 /evolve log [n]            审计账本
 /evolve explain <rev>      某版本凭什么被采纳，含证据与闸门
@@ -87,8 +92,6 @@ const tools = [
   },
 ]
 
-const describe = agent => ({ session: agent.session, scope: projectScope(agent.session) })
-
 export function apply(ctx, input = {}) {
   if (input.enabled === false) return
   const config = settings(input)
@@ -100,6 +103,13 @@ export function apply(ctx, input = {}) {
   const recent = new Map()      // session -> last finished observation
   const lastTurn = new Map()    // session -> { intent } to detect corrections
   let disposed = false
+  const commandLifetime = new AbortController(), commandJobs = new Set()
+  const trackedCommand = fn => input => {
+    const signal = input.signal ? AbortSignal.any([input.signal, commandLifetime.signal]) : commandLifetime.signal
+    const job = fn({ ...input, signal })
+    commandJobs.add(job); job.finally(() => commandJobs.delete(job)).catch(() => {})
+    return job
+  }
 
   const llm = typeof ctx.get === 'function' ? ctx.get('llm') : ctx.llm
   if (!llm?.stream) { store.close(); throw new Error('演化需要宿主的 llm 服务') }
@@ -126,18 +136,34 @@ export function apply(ctx, input = {}) {
   }
 
   // Capability and clean-worktree checks run before any paid editor call.
-  const runner = createHostRunner(ctx, { requestTimeoutMs: config.budget.requestTimeoutMs })
+  let evolve, components, runner
+  try {
+  components = createComponents(ctx, { current: scope => evolve?.current(scope), enabled: () => config.injectHarness && !disposed,
+    audit: (agent, detail) => store.log({ scope: projectScope(agent.session), action: 'hook', actor: 'runtime', detail }) })
+  const describe = agent => ({ session: agent.session, scope: projectScope({ id: agent.session.id, header: { cwd: components.cwdFor(agent) } }) })
+  runner = createHostRunner(ctx, { requestTimeoutMs: config.budget.requestTimeoutMs, components })
   const execute = hostProbe({
         spawn: runner.spawn, capability: runner.capability,
         provider: config.provider, model: config.model,
         reasoningEffort: config.reasoningEffort, steps: config.budget.probeSteps,
+        components,
       })
 
-  const evolve = new Evolve({ store, config, generate, execute, logger: () => {} })
+  evolve = new Evolve({ store, config, generate, execute, logger: () => {}, onChange: components.invalidate })
+  components.setDelegate(async input => {
+    const inherited = runner.reserveFor(input.parent)
+    const scope = describe(input.parent).scope
+    const reserve = inherited ?? (payload => {
+      const ticket = evolve.budget.request(scope, null, 'delegate', payload)
+      if (!ticket.ok) throw fail(ticket.reason)
+      return { settle: (outcome, usage) => evolve.budget.settle(ticket.callId, outcome, usage) }
+    })
+    return runner.spawn({ ...input, delegation: true, provider: config.provider, model: config.model,
+      reasoningEffort: config.reasoningEffort, maxSteps: config.budget.probeSteps, reserve })
+  })
   const safe = fn => (...args) => { try { return fn(...args) } catch { /* observation must never break a turn */ } }
   const listen = (event, handler) => disposers.push(ctx.on(event, handler))
 
-  try {
     // ---- observation ------------------------------------------------------
     listen('agent/pre-step', async (payload, next) => {
       const decision = await next()
@@ -153,7 +179,8 @@ export function apply(ctx, input = {}) {
           const intent = correction ? previous.intent : text
           lastTurn.set(sid, { intent: bounded(intent, 2000) })
           if (!recorder.get(sid)) {
-            recorder.start(sid, { scope: projectScope(payload.agent.session), turn: Date.now(), intent })
+            const state = recorder.start(sid, { scope: describe(payload.agent).scope, turn: Date.now(), intent })
+            state.revision = evolve.current(state.scope)?.rev
           }
           if (correction) {
             recorder.markCorrection(sid)
@@ -207,11 +234,10 @@ export function apply(ctx, input = {}) {
           name: `dsh-soul:${key}`, order, interpolate: false,
           text: ({ agent }) => {
             if (!agent || disposed || agent.session.header?.origin === 'subagent') return ''
-            const cwd = agent.session.header?.cwd
+            const cwd = components.cwdFor(agent)
             if (!cwd) return ''
             try {
-              const current = evolve.current(projectScope(agent.session))
-              return current?.files?.[spec.path] ?? ''
+              return components.filesFor(agent)?.[spec.path] ?? ''
             } catch { return '' }
           },
         }))
@@ -262,13 +288,13 @@ export function apply(ctx, input = {}) {
     disposers.push(ctx.commands.register({
       name: 'evolve', description: '查看与回滚 harness 自演化状态（run 会消耗模型额度）',
       input: { hint: 'status / tree / diagnose / diff / log / rollback' }, recordInput: false,
-      handler: async ({ agent, rawInput, signal }) => {
+      handler: trackedCommand(async ({ agent, rawInput, signal }) => {
         try {
           signal?.throwIfAborted()
           const text = String(rawInput ?? '').trim()
           const [verb = 'status', ...args] = text.split(/\s+/)
           const { scope } = describe(agent)
-          const cwd = agent.session.header?.cwd
+          const cwd = components.cwdFor(agent)
           if (cwd) {
             evolve.ensure(scope, readDefaults())
           }
@@ -292,6 +318,7 @@ export function apply(ctx, input = {}) {
               threshold: config.budget.repeatThreshold, trajectory: trajectoryText(observation.state) }, null, 2) }
           }
           if (verb === 'run') {
+            if (args.length > 1 || (args[0] && !Object.hasOwn(COMPONENTS,args[0]))) return {kind:'error',text:'目标组件只能是 C1–C8。'}
             if (!config.injectHarness) return { kind: 'error', text: 'injectHarness 已关闭，无法把候选应用到真实任务。' }
             const observation = recent.get(String(agent.session.id))
             if (!observation?.divergence) return { kind: 'error', text: '没有可归因的分歧，不启动。' }
@@ -304,8 +331,35 @@ export function apply(ctx, input = {}) {
               divergence: observation.divergence, metrics: observation.state,
               trajectory: trajectoryText(observation.state), task: observation.state.text,
               cwd, checks: config.checks, parent: agent,
+              ...(args[0] ? {diagnosis:{target:args[0],rule:'user_target',why:'用户指定组件，修复本次记录的分歧',hint:'只修改此组件，必须通过同条件成对验收'}} : {}),
             })
             return { kind: result.started ? 'success' : 'error', text: JSON.stringify(result, null, 2) }
+          }
+          if (verb === 'verify') {
+            const observation = recent.get(String(agent.session.id))?.state
+            const current = evolve.current(scope)
+            const window = store.openWatches(scope).find(w => w.rev === current?.rev)
+            if (!window || !observation || observation.revision !== window.rev || observation.taskKey !== window.task_key) return { kind: 'error', text: '需要在当前试用版本下完成一次同类任务，再验收。' }
+            if (observation.verified) return { kind: 'error', text: '这一轮已验收，不能重复推进窗口。' }
+            if (observation.verifying || recorder.get(String(agent.session.id))) return { kind: 'error', text: '任务或验收尚在运行。' }
+            const replay = window.baseline.verification
+            if (!replay || !cwd) return { kind: 'error', text: '旧版试用缺少固定验收定义，请回滚并重新演化。' }
+            observation.verifying = true
+            try {
+              await assertVerifier(cwd, replay)
+              const checks = await runChecks(cwd, replay.checks, { signal })
+              await assertVerifier(cwd, replay)
+              if (evolve.current(scope)?.rev !== window.rev || recent.get(String(agent.session.id))?.state !== observation || recorder.get(String(agent.session.id))) return { kind: 'error', text: '版本或任务已改变，验收作废。' }
+              observation.verified = true
+              const ok = checks.length > 0 && checks.every(c => c.ok)
+              const decisions = evolve.observe({ scope, taskKey: observation.taskKey, corrections: observation.corrections,
+                toolErrors: observation.toolErrors, complete: observation.complete && ok, verified: ok })
+              store.log({ scope, rev: window.rev, action: 'trial_verification', actor: 'user', detail: { checks, decisions } })
+              return { kind: ok ? 'success' : 'error', text: JSON.stringify({ checks, decisions, remaining: store.openWatches(scope)[0]?.remaining ?? 0 }, null, 2) }
+            } catch (error) {
+              if (!signal?.aborted && evolve.current(scope)?.rev === window.rev) evolve.observe({ scope, taskKey: observation.taskKey, corrections: 0, toolErrors: 0, complete: false })
+              throw error
+            } finally { observation.verifying = false }
           }
           if (verb === 'diff') {
             const [a, b] = args
@@ -329,7 +383,7 @@ export function apply(ctx, input = {}) {
             const current = evolve.current(scope)
             const { checkStructure } = await import('./src/gate.js')
             const files = current?.files ?? readDefaults()
-            const result = checkStructure({ target: 'C1', base: files, next: files })
+            const result = checkStructure({ target: 'C1', base: files, next: files, allowUnchanged: true })
             return { kind: 'success', text: JSON.stringify({ ok: result.ok, violations: result.violations, tax: result.tax }, null, 2) }
           }
           if (verb === 'export') {
@@ -344,21 +398,25 @@ export function apply(ctx, input = {}) {
         } catch (error) {
           return { kind: 'error', text: bounded(error?.message ?? '执行失败', 500) }
         }
-      },
+      }),
     }))
 
     const stop = async () => {
       if (disposed) return
       disposed = true
+      commandLifetime.abort(fail('plugin_stopped'))
       for (const dispose of disposers.reverse()) if (typeof dispose === 'function') dispose()
       await evolve.stop()
-      runner.stop()
+      await Promise.allSettled([...commandJobs])
+      await runner.stop()
+      await components.stop()
       store.close()
     }
-    return Object.assign(stop, { store, evolve, stop, config, recorder, recent })
+    return Object.assign(stop, { store, evolve, stop, config, recorder, recent, components })
   } catch (error) {
     for (const dispose of disposers.reverse()) if (typeof dispose === 'function') dispose()
-    runner.stop()
+    runner?.stop()
+    components?.stop()
     store.close()
     throw error
   }

@@ -13,9 +13,8 @@ const run = promisify(execFile)
 /**
  * Candidate execution.
  *
- * The reference execution is NOT re-run: the real trajectory the agent already produced is
- * the baseline. Only the candidate tree is executed, which halves the cost of a comparison
- * relative to a naive A/B replay.
+ * Baseline and candidate are replayed from the same pinned commit and verifier.
+ * The orchestrator owns repeated trials and their shared budget.
  *
  * Execution uses a separate git checkout. Host tool permissions remain in force:
  * a worktree is not a filesystem or network security sandbox.
@@ -49,12 +48,13 @@ export async function isClean(root) {
  * Create a throwaway worktree pinned at HEAD. Caller must call `release`.
  * Using a detached worktree means the probe sees exactly the committed state.
  */
-export async function withWorktree(root, fn) {
+export async function withWorktree(root, fn, { revision = 'HEAD' } = {}) {
   if (!(await isClean(root))) throw fail('dirty_worktree', '工作区有未提交改动，回放会产生噪声；已跳过离线探测')
   const folder = await mkdtemp(join(tmpdir(), 'dsh-soul-harness-probe-'))
   let added = false, primary
   try {
-    await run('git', ['-C', root, 'worktree', 'add', '--detach', folder, 'HEAD'], { timeout: 30000 })
+    if (revision !== 'HEAD' && !/^[a-f0-9]{40,64}$/.test(revision)) throw fail('invalid_revision')
+    await run('git', ['-C', root, 'worktree', 'add', '--detach', folder, revision], { timeout: 30000 })
     added = true
     return await fn(folder)
   } catch (error) {
@@ -108,7 +108,8 @@ export async function installTree(root, files, { folder = '.dsh-soul/harness' } 
 /**
  * A layer: deterministic project checks declared by the user.
  * User-declared commands run without a shell, with timeout and bounded output.
- * They have normal process privileges; their project test files are not immutable.
+ * They have normal process privileges; host-probe verifies declared test dependencies
+ * against the pinned snapshot before and after running these checks.
  */
 export async function runChecks(root, checks, { timeoutMs = 120000, signal } = {}) {
   const results = []
@@ -137,19 +138,19 @@ export async function runChecks(root, checks, { timeoutMs = 120000, signal } = {
  *
  * @param {(ctx: object) => Promise<{metrics: object, transcript: string}>} execute
  */
-export async function probe({ execute, files, task, harnessFolder, signal, timeoutMs = 480000, root = null, parent, reserve, checks }) {
+export async function probe({ execute, files, task, harnessFolder, signal, timeoutMs = 480000, root = null, parent, reserve, checks, replay, arm }) {
   if (typeof execute !== 'function') throw fail('no_executor', '未配置探测执行器')
   const started = Date.now()
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(fail('probe_timeout')), timeoutMs)
   const merged = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
   try {
-    const result = await execute({ files, task, harnessFolder, root, signal: merged, parent, reserve, checks })
+    const result = await execute({ files, task, harnessFolder, root, signal: merged, parent, reserve, checks, replay, arm })
     merged.throwIfAborted()
     if (!result?.metrics || !['steps','toolCalls','toolErrors','durationMs'].every(k => Number.isFinite(result.metrics[k]) && result.metrics[k] >= 0) || typeof result.metrics.complete !== 'boolean') throw fail('invalid_probe_metrics')
     const metrics = { ...emptyMetrics(), ...(result?.metrics ?? {}) }
     metrics.durationMs = metrics.durationMs || Date.now() - started
-    return { ok: true, metrics, checks: result.checks ?? null, transcript: bounded(redact(result?.transcript ?? ''), 12000) }
+    return { ok: true, metrics, checks: result.checks ?? null, verification: result.verification ?? null, transcript: bounded(redact(result?.transcript ?? ''), 12000) }
   } catch (error) {
     if (merged.aborted) {
       const reason = merged.reason?.code ?? 'probe_timeout'

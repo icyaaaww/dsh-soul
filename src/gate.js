@@ -1,6 +1,7 @@
 import { bytes, fail } from './util.js'
-import { COMPONENTS, anchorsOf, checkAnchors, componentOf, lint, taxOf, sizeReport } from './tree.js'
+import { COMPONENTS, anchorsOf, checkAnchors, componentOf, lint, taxOf, sizeReport, safePath } from './tree.js'
 import { assertTarget } from './diagnose.js'
+import { compareTrials } from './validation.js'
 
 /**
  * The gate is where "the model proposed something" becomes "something may happen".
@@ -12,9 +13,12 @@ import { assertTarget } from './diagnose.js'
 export const MAX_TAX_BYTES = 2400
 
 /** Structural validation of a candidate tree against its parent. */
-export function checkStructure({ target, base, next }) {
+export function checkStructure({ target, base, next, allowUnchanged = false }) {
   const violations = []
   const changed = []
+  for (const [path,text] of Object.entries(next)) {
+    try { safePath(path); violations.push(...lint(path,text)) } catch (e) { violations.push(e.message) }
+  }
 
   for (const path of new Set([...Object.keys(base), ...Object.keys(next)])) {
     if (base[path] === next[path]) continue
@@ -25,7 +29,6 @@ export function checkStructure({ target, base, next }) {
     if (!component) { violations.push(`未受管路径: ${path}`); continue }
 
     if (next[path] !== undefined) {
-      violations.push(...lint(path, next[path]))
       try { checkAnchors(path, base[path] ?? defaultAnchorFor(component, base), next[path]) }
       catch (error) { violations.push(error.message) }
     } else if (COMPONENTS[component].anchor) {
@@ -38,7 +41,8 @@ export function checkStructure({ target, base, next }) {
     else violations.push(`跨组件编辑：${path} 不属于单一目标 ${target}`)
   }
 
-  if (!changed.length) violations.push('没有任何改动')
+  if (!changed.length && !allowUnchanged) violations.push('没有任何改动')
+  if (Object.keys(next).filter(p=>componentOf(p)==='C8').length > 4) violations.push('最多激活 4 个 hook，避免每次工具执行累计延迟')
 
   const tax = taxOf(next)
   if (tax > MAX_TAX_BYTES) violations.push(`每轮固定税 ${tax} 字节超出上限 ${MAX_TAX_BYTES}`)
@@ -96,38 +100,12 @@ export function compareMetrics(base, next) {
  *
  * @returns {{adopt:boolean, shadow:boolean, violations:string[], reasons:string[]}}
  */
-export function decide({ structure, baseMetrics, nextMetrics, checks, cooldown, taxDelta }) {
-  const reasons = []
+export function decide({ structure, pairs, validation, cooldown }) {
   if (!structure.ok) return { adopt: false, shadow: false, violations: structure.violations, reasons: ['结构校验失败'] }
-
-  // A layer: deterministic project checks. A failing A layer vetoes outright.
-  if (checks && checks.length) {
-    const failed = checks.filter(c => !c.ok)
-    if (failed.length) return { adopt: false, shadow: false, violations: [], reasons: failed.map(c => `A 层失败: ${c.name}`) }
-    reasons.push(`A 层通过 ${checks.length} 项`)
-  }
-
-  const { regressions, improvements } = compareMetrics(baseMetrics, nextMetrics)
-  if (regressions.length) {
-    return { adopt: false, shadow: false, violations: [], reasons: [`B 层劣化: ${regressions.join('；')}`] }
-  }
-  if (improvements.length) reasons.push(`B 层改善: ${improvements.join('；')}`)
-
-  // Pure fixed-tax reduction is an admissible improvement on its own: it is measurable,
-  // deterministic, and cannot be faked by a lucky run.
-  const slimmed = taxDelta < 0
-  if (slimmed) reasons.push(`固定税下降 ${Math.abs(taxDelta)} 字节/轮`)
-
-  if (!improvements.length && !slimmed) {
-    return { adopt: false, shadow: false, violations: [], reasons: ['无指向性改善：质量、错误数、步数、固定税均无改善'] }
-  }
-
-  // Cost gate: a cache-rebuilding edit must be worth its own overhead.
-  if (cooldown && !cooldown.ok) {
-    return { adopt: false, shadow: true, violations: [], reasons: [`距上次采纳不足 ${cooldown.need} 轮（已 ${cooldown.have}），仅进入影子窗口`] }
-  }
-
-  return { adopt: true, shadow: true, violations: [], reasons }
+  const evidence = compareTrials(pairs, validation)
+  if (!evidence.ok) return { adopt: false, shadow: false, violations: [], reasons: [evidence.reason], evidence }
+  if (cooldown && !cooldown.ok) return { adopt: false, shadow: false, violations: [], reasons: ['cooldown'] }
+  return { adopt: true, shadow: true, violations: [], reasons: [evidence.reason], evidence }
 }
 
 /** Rolling turn counter used for the cooldown, persisted in meta so restarts do not reset it. */

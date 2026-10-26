@@ -1,7 +1,7 @@
 {
   "name": "dsh-soul",
-  "version": "0.8.1",
-  "description": "Standalone DSH harness evolution: observed divergence, worktree probes, trial adoption and rollback",
+  "version": "0.9.0",
+  "description": "Standalone DSH evolution with paired outcome validation and eight connected harness components",
   "license": "MIT",
   "repository": {
     "type": "git",

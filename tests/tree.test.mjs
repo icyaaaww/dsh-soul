@@ -36,7 +36,7 @@ test('lint enforces component caps and hook contracts', () => {
   assert.deepEqual(lint('system.md', files['system.md']), [])
   assert(lint('system.md', 'x'.repeat(COMPONENTS.C1.cap + 1)).some(v => v.includes('上限')))
 
-  const goodHook = `export const timeoutMs = 2000
+  const goodHook = `export const timeoutMs = 200
 export const failOpen = true
 export async function run(ctx) { return null }
 `
@@ -46,7 +46,7 @@ export async function run(ctx) { return null }
   assert(lint('hooks/guard.mjs', goodHook + '\nimport net from "node:net"\n').some(v => v.includes('网络')))
   assert(lint('hooks/guard.mjs', goodHook + '\nwhile (true) {}\n').some(v => v.includes('无界循环')))
   assert(lint('hooks/guard.mjs', goodHook + '\nprocess.env.SECRET\n').some(v => v.includes('凭据')))
-  assert(lint('scripts/a.mjs', 'console.log(1)').length === 1 === false || true)
+  assert(lint('scripts/a.mjs', 'console.log(1)').some(v=>v.includes('run(input)')))
 })
 
 test('lint rejects injected instructions and embedded credentials', () => {

@@ -1,6 +1,7 @@
 import { readFileSync, readdirSync, statSync, lstatSync } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
 import { hash, bytes, bounded } from './util.js'
+import { skillOf } from './components.js'
 
 /**
  * The eight editable harness components (Xu et al. 2026, Table 5), mapped to DSH mechanisms.
@@ -158,11 +159,16 @@ export function lint(path, text, { tree, blob } = {}) {
   for (const rule of BANNED) if (rule.re.test(text)) problems.push(`${path} ${rule.why}`)
 
   if (key === 'C8') {
-    if (!path.endsWith('.mjs')) problems.push(`${path} hook 必须是 .mjs`)
+    if (!/^hooks\/[a-zA-Z0-9_-]+\.mjs$/.test(path)) problems.push(`${path} hook 必须是 hooks/<name>.mjs`)
     for (const rule of HOOK_REQUIRED) if (!rule.re.test(text)) problems.push(`${path} ${rule.why}`)
     for (const rule of HOOK_FORBIDDEN) if (rule.re.test(text)) problems.push(`${path} ${rule.why}`)
+    const timeout = /export\s+const\s+timeoutMs\s*=\s*(\d+)\s*(?:;|\r?\n|$)/.exec(text)
+    if (!timeout || Number(timeout[1]) < 1 || Number(timeout[1]) > 1000) problems.push(`${path} timeoutMs 必须为 1–1000 的整数字面量`)
   }
-  if (key === 'C7' && !path.endsWith('.mjs')) problems.push(`${path} 脚本必须是 .mjs`)
+  if (['C7','C8'].includes(key) && /\bimport\s*(?:[({*"']|[A-Za-z_$])/.test(text)) problems.push(`${path} 只支持独立纯函数模块，不允许 import`)
+  if (key === 'C7' && !/^scripts\/[a-zA-Z0-9_-]+\.mjs$/.test(path)) problems.push(`${path} 脚本必须是 scripts/<name>.mjs`)
+  if (key === 'C7' && !/export\s+(?:async\s+)?function\s+run|export\s+const\s+run\s*=/.test(text)) problems.push(`${path} 脚本必须导出 run(input)`)
+  if (key === 'C6') { try { skillOf(path, text) } catch (e) { problems.push(e.message) } }
 
   if (spec.anchor) {
     try { if (!anchorsOf(text).length) problems.push(`${path} 缺少锚定区`) }

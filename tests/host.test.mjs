@@ -13,7 +13,7 @@ const pluginModule = await import(process.env.DSH_SOUL_TEST_ENTRY ?? new URL('..
 import { projectScope } from '../src/util.js'
 
 const manifest = process.env.DSH_TEST_PACKAGE
-test('real DSH: spawn integration on 0.2.1, explicit refusal on 0.2.0', { skip: !manifest, timeout: 30000 }, async () => {
+test('real DSH: spawn integration on 0.2.1, explicit refusal on 0.2.0', { skip: !manifest, timeout: 90000 }, async () => {
   const req = createRequire(resolve(manifest)), load = name => import(pathToFileURL(req.resolve('@deepseek-ai/' + name)).href)
   const hostVersion = JSON.parse(readFileSync(manifest, 'utf8')).version
   if (process.env.DSH_TEST_VERSION) assert.equal(hostVersion, process.env.DSH_TEST_VERSION)
@@ -33,12 +33,14 @@ test('real DSH: spawn integration on 0.2.1, explicit refusal on 0.2.0', { skip: 
     new AgentRegistry(ctx)
     const runner = createHostRunner(ctx)
     assert.equal(runner.capability().reason, 'host_runner_unavailable')
-    runner.stop(); await ctx.fiber.dispose()
+    await runner.stop(); await ctx.fiber.dispose()
     return
   }
   const { WorkingDirectoryService } = await load('dsh-working-directory')
   const { LocalFileSystem } = await load('dsh-fs-local')
   const { CommandRuntime } = await load('dsh-commands')
+  const { SkillRegistry } = await load('dsh-skill')
+  const skillTool = await load('dsh-tool-skill')
   const { createUserMessage } = await load('dsh-llm')
   // 0.2.0 only checks peerDependencies; engines.dsh is enforced by the newer host.
   const { evaluatePluginCompatibility } = await load('dsh-app-boot')
@@ -49,6 +51,7 @@ test('real DSH: spawn integration on 0.2.1, explicit refusal on 0.2.0', { skip: 
   const dir = mkdtempSync(join(tmpdir(), 'evolve-real-host-'))
   const git = (...args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', windowsHide: true })
   git('init', '-q'); writeFileSync(join(dir, 'README.md'), 'host integration fixture\n')
+  writeFileSync(join(dir, '.gitignore'), 'result.txt\n')
   git('add', '.'); git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture')
   const ctx = new Context()
   new SessionStore(ctx); new SessionProjectionRegistry(ctx)
@@ -56,8 +59,10 @@ test('real DSH: spawn integration on 0.2.1, explicit refusal on 0.2.0', { skip: 
   new LocalFileSystem(ctx, { cwd: dir, diffBasisMaxBytes: 1048576 }); new WorkingDirectoryService(ctx, { defaultDirectory: dir })
   const agents = new AgentRegistry(ctx), tools = new ToolRuntime(ctx), llm = new LlmRuntime(ctx)
   const commands = new CommandRuntime(ctx)
+  const skills = new SkillRegistry(ctx)
+  skillTool.apply(ctx)
   new AgentLoop(ctx, { agents: [], maxParallelToolCalls: { get: () => 1 } })
-  new SubagentRuntime(ctx, { maxDepth: { get: () => 1 }, maxActiveSubagents: { get: () => 8 } })
+  new SubagentRuntime(ctx, { maxDepth: { get: () => 3 }, maxActiveSubagents: { get: () => 8 } })
   spawnProvider.apply(ctx, { providerName: 'spawn' })
   if (process.env.DSH_EVOLVE_DEBUG) ctx.on('session/event', (s, e) => console.error(s.id, e.type, JSON.stringify(e.data).slice(0, 1200)))
   await new Promise(resolve => setImmediate(resolve))
@@ -84,6 +89,29 @@ test('real DSH: spawn integration on 0.2.1, explicit refusal on 0.2.0', { skip: 
         })
         return
       }
+      const taskUser = options.messages.findLastIndex(m => m.role === 'user' && m.source?.kind === 'user')
+      if (mode === 'component-probe' && JSON.stringify(options.messages[taskUser]).includes('component-run')) {
+        const completed = options.messages.slice(taskUser + 1).filter(m => m.role === 'tool').length
+        const actions = [
+          ['skill', {name:'soul-build-check'}],
+          ['evolve_script', {name:'sum',input:'{"a":2,"b":3}'}],
+          ['evolve_delegate', {task:'delegated-only'}],
+          ['fixture_native_delegate', {}],
+          ['fixture_write', {}],
+        ]
+        if (completed < actions.length) {
+          const [name,args] = actions[completed]
+          yield {type:'block-start',index:0,blockType:'tool-call'}
+          yield {type:'block-end',index:0,block:{type:'tool-call',id:'component-'+requests.length,name,arguments:JSON.stringify(args)}}
+          yield {type:'usage',usage:{inputTokens:13,outputTokens:7}}
+          yield {type:'finish',reason:{kind:'tool-calls'}}
+          return
+        }
+        yield {type:'text-delta',index:0,text:'components done'}
+        yield {type:'usage',usage:{inputTokens:13,outputTokens:7}}
+        yield {type:'finish',reason:{kind:'stop'}}
+        return
+      }
       if (!options.messages.slice(lastUser + 1).some(m => m.role === 'tool') || mode === 'loop') {
         const block = { type: 'tool-call', id: 'call-' + requests.length, name: 'fixture_write', arguments: '{}' }
         yield { type: 'block-start', index: 0, blockType: 'tool-call' }
@@ -105,9 +133,18 @@ test('real DSH: spawn integration on 0.2.1, explicit refusal on 0.2.0', { skip: 
     execute: async (_, exec) => {
       toolCwd = ctx.workingDirectory.get(exec.agent.session)
       if (mode === 'baseline') throw new Error('invalid parameters')
-      if (exec.agent.session.header.origin === 'subagent') writeFileSync(join(toolCwd, 'result.txt'), 'ok')
+      const expected = edits <= 1 ? '检查参数，失败时停止并报告原因。' : '先检查参数，失败时停止并报告原因。'
+      const correct = mode !== 'evolution' || JSON.stringify(requests.at(-1).messages).includes(expected)
+      writeFileSync(join(toolCwd, 'result.txt'), correct ? 'ok' : 'bad')
       return { text: 'written' }
     } })
+  tools.register({name:'fixture_native_delegate',description:'Use native host delegation',parameters:{type:'object',properties:{},additionalProperties:false},
+    output:{schema:{type:'object',properties:{text:{type:'string'}},required:['text']},render:(_,v)=>[{type:'text',text:v.text}]},
+    async execute(_,exec) {
+      const activation = await ctx.subagents.startActivation({provider:'spawn',childId:'native-fixture-'+requests.length,label:'Native fixture',delivery:'caller',signal:exec.signal,
+        request:{parent:exec.agent,cwd:ctx.workingDirectory.get(exec.agent.session),prompt:[{type:'text',text:'native-child'}],agentOptions:{provider:'local-test',model:'fixture'},maxDepth:3}})
+      try {return {text:(await activation.result).stopReason}} finally {await activation.dispose()}
+    }})
   const parent = await agents.create({ sessionId: 'test-parent', meta: { cwd: dir }, agentOptions: { provider: 'local-test', model: 'fixture' } })
   const runner = createHostRunner(ctx), settled = [], payloads = []
   const execute = hostProbe({ spawn: runner.spawn, capability: runner.capability, provider: 'local-test', model: 'fixture', steps: 3 })
@@ -117,7 +154,7 @@ test('real DSH: spawn integration on 0.2.1, explicit refusal on 0.2.0', { skip: 
     checks: [{ name: 'artifact', argv: [process.execPath, '-e', "if(require('fs').readFileSync('result.txt','utf8')!=='ok')process.exit(1)"] }] }
   try {
     assert.equal(runner.capability(parent.agent).ok, true)
-    await execute.preflight({ cwd: dir, parent: parent.agent })
+    await execute.preflight({ cwd: dir, parent: parent.agent, checks: input.checks })
     const result = await execute(input)
     assert.equal(result.metrics.complete, true, JSON.stringify(result))
     assert.equal(result.metrics.deliverable, true)
@@ -150,13 +187,13 @@ test('real DSH: spawn integration on 0.2.1, explicit refusal on 0.2.0', { skip: 
     controller.abort(Object.assign(new Error('cancelled'), { code: 'cancelled' }))
     await assert.rejects(() => running, /cancelled/)
     assert.equal(requests[0].signal.aborted, true); assert.equal(agents.list().length, 1)
-    runner.stop()
+    await runner.stop()
     const timedRunner = createHostRunner(ctx, { requestTimeoutMs: 100 })
     try {
       const timed = hostProbe({ spawn: timedRunner.spawn, capability: timedRunner.capability, provider: 'local-test', model: 'fixture' })
       await assert.rejects(() => timed(input), error => error.code === 'request_timeout')
       assert.equal(agents.list().length, 1)
-    } finally { timedRunner.stop() }
+    } finally { await timedRunner.stop() }
 
     // Full plugin commands use actual AgentLoop observations, not fabricated episode rows.
     let handle
@@ -179,19 +216,76 @@ test('real DSH: spawn integration on 0.2.1, explicit refusal on 0.2.0', { skip: 
       for (let i = 0; i < 3; i++) await turn('write result')
       const diagnosis = await command('diagnose')
       assert.equal(JSON.parse(diagnosis.text).repeats, 3, diagnosis.text)
-      mode = 'normal'; requests = []
+      mode = 'evolution'; requests = []
       const launched = await command('run')
       assert.equal(launched.kind, 'success', launched.text)
       const outcome = await handle.evolve.running
       assert.equal(outcome.state, 'shadow', JSON.stringify(outcome))
-      assert.equal(outcome.cost.calls, 3)
-      assert.equal(handle.store.db.prepare('SELECT COUNT(*) AS n FROM call').get().n, 3)
+      assert.equal(outcome.cost.calls, 9)
+      assert.equal(handle.store.db.prepare('SELECT COUNT(*) AS n FROM call').get().n, 9)
       assert.equal(git('status', '--porcelain'), '')
-      for (let i = 0; i < 2; i++) await turn('write result')
+      mode = 'normal'
+      assert.equal((await command('verify')).kind, 'error', 'no real task under the trial yet')
+      for (let i = 0; i < 2; i++) {
+        await turn('write result')
+        assert.equal(handle.evolve.current(scope).state, 'shadow', 'silence is not proof of correctness')
+        const verified = await command('verify')
+        assert.equal(verified.kind, 'success', verified.text)
+        assert.equal((await command('verify')).kind, 'error', 'cannot count one task twice')
+      }
       assert.equal(handle.evolve.current(scope).state, 'stable')
+      // All eight components must execute through real host services, including
+      // the skill provider, native skill tool, script tool and post-tool hook.
+      mode = 'normal'
+      const stable = handle.evolve.current(scope)
+      const upgraded = { ...stable.files,
+        'subagents.md': 'C5_DELEGATION_SENTINEL：先明确产物，再执行子任务。',
+        'skills/build-check/SKILL.md': '---\nname: build-check\ndescription: 构建验收流程\n---\nC6_SKILL_SENTINEL：先检查再交付。',
+        'scripts/sum.mjs': 'export function run(x) { return {sum:x.a+x.b} }',
+        'hooks/check.mjs': 'export const timeoutMs=100;export const failOpen=true;export function run(x){return {note:"C8_HOOK_SENTINEL"}}',
+      }
+      for (const path of ['system.md','guardrails.md','memory.md','tools.md']) upgraded[path] += '\nC1_C4_' + path
+      const previousCalls = handle.store.db.prepare('SELECT COUNT(*) AS n FROM call').get().n
+      requests = []; mode = 'component-probe'
+      const componentProbe = await handle.evolve.execute({ ...input, files:upgraded, task:'component-run' })
+      assert.equal(componentProbe.metrics.deliverable, true)
+      assert.equal(componentProbe.metrics.toolErrors, 0, JSON.stringify(requests.flatMap(r=>r.messages.filter(m=>m.role==='tool'&&m.isError))))
+      assert.equal(componentProbe.metrics.tokens, 200, 'own and native nested delegation usage belongs to the probe')
+      assert.equal(componentProbe.metrics.steps, 10)
+      assert.equal(requests.length, 10)
+      assert.equal(handle.store.db.prepare('SELECT COUNT(*) AS n FROM call').get().n,previousCalls,'nested probe reserves through caller, not a separate live budget')
+      for (const marker of ['C5_DELEGATION_SENTINEL','C6_SKILL_SENTINEL','C8_HOOK_SENTINEL','C1_C4_system.md','C1_C4_guardrails.md','C1_C4_memory.md','C1_C4_tools.md']) {
+        assert(requests.some(r => JSON.stringify(r.messages).includes(marker)),marker)
+      }
+      assert(requests.some(r => JSON.stringify(r.messages).includes('\\"sum\\":5')))
+      assert.equal((await skills.list({cwd:dir})).some(s=>s.name==='soul-build-check'),false,'probe does not leak skills to live project')
+
+      mode = 'normal'
+      const augmentedRev = handle.store.putRev(scope,upgraded,{parent:stable.rev,state:'stable',reason:'host-fixture'})
+      handle.components.invalidate()
+      assert((await skills.list({cwd:dir})).some(s=>s.name==='soul-build-check'))
+      const invoke = (name,args) => tools.execute({callId:'direct-'+name,name,arguments:args,agent:parent.agent,signal:new AbortController().signal})
+      const loaded = await invoke('skill',{name:'soul-build-check'})
+      assert.equal(loaded.isError,false,JSON.stringify(loaded))
+      assert(loaded.content.some(c=>c.text?.includes('C6_SKILL_SENTINEL')))
+      const scripted = await invoke('evolve_script',{name:'sum',input:'{"a":3,"b":4}'})
+      assert.equal(scripted.isError,false,JSON.stringify(scripted))
+      assert.equal(JSON.parse(scripted.value.text).sum,7)
+      const hooked = await invoke('fixture_write',{})
+      assert.equal(hooked.value.text,'written','hook preserves canonical result')
+      assert(hooked.content.some(c=>c.text?.includes('C8_HOOK_SENTINEL')))
+      requests=[]
+      const delegated = await invoke('evolve_delegate',{task:'delegated-only'})
+      assert.equal(delegated.isError,false,JSON.stringify(delegated))
+      assert(requests.some(r=>JSON.stringify(r.messages).includes('C5_DELEGATION_SENTINEL')))
+      assert.equal(handle.evolve.rollback(scope,stable.rev).ok,true)
+      assert.equal((await skills.list({cwd:dir})).some(s=>s.name==='soul-build-check'),false)
+      assert.equal((await invoke('evolve_script',{name:'sum',input:'{}'})).isError,true)
+      assert(!(await invoke('fixture_write',{})).content.some(c=>c.text?.includes('C8_HOOK_SENTINEL')))
+      assert.notEqual(handle.evolve.current(scope).rev,augmentedRev)
       // A correction on the next turn is attributed to the previous task and rolls back.
       mode = 'baseline'; await turn('write result')
-      mode = 'normal'
+      mode = 'evolution'
       const second = await command('run')
       assert.equal(second.kind, 'success', second.text)
       await handle.evolve.running
@@ -204,7 +298,7 @@ test('real DSH: spawn integration on 0.2.1, explicit refusal on 0.2.0', { skip: 
     assert.equal(tools.get('evolve_status'), undefined)
     assert.equal(tools.get('learning_search'), undefined)
   } finally {
-    runner.stop(); await parent.dispose(); await ctx.fiber.dispose()
+    await runner.stop(); await parent.dispose(); await ctx.fiber.dispose()
     rmSync(dir, { recursive: true, force: true })
   }
 })

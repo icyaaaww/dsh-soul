@@ -40,15 +40,16 @@ const editor = async ({ data }) => {
   }
 }
 
-const executor = async () => ({
+const executor = async ctx => ({
   metrics: { toolErrors: 0, toolCalls: 5, steps: 3, complete: true, deliverable: true, durationMs: 1 },
-  transcript: 'candidate run: build succeeded after bounded retry',
+  transcript: 'deterministic paired fixture', verification: 'demo-pinned-verifier',
+  checks: ctx.checks.map(c => ({name:c.name,ok:ctx.arm !== 'baseline'})),
 })
 
 const store = new Store(':memory:')
 const config = {
   enabled: true, provider: 'offline-fixture', model: 'deterministic', reasoningEffort: '',
-  injectHarness: false, harnessFolder: '.dsh-soul/harness', checks: [],
+  injectHarness: false, harnessFolder: '.dsh-soul/harness', checks: [{name:'artifact',argv:[process.execPath,'-e','process.exit(0)']}],
   budget: budgetSettings({ cooldownTurns: 0 }),
 }
 const evolve = new Evolve({ store, config, generate: editor, execute: executor })
@@ -86,7 +87,7 @@ try {
     evidence: episode.evidence.map(e => `${e.kind}:${e.bytes}B`),
   }, null, 2))
 
-  // Real traffic falsifies the candidate.
+  // A simulated correction falsifies the trial candidate.
   const decisions = evolve.observe({ scope: 'demo', taskKey: 'build-fix', corrections: 1, toolErrors: 0, complete: true })
   console.log(JSON.stringify({
     phase: 'shadow',

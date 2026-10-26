@@ -175,9 +175,14 @@ export class Store {
     const refs = {}
     for (const [path, text] of Object.entries(files)) refs[path] = this.put(text)
     const canonical = JSON.stringify(Object.keys(refs).sort().map(p => [p, refs[p]]))
-    const key = hash(canonical)
-    const existing = this.db.prepare('SELECT id FROM rev WHERE id=?').get(key)
-    if (existing) return key
+    // Blobs deduplicate globally; revisions must retain project and lineage identity.
+    // Identical default trees in two projects must never share a rev row/watch state.
+    const key = hash(JSON.stringify({ scope, parent, canonical }))
+    const existing = this.db.prepare('SELECT id,state FROM rev WHERE id=?').get(key)
+    if (existing) {
+      if (existing.state === 'retired' && state !== 'retired') throw Object.assign(new Error('此版本已被回滚，不能自动重新激活'), {code:'retired_revision'})
+      return key
+    }
     this.db.prepare('INSERT INTO rev(id,scope,parent,tree,state,taxes,created,reason) VALUES (?,?,?,?,?,?,?,?)')
       .run(key, scope, parent, JSON.stringify(refs), state, taxes, this.now(), reason)
     return key

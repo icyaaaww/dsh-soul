@@ -6,6 +6,7 @@ import { checkStructure, decide, turnCounter, MAX_TAX_BYTES } from './gate.js'
 import { probe } from './probe.js'
 import { fold, settle, rollbackTo } from './watch.js'
 import { sizeReport, treeId, diffTrees, taxOf, COMPONENTS } from './tree.js'
+import { validationSettings, normalizeChecks } from './validation.js'
 
 /**
  * Episode orchestrator.
@@ -16,22 +17,25 @@ import { sizeReport, treeId, diffTrees, taxOf, COMPONENTS } from './tree.js'
  *   diagnose   (free)  divergence -> one component
  *   edit       ($)     one agentic editor session
  *   structure  (free)  anchors, lint, whitelist, byte caps
- *   probe      ($)     execute the candidate ONCE (baseline is the recorded trajectory)
+ *   probe      ($)     replay baseline/candidate pairs from the same pinned commit
  *   checks     ($)     deterministic project checks, only when the project declares them
- *   decide     (free)  A/B veto, cooldown, tax
- *   shadow     (free)  real traffic falsifies it; rollback on any Tier-D signal
+ *   decide     (free)  objective outcomes, repeated efficiency gains, cooldown
+ *   shadow     (free)  real outcomes require explicit verification; negative signals roll back
  */
 export class Evolve {
-  constructor({ store, config, generate, execute, now = Date.now, logger = () => {} }) {
+  constructor({ store, config, generate, execute, now = Date.now, logger = () => {}, onChange = () => {} }) {
     this.store = store
     this.config = config
     this.generate = generate
     this.execute = execute
     this.now = now
     this.logger = logger
+    this.onChange = onChange
+    this.validation = validationSettings(config)
     this.budget = new Budget(store, config.budget, now)
     this.running = null
     this.closed = false
+    this.cache = new Map()
   }
 
   enabled() { return !!this.config.enabled && !this.closed }
@@ -39,7 +43,14 @@ export class Evolve {
   /** Seed or read the current stable tree for a project. */
   current(scope) {
     const latest = this.store.latest(scope, ['stable', 'shadow'])
-    return latest ? { rev: latest.id, files: this.store.materialize(latest.id), state: latest.state } : null
+    if (!latest) { this.cache.delete(scope); return null }
+    const cached = this.cache.get(scope)
+    if (cached?.rev === latest.id && cached.state === latest.state) return cached
+    const value = { rev: latest.id, files: Object.freeze(this.store.materialize(latest.id)), state: latest.state }
+    this.cache.delete(scope)
+    if (this.cache.size >= 32) this.cache.delete(this.cache.keys().next().value)
+    this.cache.set(scope,value)
+    return value
   }
 
   ensure(scope, files) {
@@ -47,6 +58,7 @@ export class Evolve {
     if (current) return current
     const rev = this.store.putRev(scope, files, { state: 'stable', reason: 'seed', taxes: taxOf(files) })
     this.store.log({ rev, scope, action: 'seed', actor: 'system', detail: { files: Object.keys(files).length } })
+    this.onChange()
     return { rev, files, state: 'stable' }
   }
 
@@ -59,7 +71,10 @@ export class Evolve {
     if (!this.enabled()) return { started: false, reason: 'disabled' }
     if (!this.generate) return { started: false, reason: 'no_model_route' }
     if (!this.execute) return { started: false, reason: 'no_executor' }
-    try { await this.execute.preflight?.(input) }
+    try {
+      input = { ...input, checks: normalizeChecks(input.checks ?? this.config.checks) }
+      input.replay = await this.execute.preflight?.(input)
+    }
     catch (error) { return { started: false, reason: error.code ?? 'probe_preflight' } }
     if (!this.enabled()) return { started: false, reason: 'disabled' }
     if (this.running) return { started: false, reason: 'busy' }
@@ -83,6 +98,7 @@ export class Evolve {
         return { started: false, reason: 'cooldown', have: sinceTurns, need: this.config.budget.cooldownTurns }
       }
     }
+    if (this.store.openWatches(scope).length) return { started: false, reason: 'trial_pending', next: '/evolve verify 或 /evolve rollback' }
 
     const diagnosis = input.diagnosis ?? diagnose(input.divergence)
     if (this.execute.supportedTargets && !this.execute.supportedTargets.includes(diagnosis.target)) return { started: false, reason: 'component_not_connected', target: diagnosis.target }
@@ -128,39 +144,45 @@ export class Evolve {
       if (!structure.ok) return this.finish(episode, { state: 'rejected', reason: 'structure', detail: structure.violations, cost })
       const taxDelta = structure.tax - taxOf(current.files)
 
-      // ---- probe ($) ------------------------------------------------------
-      const execution = await probe({
-        execute: this.execute, files: next, task: input.task, root: input.cwd ?? null,
-        harnessFolder: this.config.harnessFolder, signal: controller.signal,
-        timeoutMs: this.config.budget.episodeTimeoutMs,
-        parent: input.parent, checks: input.checks,
-        reserve: payload => {
-          controller.signal.throwIfAborted()
-          const ticket = this.budget.request(scope, episode, 'probe', payload)
-          if (!ticket.ok) throw fail(ticket.reason)
-          cost.calls++; cost.inputBytes += ticket.size
-          return { settle: (outcome, usage) => this.budget.settle(ticket.callId, outcome, usage) }
-        },
-      })
-      this.store.addEvidence(episode, 'probe', execution.transcript || execution.reason || '')
-      if (!execution.ok) {
-        return this.finish(episode, { state: 'failed', reason: execution.reason ?? 'probe_failed', cost })
+      // Pay for matched baseline/candidate runs from the SAME pinned commit, input,
+      // route and verifier. Alternate order to reduce warm-cache/order bias.
+      const pairs = []
+      for (let trial = 0; trial < this.validation.trials; trial++) {
+        const pair = {}
+        for (const arm of trial % 2 ? ['candidate', 'baseline'] : ['baseline', 'candidate']) {
+          const execution = await probe({
+            execute: this.execute, files: arm === 'baseline' ? current.files : next,
+            task: input.task, root: input.cwd ?? null, replay: input.replay, arm,
+            harnessFolder: this.config.harnessFolder, signal: controller.signal,
+            timeoutMs: this.config.budget.episodeTimeoutMs, parent: input.parent, checks: input.checks,
+            reserve: payload => {
+              controller.signal.throwIfAborted()
+              const ticket = this.budget.request(scope, episode, arm, payload)
+              if (!ticket.ok) throw fail(ticket.reason)
+              cost.calls++; cost.inputBytes += ticket.size
+              return { settle: (outcome, usage) => this.budget.settle(ticket.callId, outcome, usage) }
+            },
+          })
+          this.store.addEvidence(episode, `${arm}-${trial + 1}`, JSON.stringify(execution))
+          if (!execution.ok) throw fail(execution.reason ?? 'probe_failed')
+          if (execution.checks?.length !== input.checks.length) throw fail('missing_candidate_checks')
+          if (JSON.stringify(execution.checks.map(c => c.name)) !== JSON.stringify(input.checks.map(c => c.name))) throw fail('incomparable_checks')
+          if (arm === 'candidate' && !execution.metrics.complete) throw fail('probe_incomplete')
+          if (arm === 'candidate' && !execution.checks.every(c => c.ok === true)) return this.finish(episode, {state:'rejected',reason:'candidate_failed_verification',cost,metrics:execution.metrics})
+          pair[arm] = execution
+        }
+        pairs.push(pair)
       }
-
-      // ---- checks ($, deterministic) --------------------------------------
-      const checks = execution.checks
-      if (input.checks?.length && (!checks || checks.length !== input.checks.length)) throw fail('missing_candidate_checks')
-      if (checks) this.store.addEvidence(episode, 'checks', JSON.stringify(checks))
+      this.store.addEvidence(episode, 'paired-validation', JSON.stringify({ replay: input.replay, pairs }))
+      const execution = pairs.at(-1).candidate
       controller.signal.throwIfAborted()
-      if (!execution.metrics.complete) throw fail('probe_incomplete')
+      if (this.current(scope)?.rev !== current.rev) throw fail('stale_parent_revision')
 
       // ---- decide (free) --------------------------------------------------
       const decision = decide({
         structure,
-        baseMetrics: input.metrics,
-        nextMetrics: execution.metrics,
-        checks,
-        taxDelta,
+        pairs,
+        validation: this.validation,
         cooldown: { ok: true, have: 0, need: 0 },
       })
       if (!decision.adopt) {
@@ -170,11 +192,12 @@ export class Evolve {
       // ---- shadow adoption (free) -----------------------------------------
       toRev = this.store.putRev(scope, next, { parent: current.rev, state: 'shadow', reason: `episode:${episode}`, taxes: structure.tax })
       this.store.setRevState(current.rev, 'stable')
-      this.store.openWatch(toRev, scope, input.taskKey, execution.metrics, this.config.budget.shadowWindow)
+      this.store.openWatch(toRev, scope, input.taskKey, { ...execution.metrics, verification: input.replay ?? null }, this.config.budget.shadowWindow)
       this.store.db.prepare('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)').run(`adoptAt:${scope}`, String(turnCounter(this.store, scope).get()))
       this.store.log({ rev: toRev, scope, action: 'shadow', actor: 'evolve', gate: { decision },
         detail: { episode, target: diagnosis.target, tax: structure.tax, taxDelta, metrics: execution.metrics } })
       state = 'shadow'
+      this.onChange()
       reason = decision.reasons.join(' | ') || 'adopted'
       return this.finish(episode, { state, reason, toRev, cost, detail: decision })
     } catch (error) {
@@ -229,10 +252,11 @@ export class Evolve {
   }
 
   /** Fold one observed real turn into the shadow windows. Called from session events. */
-  observe({ scope, taskKey, corrections, toolErrors, complete }) {
+  observe({ scope, taskKey, corrections, toolErrors, complete, verified = false }) {
     if (!this.enabled()) return []
-    const decisions = fold(this.store, { scope, taskKey, corrections, toolErrors, complete })
+    const decisions = fold(this.store, { scope, taskKey, corrections, toolErrors, complete, verified })
     for (const decision of decisions) settle(this.store, decision.rev, decision.verdict, scope)
+    if (decisions.length) this.onChange()
     return decisions
   }
 
@@ -242,7 +266,9 @@ export class Evolve {
       return current?.parent ?? null
     })()
     if (!target) return { ok: false, reason: 'no_parent' }
-    return rollbackTo(this.store, scope, target)
+    const result = rollbackTo(this.store, scope, target)
+    if (result.ok) this.onChange()
+    return result
   }
 
   status(scope, { files } = {}) {
@@ -251,6 +277,8 @@ export class Evolve {
     return {
       enabled: this.enabled(),
       route: this.config.enabled ? { provider: this.config.provider, model: this.config.model } : null,
+      validation: { trials: this.validation.trials, runs: this.validation.trials * 2, minimumEfficiencyGain: this.validation.minimumGain,
+        checksRequired: true, promotion: 'verified_real_tasks', note: '同一任务的重复对照不是泛化证明；试用期需 /evolve verify 验收新任务。' },
       current: current ? { rev: current.rev, state: current.state, tax: taxOf(current.files) } : null,
       fixedTax: report ? { bytes: report.tax, cap: MAX_TAX_BYTES, components: report.rows } : null,
       budget: this.budget.report(scope),

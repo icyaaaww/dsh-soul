@@ -50,7 +50,7 @@ const store = new Store(':memory:')
 const config = {
   enabled: true, provider: 'offline-fixture', model: 'deterministic', reasoningEffort: '',
   injectHarness: false, harnessFolder: '.dsh-soul/harness', checks: [{name:'artifact',argv:[process.execPath,'-e','process.exit(0)']}],
-  budget: budgetSettings({ cooldownTurns: 0 }),
+  budget: budgetSettings({ cooldownTurns: 0, repeatThreshold: 2 }),
 }
 const evolve = new Evolve({ store, config, generate: editor, execute: executor })
 
@@ -94,6 +94,27 @@ try {
     observed: decisions,
     revState: store.rev(current.rev, 'demo').state,
     restored: evolve.current('demo').rev === store.rev(current.rev, 'demo').parent,
+  }, null, 2))
+
+  // Free experience observation: two rephrased recoveries join one cluster. No model call,
+  // no prompt text. The cluster becomes eligible; this demo does not pay to compile it.
+  for (const text of ['修复构建超时', '修复一下构建超时']) {
+    evolve.recordObservation({ scope: 'demo', state: {
+      scope: 'demo', text, steps: 4, toolCalls: 6, toolErrors: 1, complete: true,
+      reason: 'stop', durationMs: 10, tools: ['Bash'], errors: [{ tool: 'Bash', text: 'timeout' }],
+    } })
+  }
+  const report = evolve.report('demo')
+  console.log(JSON.stringify({
+    phase: 'experience',
+    note: '观察与聚类零模型调用、零提示字节；达到支持度只获得编译资格。',
+    lessons: report.lessons.counts,
+    eligible: evolve.eligibleLessons('demo').map(l => ({
+      kind: l.kind, support: l.support, target: diagnose(l.divergence ?? {
+        signals: [{ kind: l.kind, weight: 1, detail: l.summary }], score: 1,
+      }).target,
+    })),
+    cost: report.cost,
   }, null, 2))
 
   const integrity = store.integrity()

@@ -138,14 +138,14 @@ export async function runChecks(root, checks, { timeoutMs = 120000, signal } = {
  *
  * @param {(ctx: object) => Promise<{metrics: object, transcript: string}>} execute
  */
-export async function probe({ execute, files, task, harnessFolder, signal, timeoutMs = 480000, root = null, parent, reserve, checks, replay, arm }) {
+export async function probe({ execute, files, task, harnessFolder, signal, timeoutMs = 480000, maxSteps, root = null, parent, reserve, checks, replay, arm }) {
   if (typeof execute !== 'function') throw fail('no_executor', '未配置探测执行器')
   const started = Date.now()
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(fail('probe_timeout')), timeoutMs)
   const merged = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
   try {
-    const result = await execute({ files, task, harnessFolder, root, signal: merged, parent, reserve, checks, replay, arm })
+    const result = await execute({ files, task, harnessFolder, root, signal: merged, maxSteps, parent, reserve, checks, replay, arm })
     merged.throwIfAborted()
     if (!result?.metrics || !['steps','toolCalls','toolErrors','durationMs'].every(k => Number.isFinite(result.metrics[k]) && result.metrics[k] >= 0) || typeof result.metrics.complete !== 'boolean') throw fail('invalid_probe_metrics')
     const metrics = { ...emptyMetrics(), ...(result?.metrics ?? {}) }

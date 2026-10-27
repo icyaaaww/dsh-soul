@@ -19,12 +19,18 @@ export function budgetSettings(input = {}) {
   return {
     episodeCalls: n('episodeCalls', 60, 4, 400),
     dailyCalls: n('dailyCalls', 100, 0, 2000),
+    // Editor requests are small (index + bounded evidence). Probe requests carry the host's
+    // system prompt, tool schemas and growing history, so they need a separate, larger cap.
     requestInputBytes: n('requestInputBytes', 24000, 2000, 96000),
-    episodeInputBytes: n('episodeInputBytes', 320000, 8000, 3840000),
+    probeRequestBytes: n('probeRequestBytes', 64000, 2000, 512000),
+    episodeInputBytes: n('episodeInputBytes', 640000, 8000, 3840000),
     dailyInputBytes: n('dailyInputBytes', 800000, 0, 9600000),
-    episodeTimeoutMs: n('episodeTimeoutMs', 480000, 5000, 3600000),
+    episodeTimeoutMs: n('episodeTimeoutMs', 1200000, 5000, 3600000),
+    // A single probe arm gets its own deadline; the episode deadline covers all arms plus
+    // the editor. Sharing one value makes the last arms fail only after earlier ones were paid.
+    armTimeoutMs: n('armTimeoutMs', 180000, 1000, 3600000),
     requestTimeoutMs: n('requestTimeoutMs', 60000, 500, 300000),
-    probeSteps: n('probeSteps', 40, 1, 200),
+    probeSteps: n('probeSteps', 12, 1, 200),
     cooldownTurns: n('cooldownTurns', 20, 0, 500),
     shadowWindow: n('shadowWindow', 3, 1, 20),
     repeatThreshold: n('repeatThreshold', 3, 2, 20),
@@ -63,8 +69,9 @@ export class Budget {
    */
   request(scope, episode, phase, payload) {
     const size = bytes(payload)
-    if (size > this.config.requestInputBytes) {
-      return { ok: false, reason: 'input_limit', size }
+    const limit = phase === 'edit' ? this.config.requestInputBytes : this.config.probeRequestBytes
+    if (size > limit) {
+      return { ok: false, reason: 'input_limit', size, limit }
     }
     const today = day(this.now())
     const keys = {
@@ -74,10 +81,12 @@ export class Budget {
       [DAILY_IN]: this.key(scope, null, DAILY_IN),
     }
     const dims = {
-      [keys[EPISODE]]: { limit: this.config.episodeCalls, amount: 1 },
       [keys[DAILY]]: { limit: this.config.dailyCalls, amount: 1 },
-      [keys[EPISODE_IN]]: { limit: this.config.episodeInputBytes, amount: size },
       [keys[DAILY_IN]]: { limit: this.config.dailyInputBytes, amount: size },
+      ...(episode ? {
+        [keys[EPISODE]]: { limit: this.config.episodeCalls, amount: 1, lifetime: true },
+        [keys[EPISODE_IN]]: { limit: this.config.episodeInputBytes, amount: size, lifetime: true },
+      } : {}),
     }
     const result = this.store.reserve({ day: today, dims, episode, phase, inputBytes: size })
     if (!result.ok) {
@@ -97,7 +106,7 @@ export class Budget {
     const today = day(this.now())
     const keys = [this.key(scope, null, DAILY), this.key(scope, null, DAILY_IN)]
     if (episode) keys.push(this.key(scope, episode, EPISODE), this.key(scope, episode, EPISODE_IN))
-    const state = this.store.budgetState(today, keys)
+    const state = this.store.budgetState(today, keys, episode ? keys.slice(2) : [])
     return {
       day: today,
       daily: {
@@ -105,6 +114,7 @@ export class Budget {
         inputBytes: state[keys[1]],
         limits: { calls: this.config.dailyCalls, inputBytes: this.config.dailyInputBytes },
       },
+      requestBytes: { editor: this.config.requestInputBytes, probe: this.config.probeRequestBytes },
       ...(episode ? {
         episode: {
           calls: state[keys[2]],

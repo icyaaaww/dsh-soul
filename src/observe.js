@@ -1,4 +1,4 @@
-import { bounded, clean, hash, redact, taskKey, textBlocks, human, day } from './util.js'
+import { bounded, clean, hash, redact, taskKey, terms, sameTask, textBlocks, human, day } from './util.js'
 
 /**
  * Turn-level observation supplies diagnosis evidence. Adoption uses separate paired
@@ -24,6 +24,9 @@ export class Recorder {
     const state = {
       session: sessionId, scope, turn, intent,
       taskKey: taskKey({ scope, text: intent }),
+      // Terms make "the same kind of task" tolerant to wording changes. The hash is kept as
+      // a fast exact path for old rows and short intents.
+      terms: terms(intent),
       text: bounded(intent, 2000),
       steps: 0, toolCalls: 0, toolErrors: 0, started: Date.now(),
       calls: new Map(), tools: [], errors: [], deliverable: false,
@@ -97,9 +100,10 @@ export function divergenceOf(state) {
   if (state.corrections > 0) signals.push({ kind: 'user_correction', weight: 4, detail: bounded(state.text, 300) })
   if (!state.complete) signals.push({ kind: 'incomplete', weight: 2, detail: state.reason })
   if (state.reason === 'max-tokens') signals.push({ kind: 'truncated', weight: 2, detail: 'max-tokens' })
-  if (!state.deliverable && state.toolCalls > 0 && state.reason === 'stop') {
-    signals.push({ kind: 'no_deliverable', weight: 1, detail: 'turn stopped without a concrete result' })
-  }
+  // No online "deliverable" heuristic: this recorder cannot prove a concrete artifact exists,
+  // and treating every completed tool-using turn as a divergence turned ordinary work into
+  // paid evolution. Only declared checks can establish a deliverable; `no_deliverable` remains
+  // a valid signal for callers that can actually observe it.
   if (!signals.length) return null
   // Strongest first: diagnosis takes the head as "the earliest divergence worth fixing", and
   // a caller should not have to re-sort to get that.
@@ -111,18 +115,23 @@ export function divergenceOf(state) {
  * Repetition is the entry condition for evolution (design axiom: never evolve a one-off).
  * We count how many times the same task fingerprint showed a divergence in the window.
  */
-export function repeatCount(rows, taskKeyValue, windowMs = 7 * 86400000) {
+export function repeatCount(rows, reference, windowMs = 7 * 86400000) {
   const cutoff = Date.now() - windowMs
-  return rows.filter(r => r.task_key === taskKeyValue && r.created >= cutoff && r.state !== 'skipped').length
+  const ref = typeof reference === 'string' ? { taskKey: reference } : reference
+  return rows.filter(r => r.created >= cutoff && r.state !== 'skipped' &&
+    sameTask({ taskKey: r.task_key, terms: r.terms }, ref)).length
 }
 
 /** Serialise a trajectory for evidence; bounded so it cannot dominate a prompt. */
 export function trajectoryText(state, { maxBytes = 10000 } = {}) {
   return bounded(JSON.stringify({
-    intent: bounded(state.text, 600),
+    intent: bounded(redact(String(state.text ?? '')), 600),
     steps: state.steps, toolCalls: state.toolCalls, toolErrors: state.toolErrors,
     complete: state.complete, reason: state.reason, durationMs: state.durationMs,
-    tools: state.tools.slice(0, 24),
-    errors: state.errors.slice(0, 6),
+    tools: Array.isArray(state.tools) ? state.tools.slice(0, 24) : [],
+    errors: Array.isArray(state.errors) ? state.errors.slice(0, 6).map(error => ({
+      tool: String(error?.tool ?? ''),
+      text: bounded(redact(String(error?.text ?? '')), 600),
+    })) : [],
   }, null, 2), maxBytes)
 }

@@ -14,7 +14,7 @@ import { captureReplay, assertVerifier } from './validation.js'
 export function hostProbe({ spawn, capability, provider, model, reasoningEffort = '', steps = 40, components }) {
   if (typeof spawn !== 'function') throw fail('no_spawner', '未提供宿主子会话执行器')
 
-  const execute = async ({ files, task, root, signal, parent, reserve, checks = [], harnessFolder = '.dsh-soul/harness', replay }) => {
+  const execute = async ({ files, task, root, signal, maxSteps, parent, reserve, checks = [], harnessFolder = '.dsh-soul/harness', replay }) => {
     const repo = root ? await repoOf(root) : null
     if (!repo) {
       throw fail('not_a_repo', '候选探测需要干净的 git 仓库')
@@ -32,7 +32,7 @@ export function hostProbe({ spawn, capability, provider, model, reasoningEffort 
       try {
         const result = await spawn({
           cwd, task, signal, parent, files, reserve, harnessFolder,
-          provider, model, reasoningEffort, maxSteps: steps,
+          provider, model, reasoningEffort, maxSteps: maxSteps ?? steps,
         })
         signal.throwIfAborted()
         await assertVerifier(cwd, replay)

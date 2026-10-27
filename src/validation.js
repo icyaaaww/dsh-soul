@@ -74,25 +74,46 @@ export async function assertVerifier(cwd, replay) {
   if (await verifierFingerprint(cwd, replay.checks) !== replay.verifier) throw fail('verifier_modified', '验收文件或配置已改变，结果作废')
 }
 
+const success = run => run?.ok === true && run.metrics?.complete === true && run.checks?.length > 0 && run.checks.every(c => c.ok === true)
+
+/**
+ * Classify one paired trial without deciding the episode.
+ *
+ * The result is deliberately partial: `quality` and `efficiency` say whether this pair
+ * contributes a win, not whether the whole episode wins. The orchestrator uses it to stop
+ * after a pair that can never be recovered -- once one pair shows neither a quality nor an
+ * efficiency gain, "every pair must win" is unreachable, so the remaining arms are pure waste.
+ *
+ * @returns {{valid:boolean, quality:boolean, efficiency:boolean, reason?:string}}
+ */
+export function classifyPair({ baseline, candidate }, { minimumGain = 0.2 } = {}) {
+  if (!baseline?.verification || baseline.verification !== candidate?.verification) return { valid: false, quality: false, efficiency: false, reason: 'incomparable_runs' }
+  if (!baseline.ok || !candidate.ok) return { valid: false, quality: false, efficiency: false, reason: 'probe_failed' }
+  if (JSON.stringify(baseline.checks?.map(c => c.name)) !== JSON.stringify(candidate.checks?.map(c => c.name))) return { valid: false, quality: false, efficiency: false, reason: 'incomparable_checks' }
+  if (!success(candidate)) return { valid: false, quality: false, efficiency: false, reason: 'candidate_failed_verification' }
+  // A baseline that fails the declared checks and a candidate that passes is the strongest
+  // evidence available, and it outranks tool-error counts for that pair.
+  if (!success(baseline)) return { valid: true, quality: true, efficiency: false }
+  const a = baseline.metrics, b = candidate.metrics
+  if (b.toolErrors > a.toolErrors) return { valid: true, quality: false, efficiency: false, reason: 'tool_error_regression' }
+  // Both arms must pass the same objective checks. No prompt-byte/step-only win.
+  const tokenKnown = [a.tokens, b.tokens].every(n => Number.isFinite(n) && n > 0)
+  const timeKnown = a.durationMs >= 1000 && b.durationMs > 0
+  const tokenWin = tokenKnown && b.tokens <= a.tokens * (1 - minimumGain) && (!timeKnown || b.durationMs <= a.durationMs * 1.1)
+  const timeWin = timeKnown && b.durationMs <= a.durationMs * (1 - minimumGain) && tokenKnown && b.tokens <= a.tokens * 1.1
+  return { valid: true, quality: false, efficiency: tokenWin || timeWin }
+}
+
 export function compareTrials(pairs, { trials = 2, minimumGain = 0.2 } = {}) {
   const reject = reason => ({ ok: false, reason })
   if (!Array.isArray(pairs) || pairs.length < trials || trials < 2) return reject('insufficient_trials')
-  const success = run => run?.ok === true && run.metrics?.complete === true && run.checks?.length > 0 && run.checks.every(c => c.ok === true)
   let qualityWins = 0, efficiencyWins = 0
-  for (const { baseline, candidate } of pairs) {
-    if (!baseline?.verification || baseline.verification !== candidate?.verification) return reject('incomparable_runs')
-    if (!baseline.ok || !candidate.ok) return reject('probe_failed')
-    if (JSON.stringify(baseline.checks?.map(c => c.name)) !== JSON.stringify(candidate.checks?.map(c => c.name))) return reject('incomparable_checks')
-    if (!success(candidate)) return reject('candidate_failed_verification')
-    if (!success(baseline)) { qualityWins++; continue }
-    const a = baseline.metrics, b = candidate.metrics
-    if (b.toolErrors > a.toolErrors) return reject('tool_error_regression')
-    // Both arms must pass the same objective checks. No prompt-byte/step-only win.
-    const tokenKnown = [a.tokens, b.tokens].every(n => Number.isFinite(n) && n > 0)
-    const timeKnown = a.durationMs >= 1000 && b.durationMs > 0
-    const tokenWin = tokenKnown && b.tokens <= a.tokens * (1 - minimumGain) && (!timeKnown || b.durationMs <= a.durationMs * 1.1)
-    const timeWin = timeKnown && b.durationMs <= a.durationMs * (1 - minimumGain) && tokenKnown && b.tokens <= a.tokens * 1.1
-    if (tokenWin || timeWin) efficiencyWins++
+  for (const pair of pairs) {
+    const verdict = classifyPair(pair, { minimumGain })
+    if (!verdict.valid) return reject(verdict.reason)
+    if (verdict.reason === 'tool_error_regression') return reject('tool_error_regression')
+    if (verdict.quality) qualityWins++
+    else if (verdict.efficiency) efficiencyWins++
   }
   if (qualityWins !== pairs.length && efficiencyWins !== pairs.length) return reject('no_repeatable_gain')
   return { ok: true, reason: qualityWins ? 'verified_quality_gain' : 'verified_efficiency_gain', trials: pairs.length, qualityWins, efficiencyWins }

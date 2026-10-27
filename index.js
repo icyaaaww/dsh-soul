@@ -10,7 +10,7 @@ import { readDefaults } from './src/harness.js'
 import { turnCounter } from './src/gate.js'
 import { hostProbe } from './src/host-probe.js'
 import { createHostRunner } from './src/host-runner.js'
-import { projectScope, bounded, boolean, integer, human, textBlocks, fail } from './src/util.js'
+import { projectScope, bounded, boolean, integer, human, textBlocks, fail, sameTask, redact } from './src/util.js'
 import { sizeReport, COMPONENTS } from './src/tree.js'
 import { createComponents } from './src/components.js'
 import { assertVerifier, validationSettings } from './src/validation.js'
@@ -51,8 +51,9 @@ export function settings(input = {}) {
 const HELP = `DSH Soul — 真实宿主 harness 演化（单变量编辑 / 真实任务试用 / 在线基线）
 /evolve status             当前版本、每轮固定税、额度、影子窗口
 /evolve diagnose [n]       查看最近 n 轮观察的诊断结果，不花费模型调用
-/evolve run [C1–C8]        对最近分歧精炼；可显式指定目标组件
+/evolve run [C1–C8]        对最近分歧或支持度达标经验簇精炼；可显式指定目标组件
 /evolve verify             验收最近一次真实试用任务；通过才推进转正窗口
+/evolve report             经验簇、采纳/回滚率、调用与字节成本；不调用模型
 /evolve diff [A] [B]       两版组件差异，默认当前 stable 与最近影子版本
 /evolve log [n]            审计账本
 /evolve explain <rev>      某版本凭什么被采纳，含证据与闸门
@@ -64,6 +65,22 @@ const HELP = `DSH Soul — 真实宿主 harness 演化（单变量编辑 / 真�
 
 演化默认关闭。开启需在 bundle 中显式配置 enabled: true 与 provider/model。`
 
+/** A stored cluster always carries enough shape to be routed by the same free rule table. */
+const lessonDivergence = lesson => lesson.divergence?.signals?.length ? lesson.divergence : {
+  signals: [{ kind: lesson.kind, weight: 1, detail: lesson.summary }], score: 1,
+}
+
+/** Compact view for tools/commands: no detail, no trajectory, no prompt-sized body. */
+function lessonView(lesson) {
+  const diagnosis = diagnose(lessonDivergence(lesson))
+  return {
+    id: lesson.id, kind: lesson.kind, support: lesson.support,
+    contradictions: lesson.contradictions, state: lesson.state,
+    summary: bounded(String(lesson.summary ?? ''), 400),
+    target: diagnosis.target, rule: diagnosis.rule, why: diagnosis.why,
+  }
+}
+
 const output = {
   schema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'], additionalProperties: false },
   render: (_args, value) => [{ type: 'text', text: value.text }],
@@ -72,17 +89,17 @@ const str = description => ({ type: 'string', description })
 const tools = [
   {
     name: 'evolve_status',
-    description: '查看当前项目的 harness 版本、每轮固定税、额度、影子窗口与最近 episode。不调用模型、不花钱。',
+    description: '查看当前项目的 harness 版本、每轮固定税、经验池、额度、影子窗口与最近 episode。不调用模型、不花钱。',
     properties: {}, required: [],
   },
   {
     name: 'evolve_diagnose',
-    description: '对最近观察到的一次分歧做归因，返回目标组件与依据。不调用模型、不花钱。用于判断值不值得精炼。',
+    description: '对最近观察到的一次分歧做归因，返回目标组件与依据；本地没有分歧时回落到支持度达标的经验簇。不调用模型、不花钱。',
     properties: { episodeTurn: str('可选：指定观察序号；默认最近一次') }, required: [],
   },
   {
     name: 'evolve_request',
-    description: '请求对最近一次已归因的分歧发起一次精炼（会花费模型调用探测）。只有在同类任务重复出现时才值得。返回是否有资格启动，不直接执行。',
+    description: '请求对最近一次已归因的分歧或支持度达标的经验簇发起精炼（会花费模型调用探测）。只有在同类模式重复出现时才值得。返回是否有资格启动，不直接执行。',
     properties: { confirm: str('必须传入 "confirm" 表示你知道这会消耗额度') }, required: ['confirm'],
   },
   {
@@ -187,7 +204,7 @@ export function apply(ctx, input = {}) {
             const state = recorder.get(sid)
             state.text = bounded(`${intent}\n用户纠正：${text}`, 2000)
             // The correction refers to the preceding task, even when its wording differs.
-            evolve.observe({ scope: state.scope, taskKey: state.taskKey, corrections: 1, toolErrors: 0, complete: true })
+            evolve.observe({ scope: state.scope, taskKey: state.taskKey, taskTerms: state.terms, corrections: 1, toolErrors: 0, complete: true })
           }
         }
       })()
@@ -206,14 +223,34 @@ export function apply(ctx, input = {}) {
           recent.set(sid, { state, divergence })
           if (divergence) {
             store.db.prepare('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)')
-              .run(`last:${state.scope}`, JSON.stringify({ taskKey: state.taskKey, text: bounded(state.text, 600), at: Date.now() }))
+              .run(`last:${state.scope}`, JSON.stringify({ taskKey: state.taskKey, text: bounded(redact(state.text), 600), at: Date.now() }))
           }
           const key = `observations:${state.scope}`
           const rows = JSON.parse(store.db.prepare('SELECT value FROM meta WHERE key=?').get(key)?.value ?? '[]')
-          if (divergence) rows.push({ task_key: state.taskKey, created: Date.now(), state: 'observed' })
+          // Had this task family diverged before? That is what turns a later clean turn into
+          // "resolved" instead of ordinary silence. Computed before the current row is added.
+          const reference = { taskKey: state.taskKey, terms: state.terms }
+          const hadDivergence = rows.some(row => row.state !== 'skipped' &&
+            sameTask({ taskKey: row.task_key, terms: row.terms }, reference))
+          // A clean turn inside a shadow trial is not yet a success: only /evolve verify can
+          // establish that. Recording it as resolved would manufacture positive evidence from
+          // a version that may still fail its declared checks.
+          const inTrial = store.openWatches(state.scope).some(w => sameTask(
+            { taskKey: w.task_key, terms: w.baseline?.taskTerms }, reference))
+          if (divergence) rows.push({ task_key: state.taskKey, terms: state.terms, created: Date.now(), state: 'observed' })
           store.db.prepare('INSERT OR REPLACE INTO meta VALUES (?,?)').run(key, JSON.stringify(rows.slice(-200)))
-          evolve.observe({ scope: state.scope, taskKey: state.taskKey, corrections: state.corrections,
-            toolErrors: state.toolErrors, complete: state.complete })
+          evolve.observe({ scope: state.scope, taskKey: state.taskKey, taskTerms: state.terms,
+            corrections: state.corrections, toolErrors: state.toolErrors, complete: state.complete })
+          // Free experience observation. This writes only to the local lesson pool: no model
+          // call, no prompt injection, no version.
+          const lesson = evolve.recordObservation({
+            scope: state.scope, state, trajectory: trajectoryText(state),
+            hadDivergence: hadDivergence && !inTrial,
+          })
+          if (lesson && lesson.state === 'candidate' && lesson.support === config.budget.repeatThreshold) {
+            store.log({ scope: state.scope, action: 'lesson_candidate', actor: 'observe',
+              detail: { lesson: lesson.id, kind: lesson.kind, support: lesson.support } })
+          }
         }
         return
       }
@@ -261,22 +298,36 @@ export function apply(ctx, input = {}) {
           else if (definition.name === 'evolve_tree') value = current ? sizeReport(current.files) : sizeReport(readDefaults())
           else if (definition.name === 'evolve_diagnose') {
             const observation = recent.get(String(session.id))
-            value = observation?.divergence
-              ? { ...diagnose(observation.divergence), taskKey: observation.state.taskKey,
-                  repeats: repeatCount(JSON.parse(store.db.prepare('SELECT value FROM meta WHERE key=?').get(`observations:${scope}`)?.value ?? '[]'), observation.state.taskKey, config.budget.repeatWindowMs),
-                  note: '归因是规则表结果，零模型调用；是否值得精炼看重复次数是否达到阈值' }
-              : { error: '当前会话最近一轮没有可归因的分歧' }
+            if (observation?.divergence) {
+              value = { ...diagnose(observation.divergence), taskKey: observation.state.taskKey,
+                repeats: repeatCount(JSON.parse(store.db.prepare('SELECT value FROM meta WHERE key=?').get(`observations:${scope}`)?.value ?? '[]'), { taskKey: observation.state.taskKey, terms: observation.state.terms }, config.budget.repeatWindowMs),
+                note: '归因是规则表结果，零模型调用；是否值得精炼看重复次数是否达到阈值' }
+            } else {
+              const clusters = evolve.eligibleLessons(scope)
+              value = clusters.length
+                ? { source: 'lesson_pool', clusters: clusters.map(lessonView),
+                    threshold: config.budget.repeatThreshold,
+                    note: '本地会话没有分歧；以下经验簇来自免费观察，未进入任何提示。' }
+                : { error: '当前会话最近一轮没有可归因的分歧，经验池也没有达到阈值的候选' }
+            }
           } else {
             const observation = recent.get(String(session.id))
-            if (!observation?.divergence) value = { started: false, reason: 'no_divergence' }
-            else {
-              const repeats = repeatCount(JSON.parse(store.db.prepare('SELECT value FROM meta WHERE key=?').get(`observations:${scope}`)?.value ?? '[]'), observation.state.taskKey, config.budget.repeatWindowMs)
+            if (observation?.divergence) {
+              const repeats = repeatCount(JSON.parse(store.db.prepare('SELECT value FROM meta WHERE key=?').get(`observations:${scope}`)?.value ?? '[]'), { taskKey: observation.state.taskKey, terms: observation.state.terms }, config.budget.repeatWindowMs)
               value = repeats < config.budget.repeatThreshold
                 ? { started: false, reason: 'insufficient_repetition', repeats, need: config.budget.repeatThreshold,
                     note: '一次性任务不进化；同类任务重复出现才值得花额度' }
                 : { started: false, reason: 'requires_host_command',
                     next: '/evolve run', target: diagnose(observation.divergence).target,
                     note: '工具不直接消耗额度；只有用户命令能启动付费探测' }
+            } else {
+              const lesson = evolve.eligibleLesson(scope)
+              value = lesson
+                ? { started: false, reason: 'requires_host_command', next: '/evolve run',
+                    lesson: lessonView(lesson),
+                    note: '工具不直接消耗额度；只有用户命令能启动付费探测' }
+                : { started: false, reason: 'no_divergence',
+                    note: '没有当前分歧，也没有达到支持度阈值的经验簇' }
             }
           }
           return { text: JSON.stringify(value) }
@@ -287,7 +338,7 @@ export function apply(ctx, input = {}) {
     // ---- command ----------------------------------------------------------
     disposers.push(ctx.commands.register({
       name: 'evolve', description: '查看与回滚 harness 自演化状态（run 会消耗模型额度）',
-      input: { hint: 'status / tree / diagnose / diff / log / rollback' }, recordInput: false,
+      input: { hint: 'status / report / tree / diagnose / diff / log / rollback' }, recordInput: false,
       handler: trackedCommand(async ({ agent, rawInput, signal }) => {
         try {
           signal?.throwIfAborted()
@@ -306,32 +357,60 @@ export function apply(ctx, input = {}) {
             return { kind: 'success', text: JSON.stringify(report, null, 2) }
           }
           if (verb === 'watch') return { kind: 'success', text: JSON.stringify(store.openWatches(scope), null, 2) }
+          if (verb === 'report') return { kind: 'success', text: JSON.stringify(evolve.report(scope), null, 2) }
           if (verb === 'log') {
             const n = Number(args[0]) || 20
             return { kind: 'success', text: JSON.stringify(store.ledger(scope, Math.min(200, n)), null, 2) }
           }
           if (verb === 'diagnose') {
             const observation = recent.get(String(agent.session.id))
-            if (!observation?.divergence) return { kind: 'success', text: '当前会话最近一轮没有可归因的分歧。' }
-            const repeats = repeatCount(JSON.parse(store.db.prepare('SELECT value FROM meta WHERE key=?').get(`observations:${scope}`)?.value ?? '[]'), observation.state.taskKey, config.budget.repeatWindowMs)
+            if (!observation?.divergence) {
+              const clusters = evolve.eligibleLessons(scope)
+              return { kind: 'success', text: clusters.length
+                ? JSON.stringify({ source: 'lesson_pool', clusters: clusters.map(lessonView),
+                    threshold: config.budget.repeatThreshold,
+                    note: '本地会话没有分歧；以下来自经验池，尚未注入任何提示。' }, null, 2)
+                : '当前会话最近一轮没有可归因的分歧，经验池也没有达到阈值的候选。' }
+            }
+            const repeats = repeatCount(JSON.parse(store.db.prepare('SELECT value FROM meta WHERE key=?').get(`observations:${scope}`)?.value ?? '[]'), { taskKey: observation.state.taskKey, terms: observation.state.terms }, config.budget.repeatWindowMs)
             return { kind: 'success', text: JSON.stringify({ ...diagnose(observation.divergence), repeats,
               threshold: config.budget.repeatThreshold, trajectory: trajectoryText(observation.state) }, null, 2) }
           }
           if (verb === 'run') {
             if (args.length > 1 || (args[0] && !Object.hasOwn(COMPONENTS,args[0]))) return {kind:'error',text:'目标组件只能是 C1–C8。'}
             if (!config.injectHarness) return { kind: 'error', text: 'injectHarness 已关闭，无法把候选应用到真实任务。' }
+            const override = args[0] ? { diagnosis: { target: args[0], rule: 'user_target',
+              why: '用户指定组件，修复本次记录的分歧', hint: '只修改此组件，必须通过同条件成对验收' } } : {}
             const observation = recent.get(String(agent.session.id))
-            if (!observation?.divergence) return { kind: 'error', text: '没有可归因的分歧，不启动。' }
-            const repeats = repeatCount(JSON.parse(store.db.prepare('SELECT value FROM meta WHERE key=?').get(`observations:${scope}`)?.value ?? '[]'), observation.state.taskKey, config.budget.repeatWindowMs)
-            if (repeats < config.budget.repeatThreshold) {
-              return { kind: 'error', text: `同类任务仅重复 ${repeats} 次（阈值 ${config.budget.repeatThreshold}），一次性任务不进化。` }
+            if (observation?.divergence) {
+              const repeats = repeatCount(JSON.parse(store.db.prepare('SELECT value FROM meta WHERE key=?').get(`observations:${scope}`)?.value ?? '[]'), { taskKey: observation.state.taskKey, terms: observation.state.terms }, config.budget.repeatWindowMs)
+              if (repeats < config.budget.repeatThreshold) {
+                return { kind: 'error', text: `同类任务仅重复 ${repeats} 次（阈值 ${config.budget.repeatThreshold}），一次性任务不进化。` }
+              }
+              // A local event can also link to the cluster that has been accumulating in the
+              // free pool; the contrast then carries the cluster's related success sample.
+              const lesson = evolve.eligibleLessons(scope).find(item => sameTask(
+                { taskKey: item.task_key, terms: item.terms },
+                { taskKey: observation.state.taskKey, terms: observation.state.terms })) ?? null
+              const result = await evolve.start({
+                scope, taskKey: observation.state.taskKey, taskTerms: observation.state.terms, trigger: 'user_command',
+                divergence: observation.divergence, metrics: observation.state,
+                trajectory: trajectoryText(observation.state), task: observation.state.text,
+                cwd, checks: config.checks, parent: agent,
+                ...(lesson ? { lesson } : {}), ...override,
+              })
+              return { kind: result.started ? 'success' : 'error', text: JSON.stringify(result, null, 2) }
             }
+            // No divergence in this session: the paid path may still be justified by a
+            // cluster that repeated across turns. The cluster is the trigger; its stored
+            // trajectory and contrast are the evidence.
+            const lesson = evolve.eligibleLesson(scope)
+            if (!lesson) return { kind: 'error', text: `没有可归因的分歧，经验池也没有达到支持度 ${config.budget.repeatThreshold} 的候选。` }
             const result = await evolve.start({
-              scope, taskKey: observation.state.taskKey, trigger: 'user_command',
-              divergence: observation.divergence, metrics: observation.state,
-              trajectory: trajectoryText(observation.state), task: observation.state.text,
-              cwd, checks: config.checks, parent: agent,
-              ...(args[0] ? {diagnosis:{target:args[0],rule:'user_target',why:'用户指定组件，修复本次记录的分歧',hint:'只修改此组件，必须通过同条件成对验收'}} : {}),
+              scope, taskKey: lesson.task_key, taskTerms: lesson.terms, trigger: 'lesson',
+              divergence: lessonDivergence(lesson), metrics: lesson.detail ?? EMPTY_METRICS,
+              trajectory: lesson.trajectory ?? '', task: lesson.task || lesson.summary,
+              lesson, cwd, checks: config.checks, parent: agent, ...override,
             })
             return { kind: result.started ? 'success' : 'error', text: JSON.stringify(result, null, 2) }
           }
@@ -339,7 +418,11 @@ export function apply(ctx, input = {}) {
             const observation = recent.get(String(agent.session.id))?.state
             const current = evolve.current(scope)
             const window = store.openWatches(scope).find(w => w.rev === current?.rev)
-            if (!window || !observation || observation.revision !== window.rev || observation.taskKey !== window.task_key) return { kind: 'error', text: '需要在当前试用版本下完成一次同类任务，再验收。' }
+            if (!window || !observation || observation.revision !== window.rev ||
+              !sameTask({ taskKey: window.task_key, terms: window.baseline?.taskTerms },
+                { taskKey: observation.taskKey, terms: observation.terms })) {
+              return { kind: 'error', text: '需要在当前试用版本下完成一次同类任务，再验收。' }
+            }
             if (observation.verified) return { kind: 'error', text: '这一轮已验收，不能重复推进窗口。' }
             if (observation.verifying || recorder.get(String(agent.session.id))) return { kind: 'error', text: '任务或验收尚在运行。' }
             const replay = window.baseline.verification
@@ -352,12 +435,21 @@ export function apply(ctx, input = {}) {
               if (evolve.current(scope)?.rev !== window.rev || recent.get(String(agent.session.id))?.state !== observation || recorder.get(String(agent.session.id))) return { kind: 'error', text: '版本或任务已改变，验收作废。' }
               observation.verified = true
               const ok = checks.length > 0 && checks.every(c => c.ok)
-              const decisions = evolve.observe({ scope, taskKey: observation.taskKey, corrections: observation.corrections,
-                toolErrors: observation.toolErrors, complete: observation.complete && ok, verified: ok })
-              store.log({ scope, rev: window.rev, action: 'trial_verification', actor: 'user', detail: { checks, decisions } })
-              return { kind: ok ? 'success' : 'error', text: JSON.stringify({ checks, decisions, remaining: store.openWatches(scope)[0]?.remaining ?? 0 }, null, 2) }
+              const decisions = evolve.observe({ scope, taskKey: observation.taskKey, taskTerms: observation.terms,
+                corrections: observation.corrections, toolErrors: observation.toolErrors,
+                complete: observation.complete && ok, verified: ok })
+              // A passed verifier is the only online signal that can prove a deliverable.
+              // It becomes positive contrast for the same task family, not a prompt.
+              const lesson = ok ? evolve.recordVerified({ scope, taskKey: observation.taskKey,
+                taskTerms: observation.terms, task: observation.text, state: observation,
+                rev: window.rev, checks }) : null
+              store.log({ scope, rev: window.rev, action: 'trial_verification', actor: 'user',
+                detail: { checks, decisions, lesson: lesson?.id ?? null } })
+              return { kind: ok ? 'success' : 'error', text: JSON.stringify({ checks, decisions,
+                lesson: lesson ? lessonView(lesson) : null,
+                remaining: store.openWatches(scope)[0]?.remaining ?? 0 }, null, 2) }
             } catch (error) {
-              if (!signal?.aborted && evolve.current(scope)?.rev === window.rev) evolve.observe({ scope, taskKey: observation.taskKey, corrections: 0, toolErrors: 0, complete: false })
+              if (!signal?.aborted && evolve.current(scope)?.rev === window.rev) evolve.observe({ scope, taskKey: observation.taskKey, taskTerms: observation.terms, corrections: 0, toolErrors: 0, complete: false })
               throw error
             } finally { observation.verifying = false }
           }

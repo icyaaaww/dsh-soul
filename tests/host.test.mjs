@@ -286,6 +286,16 @@ test('real DSH: spawn integration on 0.2.1, explicit refusal on 0.2.0', { skip: 
       // A correction on the next turn is attributed to the previous task and rolls back.
       mode = 'baseline'; await turn('write result')
       mode = 'evolution'
+      const callsBeforeRetry = handle.store.db.prepare('SELECT COUNT(*) n FROM call').get().n
+      const blocked = await command('run')
+      assert.equal(blocked.kind, 'error')
+      assert.equal(JSON.parse(blocked.text).reason, 'lesson_compiled')
+      assert.equal(handle.store.db.prepare('SELECT COUNT(*) n FROM call').get().n, callsBeforeRetry,
+        'a repeated compiled lesson must not purchase another editor session')
+      // Only an explicit rollback reopens the lesson for a new paid attempt.
+      const seedRev = handle.store.rev(stable.rev, scope).parent
+      assert.equal((await command('rollback ' + seedRev)).kind, 'success')
+      assert.equal(handle.evolve.current(scope).rev, seedRev)
       const second = await command('run')
       assert.equal(second.kind, 'success', second.text)
       await handle.evolve.running

@@ -4,8 +4,8 @@ import { mkdtempSync, rmSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { settings, apply, name, inject } from '../index.js'
-import { projectScope, taskKey, leadingIntent, day, bounded, redact } from '../src/util.js'
-import { Recorder, divergenceOf, isCorrection, trajectoryText } from '../src/observe.js'
+import { projectScope, taskKey, leadingIntent, day, bounded, redact, terms, sameTask } from '../src/util.js'
+import { Recorder, divergenceOf, isCorrection, trajectoryText, repeatCount } from '../src/observe.js'
 
 /** Minimal Cordis stand-in: enough to exercise registration and dispatch. */
 function fakeContext() {
@@ -160,6 +160,53 @@ test('tool argument validation rejects unknown and missing parameters', async ()
   } finally { await handle.stop() }
 })
 
+test('a supported lesson cluster is visible to tools but still needs the host command', async () => {
+  const { ctx, tools, commands } = fakeContext()
+  const dir = mkdtempSync(join(tmpdir(), 'evolve-lesson-cmd-'))
+  const handle = apply(ctx, { profile: 'test', database: ':memory:', enabled: true,
+    provider: 'p', model: 'm', repeatThreshold: 2,
+    checks: [{ name: 'artifact', argv: [process.execPath, '-e', 'process.exit(0)'] }] })
+  try {
+    const agent = { session: session(dir) }
+    const scope = projectScope(agent.session)
+    for (const text of ['修复构建超时', '修复一下构建超时']) {
+      handle.evolve.recordObservation({ scope, state: {
+        scope, text, steps: 4, toolCalls: 6, toolErrors: 1, complete: true,
+        reason: 'stop', durationMs: 10, tools: ['Bash'], errors: [{ tool: 'Bash', text: 'timeout' }],
+      } })
+    }
+
+    // The zero-cost diagnosis falls back to the pool instead of claiming there is nothing.
+    const diagnose = tools.find(t => t.name === 'evolve_diagnose')
+    const seen = JSON.parse((await diagnose.execute({}, { agent, signal: new AbortController().signal })).text)
+    assert.equal(seen.source, 'lesson_pool')
+    assert.equal(seen.clusters[0].kind, 'recovery')
+    assert.equal(seen.clusters[0].target, 'C4')
+
+    // The paid tool only reports eligibility; it never starts an episode.
+    const request = tools.find(t => t.name === 'evolve_request')
+    const refused = JSON.parse((await request.execute({ confirm: 'confirm' }, { agent, signal: new AbortController().signal })).text)
+    assert.equal(refused.started, false)
+    assert.equal(refused.reason, 'requires_host_command')
+    assert.equal(refused.lesson.kind, 'recovery')
+    assert.equal(handle.evolve.status(scope).budget.daily.calls.used, 0)
+
+    // The user command is allowed to enter the paid path, but this test host cannot spawn.
+    const run = await commands[0].handler({ agent, rawInput: 'run', signal: new AbortController().signal })
+    assert.equal(run.kind, 'error')
+    const outcome = JSON.parse(run.text)
+    assert.equal(outcome.started, false)
+    assert.equal(outcome.reason, 'host_runner_unavailable')
+
+    const report = await commands[0].handler({ agent, rawInput: 'report', signal: new AbortController().signal })
+    assert.equal(report.kind, 'success')
+    const summary = JSON.parse(report.text)
+    assert(summary.lessons.counts.observed + summary.lessons.counts.candidate >= 1)
+    assert.equal(summary.cost.calls, 0)
+    assert.match(summary.note, /留存\/迁移/)
+  } finally { await handle.stop(); rmSync(dir, { recursive: true, force: true }) }
+})
+
 test('observation estimates a task key without storing the whole message', () => {
   const recorder = new Recorder()
   const state = recorder.start('s', { scope: 'project:x', turn: 1, intent: '把日志转成 JSON 并去重' })
@@ -169,6 +216,24 @@ test('observation estimates a task key without storing the whole message', () =>
   assert.equal(leadingIntent('把日志转成 JSON 并去重'), leadingIntent('把日志转成 JSON 并去重'))
   assert.equal(isCorrection('不对，又错了'), true)
   assert.equal(isCorrection('继续'), false)
+})
+
+test('a completed tool-using turn is not a divergence just because no artifact was tracked', () => {
+  // The online recorder cannot prove a deliverable exists. Treating every "stop" as missing
+  // one made ordinary work look like a repeated failure and triggered paid episodes.
+  assert.equal(divergenceOf({ toolErrors: 0, corrections: 0, complete: true, deliverable: false, reason: 'stop', toolCalls: 3, text: 'x', errors: [] }), null)
+})
+
+test('repeat counting tolerates wording variants but not unrelated tasks', () => {
+  const rows = [
+    { task_key: 'a', terms: terms('修复构建超时'), created: Date.now(), state: 'observed' },
+    { task_key: 'b', terms: terms('修复一下构建超时'), created: Date.now(), state: 'observed' },
+    { task_key: 'c', terms: terms('部署生产环境'), created: Date.now(), state: 'observed' },
+  ]
+  assert.equal(repeatCount(rows, { taskKey: 'a', terms: terms('修复构建超时') }), 2)
+  assert.equal(repeatCount(rows, { taskKey: 'c', terms: terms('部署生产环境') }), 1)
+  assert.equal(repeatCount(rows, 'a'), 1, 'legacy rows still match by exact hash')
+  assert.equal(sameTask({ taskKey: 'x', terms: terms('修复构建超时') }, { taskKey: 'y', terms: terms('部署生产环境') }), false)
 })
 
 test('divergence scoring needs a real signal, and corrections outrank tool errors', () => {

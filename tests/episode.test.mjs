@@ -2,8 +2,9 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Store } from '../src/store.js'
 import { Evolve } from '../src/evolve.js'
-import { budgetSettings } from '../src/budget.js'
+import { budgetSettings, Budget } from '../src/budget.js'
 import { verdictOf } from '../src/watch.js'
+import { terms } from '../src/util.js'
 import { defaults, fixtureEditor, fixtureExecutor, divergence, BASE_METRICS } from './fixture.mjs'
 
 const config = ({ budget: budgetOverrides = {}, ...extra } = {}) => ({
@@ -330,4 +331,63 @@ test('missing outcome checks refuse before any editor request', async t => {
   assert.equal(result.reason,'verification_required')
   assert.equal(f.editor.requests.length,0)
   assert.equal(f.store.recentEpisodes('p').length,0)
+})
+
+test('an episode that cannot fit one paired probe refuses before the editor', async t => {
+  const f = setup(t, { cfg: config({ budget: { episodeCalls: 8 } }) })
+  const started = await f.start()
+  assert.equal(started.started, false)
+  assert.equal(started.reason, 'budget_envelope')
+  assert.equal(f.editor.requests.length, 0)
+})
+
+test('probe arms share the episode call budget instead of assuming probeSteps', async t => {
+  const f = setup(t, { cfg: config({ budget: { episodeCalls: 22, probeSteps: 40 } }) })
+  const started = await f.start()
+  await f.evolve.running
+  // (22 calls - 6 editor calls) / (2 trials x 2 arms) = 4 steps per arm.
+  assert.equal(started.steps, 4)
+  assert.equal(f.executor.calls.length, 4)
+  assert(f.executor.calls.every(c => c.maxSteps === 4), 'every arm gets the same bounded step count')
+})
+
+test('a pair with no gain stops before paying for the remaining trials', async t => {
+  const f = setup(t, { cfg: config({ validationTrials: 3 }) })
+  let arms = 0
+  f.executor.execute = async ctx => {
+    arms++
+    return {
+      metrics: { ...BASE_METRICS, tokens: 1000, durationMs: 5000 },
+      transcript: '', verification: 'fixture-snapshot',
+      checks: ctx.checks.map(c => ({ name: c.name, ok: true })),
+    }
+  }
+  const started = await f.start()
+  await f.evolve.running
+  assert.equal(arms, 2, 'one pair, not all three trials')
+  const episode = f.store.episode(started.episode, 'p')
+  assert.equal(episode.state, 'rejected')
+  assert.equal(episode.reason, 'no_repeatable_gain')
+  assert(episode.evidence.some(e => e.kind === 'paired-validation'), 'the pair that justified stopping is kept')
+})
+
+test('editor and probe requests have separate byte caps', () => {
+  const store = new Store(':memory:')
+  try {
+    const budget = new Budget(store, budgetSettings({ requestInputBytes: 2000, probeRequestBytes: 64000 }))
+    assert.equal(budget.request('p', null, 'baseline', 'x'.repeat(30000)).ok, true)
+    assert.equal(budget.request('p', null, 'edit', 'x'.repeat(30000)).reason, 'input_limit')
+  } finally { store.close() }
+})
+
+test('a rephrased same-kind task still drains the shadow window', async t => {
+  const f = setup(t)
+  const started = await f.start({ taskTerms: terms('修复构建超时') })
+  await f.evolve.running
+  const rev = f.store.latest('p', ['shadow']).id
+  for (let i = 0; i < 3; i++) {
+    f.evolve.observe({ scope: 'p', taskKey: 'rephrased', taskTerms: terms('修复一下构建超时'),
+      corrections: 0, toolErrors: 0, complete: true, verified: true })
+  }
+  assert.equal(f.store.rev(rev, 'p').state, 'stable')
 })

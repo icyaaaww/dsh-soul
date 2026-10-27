@@ -1,9 +1,15 @@
 import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { hash, id, day, clean, bounded } from './util.js'
+import { hash, id, day, clean, bounded, redact, redactData, redactText, terms as termSet, sameTask } from './util.js'
 
-export const SCHEMA_VERSION = 1
+export const SCHEMA_VERSION = 3
+
+const jsonText = value => value === null || value === undefined ? null : bounded(JSON.stringify(redactData(value)), 4000)
+const parseJson = (value, fallback) => {
+  if (!value) return fallback
+  try { return JSON.parse(value) } catch { return fallback }
+}
 
 /**
  * Storage for harness revision trees, episodes, evidence and the append-only ledger.
@@ -22,7 +28,7 @@ export class Store {
     this.now = now
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
     this.db = new DatabaseSync(path)
-    this.db.exec(`PRAGMA busy_timeout=200; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;`)
+    this.db.exec(`PRAGMA busy_timeout=200; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;`)
     const version = this.db.prepare('PRAGMA user_version').get().user_version
     if (version > SCHEMA_VERSION) {
       this.db.close()
@@ -61,6 +67,7 @@ export class Store {
           to_rev TEXT REFERENCES rev(id) ON DELETE SET NULL,
           divergence TEXT,
           target TEXT,
+          lesson TEXT,
           cost TEXT,
           state TEXT NOT NULL,
           reason TEXT,
@@ -78,6 +85,31 @@ export class Store {
           bytes INTEGER NOT NULL,
           created INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS evidence_episode ON evidence(episode, kind);
+
+        CREATE TABLE IF NOT EXISTS lesson(
+          id TEXT PRIMARY KEY,
+          scope TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          terms TEXT NOT NULL,
+          task_key TEXT NOT NULL,
+          task TEXT,
+          summary TEXT NOT NULL,
+          detail TEXT,
+          success TEXT,
+          divergence TEXT,
+          trajectory TEXT,
+          support INTEGER NOT NULL DEFAULT 1,
+          contradictions INTEGER NOT NULL DEFAULT 0,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          state TEXT NOT NULL DEFAULT 'observed',
+          episode TEXT,
+          rev TEXT,
+          last_reason TEXT,
+          last_attempt INTEGER,
+          created INTEGER NOT NULL,
+          seen INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS lesson_scope ON lesson(scope, state, seen);
+        CREATE INDEX IF NOT EXISTS lesson_rev ON lesson(rev);
 
         CREATE TABLE IF NOT EXISTS watch(
           rev TEXT PRIMARY KEY REFERENCES rev(id) ON DELETE CASCADE,
@@ -119,9 +151,18 @@ export class Store {
         CREATE INDEX IF NOT EXISTS call_day ON call(day);
         CREATE INDEX IF NOT EXISTS call_episode ON call(episode);
 
-        PRAGMA user_version=${SCHEMA_VERSION};
         COMMIT;
       `)
+      // Version 1 databases predate the lesson column; CREATE TABLE IF NOT EXISTS cannot add
+      // it, so migrate explicitly before declaring the schema current.
+      const episodeColumns = this.db.prepare('PRAGMA table_info(episode)').all().map(c => c.name)
+      if (!episodeColumns.includes('lesson')) this.db.exec('ALTER TABLE episode ADD COLUMN lesson TEXT')
+      this.db.exec('CREATE INDEX IF NOT EXISTS episode_lesson ON episode(lesson)')
+      this.tx(() => {
+        if (version < 3) this.scrubObservationData()
+        this.db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`)
+      })
+      if (version < 3) this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
     } catch (error) {
       this.db.close()
       throw error
@@ -129,6 +170,36 @@ export class Store {
   }
 
   close() { try { this.db.close() } catch { /* already closed */ } }
+
+  /** One-time cleanup of pre-v3 observation metadata; never rewrite harness blobs. */
+  scrubObservationData() {
+    for (const row of this.db.prepare('SELECT * FROM lesson').all()) {
+      const task = row.task === null ? null : redact(row.task)
+      // Old tokens have lost credential context. Rebuild from safe text, or drop them.
+      const fields = ['summary', 'detail', 'success', 'divergence', 'trajectory', 'last_reason']
+      this.db.prepare(`UPDATE lesson SET task=?, terms=?, ${fields.map(k => `${k}=?`).join(',')} WHERE id=?`)
+        .run(task, JSON.stringify(termSet(task ?? '')), ...fields.map(k => row[k] === null ? null : redactText(row[k])), row.id)
+    }
+    for (const row of this.db.prepare("SELECT * FROM meta WHERE key LIKE 'last:%' OR key LIKE 'observations:%'").all()) {
+      let value = parseJson(row.value, null)
+      if (value === null) value = row.key.startsWith('observations:') ? [] : {}
+      value = redactData(value)
+      if (row.key.startsWith('observations:') && Array.isArray(value)) value = value.map(item => ({ ...item, terms: [] }))
+      this.db.prepare('UPDATE meta SET value=? WHERE key=?').run(JSON.stringify(value), row.key)
+    }
+    for (const row of this.db.prepare('SELECT rev,baseline FROM watch').all()) {
+      const value = redactData(parseJson(row.baseline, {}))
+      value.taskTerms = []
+      this.db.prepare('UPDATE watch SET baseline=? WHERE rev=?').run(JSON.stringify(value), row.rev)
+    }
+    for (const row of this.db.prepare('SELECT id,divergence FROM episode WHERE divergence IS NOT NULL').all()) {
+      this.db.prepare('UPDATE episode SET divergence=? WHERE id=?').run(redactText(row.divergence), row.id)
+    }
+    for (const row of this.db.prepare('SELECT id,detail,gate FROM ledger').all()) {
+      this.db.prepare('UPDATE ledger SET detail=?,gate=? WHERE id=?')
+        .run(row.detail === null ? null : redactText(row.detail), row.gate === null ? null : redactText(row.gate), row.id)
+    }
+  }
 
   tx(fn) {
     this.db.exec('BEGIN IMMEDIATE')
@@ -209,12 +280,13 @@ export class Store {
 
   // -- episodes ------------------------------------------------------------
 
-  createEpisode({ scope, taskKey, trigger, fromRev, divergence = null, target = null }) {
+  createEpisode({ scope, taskKey, trigger, fromRev, divergence = null, target = null, lesson = null }) {
     const key = id()
     this.db.prepare('INSERT INTO episode(id,scope,task_key,trigger,from_rev,state,created) VALUES (?,?,?,?,?,?,?)')
       .run(key, scope, taskKey, trigger, fromRev, 'running', this.now())
-    if (divergence) this.db.prepare('UPDATE episode SET divergence=? WHERE id=?').run(JSON.stringify(divergence), key)
+    if (divergence) this.db.prepare('UPDATE episode SET divergence=? WHERE id=?').run(JSON.stringify(redactData(divergence)), key)
     if (target) this.db.prepare('UPDATE episode SET target=? WHERE id=?').run(target, key)
+    if (lesson) this.db.prepare('UPDATE episode SET lesson=? WHERE id=?').run(lesson, key)
     return key
   }
 
@@ -235,7 +307,7 @@ export class Store {
   }
 
   recentEpisodes(scope, limit = 20) {
-    return this.db.prepare('SELECT id,scope,task_key,trigger,target,state,reason,created,finished FROM episode WHERE scope=? ORDER BY created DESC, rowid DESC LIMIT ?')
+    return this.db.prepare('SELECT id,scope,task_key,trigger,target,lesson,state,reason,created,finished FROM episode WHERE scope=? ORDER BY created DESC, rowid DESC LIMIT ?')
       .all(scope, limit)
   }
 
@@ -253,7 +325,7 @@ export class Store {
 
   addEvidence(episode, kind, text) {
     const key = id()
-    const body = bounded(text, 24000)
+    const body = bounded(redactText(text), 24000)
     const path = `${kind}-${key}.txt`
     this.db.prepare('INSERT INTO evidence(id,episode,kind,path,bytes,created) VALUES (?,?,?,?,?,?)')
       .run(key, episode, kind, path, Buffer.byteLength(body), this.now())
@@ -264,6 +336,175 @@ export class Store {
   }
 
   readEvidence(key) { return this.get(`ev:${key}`) }
+
+  // -- lessons -------------------------------------------------------------
+
+  parseLesson(row) {
+    return row ? {
+      ...row,
+      terms: parseJson(row.terms, []),
+      detail: parseJson(row.detail, null),
+      success: parseJson(row.success, null),
+      divergence: parseJson(row.divergence, null),
+    } : null
+  }
+
+  lesson(key) {
+    return this.parseLesson(this.db.prepare('SELECT * FROM lesson WHERE id=?').get(key))
+  }
+
+  /**
+   * Record one observed pattern. Matching is by kind plus task-term overlap, so a rephrased
+   * request increments the same cluster instead of creating a new one. This is free: no model
+   * call, no prompt injection, and the trajectory body is bounded before it is stored.
+   */
+  recordLesson({ scope, kind, taskKey, terms, task = null, summary, detail = null, success = null,
+    divergence = null, trajectory = null }) {
+    if (!scope || !kind || !taskKey) throw new Error('lesson 需要 scope/kind/taskKey')
+    const now = this.now()
+    const taskTerms = task != null ? termSet(task) : []
+    const rows = this.db.prepare("SELECT * FROM lesson WHERE scope=? AND kind=? ORDER BY CASE state WHEN 'retired' THEN 0 WHEN 'compiled' THEN 1 ELSE 2 END, seen DESC")
+      .all(scope, kind)
+    const match = rows.find(row => sameTask(
+      { taskKey: row.task_key, terms: parseJson(row.terms, []) },
+      { taskKey, terms: taskTerms },
+    ))
+    const label = bounded(redact(String(task ?? '')), 600)
+    const text = bounded(redact(String(summary ?? kind)), 600)
+    if (match) {
+      // Recurrence adds support but never reopens the lesson by itself. A compiled lesson is
+      // already in the current version; a retired one has failed its paired gate twice. Only
+      // an explicit rollback reverses a compiled lesson, otherwise retirement would mean
+      // nothing and a pattern that fails validation forever would keep buying episodes.
+      this.db.prepare(`UPDATE lesson SET
+        support=support+1, seen=?, task=COALESCE(?,task), summary=?, detail=COALESCE(?,detail),
+        success=COALESCE(?,success), divergence=COALESCE(?,divergence), trajectory=COALESCE(?,trajectory)
+        WHERE id=?`)
+        .run(now, label, text, jsonText(detail), jsonText(success), jsonText(divergence),
+          trajectory === null ? null : bounded(redactText(String(trajectory)), 8000), match.id)
+      return this.lesson(match.id)
+    }
+    const key = id()
+    this.db.prepare(`INSERT INTO lesson(
+      id,scope,kind,terms,task_key,task,summary,detail,success,divergence,trajectory,
+      support,contradictions,attempts,state,episode,rev,last_reason,last_attempt,created,seen)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(key, scope, kind, JSON.stringify(taskTerms), taskKey, label, text,
+        jsonText(detail), jsonText(success), jsonText(divergence),
+        trajectory === null ? null : bounded(redactText(String(trajectory)), 8000),
+        1, 0, 0, 'observed', null, null, null, null, now, now)
+    this.pruneLessons(scope)
+    return this.lesson(key)
+  }
+
+  /** Support threshold reached: visible as a candidate, still not a version or a prompt. */
+  markLessonCandidate(key) {
+    this.db.prepare("UPDATE lesson SET state='candidate' WHERE id=? AND state='observed'").run(key)
+    return this.lesson(key)
+  }
+
+  pruneLessons(scope, limit = 200) {
+    this.db.prepare(`DELETE FROM lesson WHERE scope=? AND state IN ('observed','candidate')
+      AND id NOT IN (SELECT id FROM lesson WHERE scope=? AND state IN ('observed','candidate')
+      ORDER BY seen DESC LIMIT ?)`).run(scope, scope, limit)
+  }
+
+  lessons(scope, { state = null, limit = 20 } = {}) {
+    const rows = state
+      ? this.db.prepare('SELECT * FROM lesson WHERE scope=? AND state=? ORDER BY seen DESC LIMIT ?').all(scope, state, limit)
+      : this.db.prepare('SELECT * FROM lesson WHERE scope=? ORDER BY seen DESC LIMIT ?').all(scope, limit)
+    return rows.map(row => this.parseLesson(row))
+  }
+
+  /** All matching trigger clusters, including durable retirement/compilation records. */
+  matchingLessons(scope, reference, kinds) {
+    const slots = kinds.map(() => '?').join(',')
+    // No state/recency limit: retirement also applies to direct session runs.
+    return this.db.prepare(`SELECT * FROM lesson WHERE scope=? AND kind IN (${slots}) ORDER BY seen DESC`)
+      .all(scope, ...kinds).map(row => this.parseLesson(row))
+      .filter(row => sameTask({ taskKey: row.task_key, terms: row.terms }, reference))
+  }
+
+  /** Supported clusters that may justify a paid compilation episode. */
+  lessonCandidates(scope, threshold, { kinds = ['user_correction', 'tool_error', 'incomplete', 'recovery'], limit = 10, windowMs = null } = {}) {
+    const slots = kinds.map(() => '?').join(',')
+    // A stale cluster is not a recurring pattern. The window is optional so callers/tests can
+    // inspect the whole pool, but the paid path only sees what was observed recently.
+    const cutoff = windowMs === null ? 0 : this.now() - windowMs
+    return this.db.prepare(`SELECT * FROM lesson
+      WHERE scope=? AND state IN ('observed','candidate') AND kind IN (${slots})
+        AND support>=? AND contradictions<2 AND seen>=?
+      ORDER BY support DESC, seen DESC LIMIT ?`)
+      .all(scope, ...kinds, threshold, cutoff, limit)
+      .map(row => this.parseLesson(row))
+  }
+
+  /** Latest successful sample for the same task family, used as contrast evidence. */
+  relatedLesson(scope, { taskKey, terms = [], kinds = ['resolved', 'recovery', 'verified_success'], limit = 100 } = {}) {
+    const slots = kinds.map(() => '?').join(',')
+    const rows = this.db.prepare(`SELECT * FROM lesson
+      WHERE scope=? AND state!='retired' AND kind IN (${slots})
+      ORDER BY seen DESC LIMIT ?`).all(scope, ...kinds, limit)
+    for (const row of rows) {
+      const lesson = this.parseLesson(row)
+      if (sameTask({ taskKey: lesson.task_key, terms: lesson.terms }, { taskKey, terms })) return lesson
+    }
+    return null
+  }
+
+  /** Link an episode outcome back to its lesson. Rejections retire a cluster after two tries. */
+  settleLesson(key, { state, rev = null, episode = null, reason = null }) {
+    const row = this.db.prepare('SELECT * FROM lesson WHERE id=?').get(key)
+    if (!row) return null
+    const now = this.now()
+    const attempts = row.attempts + 1
+    const note = bounded(redact(String(reason ?? '')), 300)
+    if (state === 'shadow') {
+      this.db.prepare(`UPDATE lesson SET state='compiled', rev=?, episode=?, attempts=?, last_reason=?,
+        last_attempt=?, seen=? WHERE id=?`).run(rev, episode, attempts, note, now, now, key)
+    } else if (state === 'rejected') {
+      const contradictions = row.contradictions + 1
+      this.db.prepare(`UPDATE lesson SET state=?, rev=NULL, episode=?, contradictions=?, attempts=?,
+        last_reason=?, last_attempt=?, seen=? WHERE id=?`)
+        .run(contradictions >= 2 ? 'retired' : 'observed', episode, contradictions, attempts, note, now, now, key)
+    } else {
+      // Provider failure/interruption is not evidence against the experience; keep its status
+      // (compiled/candidate/observed) but record the attempt so the next run can explain it.
+      const keep = row.state === 'compiled' ? 'compiled' : row.state === 'candidate' ? 'candidate' : 'observed'
+      this.db.prepare(`UPDATE lesson SET state=?, attempts=?, last_reason=?, last_attempt=?, seen=? WHERE id=?`)
+        .run(keep, attempts, note, now, now, key)
+    }
+    return this.lesson(key)
+  }
+
+  /** A rolled-back revision invalidates the lessons it compiled. */
+  reopenLessonsForRev(rev, scope) {
+    const rows = this.db.prepare('SELECT id,contradictions FROM lesson WHERE rev=? AND scope=?').all(rev, scope)
+    const now = this.now()
+    for (const row of rows) {
+      const contradictions = row.contradictions + 1
+      this.db.prepare(`UPDATE lesson SET state=?, rev=NULL, contradictions=?, last_reason='revision_rolled_back',
+        seen=? WHERE id=?`).run(contradictions >= 2 ? 'retired' : 'observed', contradictions, now, row.id)
+    }
+    return rows.length
+  }
+
+  lessonStats(scope) {
+    const counts = { observed: 0, candidate: 0, compiled: 0, retired: 0 }
+    for (const row of this.db.prepare('SELECT state, COUNT(*) n FROM lesson WHERE scope=? GROUP BY state').all(scope)) {
+      counts[row.state] = row.n
+    }
+    const top = this.db.prepare(`SELECT id,kind,summary,support,contradictions,state,last_reason,seen
+      FROM lesson WHERE scope=? AND state IN ('observed','candidate')
+      ORDER BY support DESC, seen DESC LIMIT 5`).all(scope)
+    return { counts, top }
+  }
+
+  callStatsForScope(scope) {
+    return this.db.prepare(`SELECT c.phase, c.outcome, COUNT(*) n, COALESCE(SUM(c.input_bytes),0) bytes
+      FROM call c JOIN episode e ON e.id=c.episode WHERE e.scope=?
+      GROUP BY c.phase, c.outcome`).all(scope)
+  }
 
   // -- watch ---------------------------------------------------------------
 
@@ -293,8 +534,8 @@ export class Store {
   log({ rev = null, scope, action, actor, gate = null, detail = null }) {
     const key = id()
     this.db.prepare('INSERT INTO ledger VALUES (?,?,?,?,?,?,?,?)')
-      .run(key, rev, scope, action, actor, gate ? JSON.stringify(gate) : null,
-        detail === null ? null : bounded(typeof detail === 'string' ? detail : JSON.stringify(detail), 4000), this.now())
+      .run(key, rev, scope, action, actor, gate ? JSON.stringify(redactData(gate)) : null,
+        detail === null ? null : bounded(typeof detail === 'string' ? redactText(detail) : JSON.stringify(redactData(detail)), 4000), this.now())
     return key
   }
 
@@ -314,19 +555,19 @@ export class Store {
     return this.tx(() => {
       // All-or-nothing across dimensions: a partial reservation would let one dimension
       // starve while another over-spends.
-      for (const [key, { limit, amount }] of Object.entries(dims)) {
+      for (const [key, { limit, amount, lifetime = false }] of Object.entries(dims)) {
         const row = this.db.prepare('SELECT * FROM budget WHERE key=?').get(key)
-        const used = row && row.day === dayKey ? row.used : 0
+        const used = row && (lifetime || row.day === dayKey) ? row.used : 0
         if (used + amount > limit) return { ok: false, key, used, limit, amount }
       }
       // Capacity is spent immediately, not held: this plugin never retries paid work, so
       // there is no window in which a reservation should be released.
-      for (const [key, { amount }] of Object.entries(dims)) {
+      for (const [key, { amount, lifetime = false }] of Object.entries(dims)) {
         this.db.prepare(`INSERT INTO budget(key,day,used,reserved) VALUES (?,?,?,0)
           ON CONFLICT(key) DO UPDATE SET
-            used=CASE WHEN budget.day=excluded.day THEN budget.used+excluded.used ELSE excluded.used END,
+            used=CASE WHEN ? OR budget.day=excluded.day THEN budget.used+excluded.used ELSE excluded.used END,
             reserved=0, day=excluded.day`)
-          .run(key, dayKey, amount)
+          .run(key, lifetime ? '*' : dayKey, amount, lifetime ? 1 : 0)
       }
       const callId = id()
       this.db.prepare('INSERT INTO call(id,episode,phase,day,input_bytes,outcome,created) VALUES (?,?,?,?,?,?,?)')
@@ -341,11 +582,11 @@ export class Store {
       .run(outcome, usage ? JSON.stringify(usage) : null, callId)
   }
 
-  budgetState(dayKey, keys) {
+  budgetState(dayKey, keys, lifetimeKeys = []) {
     const out = {}
     for (const key of keys) {
       const row = this.db.prepare('SELECT * FROM budget WHERE key=?').get(key)
-      out[key] = row && row.day === dayKey ? { used: row.used, reserved: row.reserved } : { used: 0, reserved: 0 }
+      out[key] = row && (lifetimeKeys.includes(key) || row.day === dayKey) ? { used: row.used, reserved: row.reserved } : { used: 0, reserved: 0 }
     }
     return out
   }

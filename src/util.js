@@ -25,6 +25,22 @@ export function redact(text) {
     .replace(/(https?:\/\/)[^\s/@:]+:[^\s/@]+@/g, '$1[REDACTED]@')
 }
 
+/** Preserve JSON structure while redacting string values and credential fields. */
+export function redactData(value) {
+  if (typeof value === 'string') return redact(value)
+  if (Array.isArray(value)) return value.map(redactData)
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+    key, /^(?:api[_-]?key|access[_-]?token|password|passwd|secret|sessdata|authorization|cookie)$/i.test(key)
+      ? '[REDACTED]' : redactData(item),
+  ]))
+  return value
+}
+
+export function redactText(text) {
+  try { return JSON.stringify(redactData(JSON.parse(text))) }
+  catch { return redact(text) }
+}
+
 export function clean(text, limit = 4000) {
   if (typeof text !== 'string' || !text.trim()) throw new Error('需要非空文字')
   return bounded(redact(text.trim()), limit)
@@ -77,13 +93,43 @@ export function leadingIntent(text) {
 }
 
 export function terms(text) {
-  const s = String(text ?? '').normalize('NFKC').toLowerCase()
+  const s = redact(String(text ?? '')).replace(/\[REDACTED(?: KEY| TOKEN)?\]/g, '').normalize('NFKC').toLowerCase()
   const words = s.match(/[a-z0-9_]{2,}/g) ?? []
   for (const span of s.match(/[\p{Script=Han}]+/gu) ?? []) {
     if (span.length === 1) words.push(span)
     else for (let i = 0; i < span.length - 1; i++) words.push(span.slice(i, i + 2))
   }
   return [...new Set(words)].slice(0, 80)
+}
+
+const TASK_SIMILARITY = 0.5
+
+function overlap(a = [], b = []) {
+  const x = new Set(a), y = new Set(b)
+  let shared = 0
+  for (const term of x) if (y.has(term)) shared++
+  return { shared, union: x.size + y.size - shared }
+}
+
+/** Jaccard similarity over two term sets; 0 when either side is empty. */
+export function similarity(a, b) {
+  const { shared, union } = overlap(a, b)
+  return union ? shared / union : 0
+}
+
+/**
+ * "Same kind of task" for repetition counting and shadow windows. The exact hash is the
+ * fast path; two wording variants of the same intent fall back to term overlap so a single
+ * filler word ("一下", "帮我") does not reset the count. At least two shared terms are
+ * required, which keeps a common word such as "修复" from matching unrelated work.
+ */
+export function sameTask(a, b) {
+  if (!a || !b) return false
+  if (typeof a === 'string') a = { taskKey: a }
+  if (typeof b === 'string') b = { taskKey: b }
+  if (a.taskKey && b.taskKey && a.taskKey === b.taskKey) return true
+  const { shared, union } = overlap(a.terms, b.terms)
+  return shared >= 2 && union > 0 && shared / union >= TASK_SIMILARITY
 }
 
 /** Project scope: one harness tree per project, keyed by resolved cwd. */

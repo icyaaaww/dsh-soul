@@ -27,6 +27,16 @@ const RULES = [
     hint: 'hook 必须 fail-open、声明 timeoutMs、不得阻断合法完成',
   },
   {
+    // A recovery is not a failure to fix; it is a repeated path that already worked. Compiling
+    // it into tool guidance can reduce later tool errors and steps, but it still has to pass
+    // the same paired gate as any other candidate.
+    id: 'recovery_pattern',
+    when: d => d.signals.some(s => s.kind === 'recovery'),
+    target: 'C4',
+    why: '同类任务反复出现工具失败后恢复，固化可复用的回退与停止条件',
+    hint: '把恢复步骤写成有界回退；不要写“重试直到成功”，也不要写具体任务答案',
+  },
+  {
     id: 'tool_contract',
     when: d => d.signals.some(s => s.kind === 'tool_error' && /timeout|permission|denied|not found|invalid|unrecogni|参数|超时|权限|不存在/i.test(JSON.stringify(s.detail))),
     target: 'C4',

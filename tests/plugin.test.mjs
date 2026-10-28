@@ -44,12 +44,12 @@ test('enabled: tools and the four every-call contexts register exactly once', as
   const { ctx, tools, commands, contexts } = fakeContext()
   const handle = apply(ctx, { profile: 'test', database: ':memory:', enabled: true, provider: 'p', model: 'm' })
   try {
-    assert.equal(contexts.length, 9)
+    assert.equal(contexts.length, 10)
     const normal = contexts.filter(c => !c.name.startsWith('dsh-soul:probe:'))
-    assert.deepEqual(normal.map(c => c.order), [900, 910, 920, 950])
-    assert.equal(new Set(contexts.map(c => c.name)).size, 9)
-    assert.deepEqual(tools.map(t => t.name).sort(), ['evolve_catalog', 'evolve_delegate', 'evolve_diagnose', 'evolve_request', 'evolve_script', 'evolve_status', 'evolve_tree'])
-    assert.deepEqual(commands.map(c => c.name), ['evolve'])
+    assert.deepEqual(normal.map(c => c.order).sort((a, b) => a - b), [900, 910, 920, 940, 950])
+    assert.equal(new Set(contexts.map(c => c.name)).size, 10)
+    assert.deepEqual(tools.map(t => t.name).sort(), ['evolve_catalog', 'evolve_delegate', 'evolve_diagnose', 'evolve_request', 'evolve_script', 'evolve_status', 'evolve_tree', 'soul_expand', 'soul_recall'])
+    assert.deepEqual(commands.map(c => c.name), ['evolve', 'mem'])
     for (const tool of tools) {
       assert.equal(tool.parameters.type, 'object')
       assert.equal(tool.parameters.additionalProperties, false)

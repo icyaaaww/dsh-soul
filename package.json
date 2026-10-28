@@ -1,7 +1,7 @@
 {
   "name": "dsh-soul",
-  "version": "1.0.0",
-  "description": "Standalone DSH evolution with paired outcome validation and eight connected harness components",
+  "version": "1.5.0",
+  "description": "Memory skeleton and graph compaction for DSH: recover what compression removed",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -15,6 +15,7 @@
   "main": "index.js",
   "exports": {
     ".": "./index.js",
+    "./compaction": "./compaction.js",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json"
   },
@@ -29,6 +30,7 @@
   },
   "files": [
     "index.js",
+    "compaction.js",
     "src/*.js",
     "harness/default/*.md",
     "locale/*.json",
@@ -42,7 +44,11 @@
     "test": "node scripts/test.mjs",
     "check": "node --check index.js && npm test",
     "demo": "node scripts/demo.mjs",
-    "test:host": "node scripts/test-host.mjs"
+    "bench": "node bench/compaction-loss.mjs",
+    "demo:memory": "node scripts/memory-demo.mjs",
+    "demo:compaction": "node scripts/compaction-demo.mjs",
+    "test:host": "node scripts/test-host.mjs",
+    "test:compaction-host": "node --test tests/compaction-host.test.mjs"
   },
   "keywords": [
     "dsh-plugin",

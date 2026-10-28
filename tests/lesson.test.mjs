@@ -285,7 +285,7 @@ test('a version 1 database gains the lesson column and keeps old episodes', () =
 
     const store = new Store(path)
     try {
-      assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 3)
+      assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 6)
       const columns = store.db.prepare('PRAGMA table_info(episode)').all().map(c => c.name)
       assert(columns.includes('lesson'))
       const row = store.recentEpisodes('p', 1)[0]

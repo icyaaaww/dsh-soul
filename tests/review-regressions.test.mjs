@@ -179,7 +179,7 @@ test('v2 migration scrubs old metadata, preserves version history and is idempot
     store.openWatch(rev, 'p', 'k', { taskTerms: [secret], toolErrors: 0 }, 3)
     store.db.exec('PRAGMA user_version=2'); store.close(); store = new Store(path)
     for (const table of ['lesson', 'meta', 'watch']) assert.equal(JSON.stringify(store.db.prepare(`SELECT * FROM ${table}`).all()).includes(secret), false)
-    assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 3)
+    assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 6)
     assert.equal(store.latest('p').id, rev)
     assert.deepEqual(store.materialize(rev), defaults())
     assert.equal(store.lesson(lesson.id).support, 1)

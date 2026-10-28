@@ -3,7 +3,7 @@ import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { hash, id, day, clean, bounded, redact, redactData, redactText, terms as termSet, sameTask } from './util.js'
 
-export const SCHEMA_VERSION = 3
+export const SCHEMA_VERSION = 6
 
 const jsonText = value => value === null || value === undefined ? null : bounded(JSON.stringify(redactData(value)), 4000)
 const parseJson = (value, fallback) => {
@@ -35,6 +35,12 @@ export class Store {
       throw new Error(`数据库版本 ${version} 高于插件支持的 ${SCHEMA_VERSION}`)
     }
     try {
+      // The span index is derived data, so a shape change drops and rebuilds it. That rebuild
+      // must happen exactly once, on migration — putting it in the CREATE block below wiped the
+      // index on every process start, which silently destroyed cross-session memory.
+      if (version > 0 && version < 6) {
+        this.db.exec('DROP TABLE IF EXISTS span_fts; DROP TABLE IF EXISTS span; DROP TABLE IF EXISTS span_meta;')
+      }
       this.db.exec(`
         BEGIN IMMEDIATE;
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -151,6 +157,74 @@ export class Store {
         CREATE INDEX IF NOT EXISTS call_day ON call(day);
         CREATE INDEX IF NOT EXISTS call_episode ON call(episode);
 
+        -- Memory skeleton (1.5). State, not policy: no revision tree, no gate, no model call.
+        CREATE TABLE IF NOT EXISTS node(
+          id TEXT PRIMARY KEY,
+          scope TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          claim TEXT NOT NULL,
+          terms TEXT NOT NULL,
+          anchor TEXT,
+          hash TEXT,
+          source TEXT,
+          seq INTEGER NOT NULL DEFAULT 0,
+          pin INTEGER NOT NULL DEFAULT 0,
+          valid_from INTEGER NOT NULL,
+          valid_to INTEGER,
+          recorded_at INTEGER NOT NULL,
+          weight REAL NOT NULL DEFAULT 1.0,
+          support INTEGER NOT NULL DEFAULT 1,
+          hits INTEGER NOT NULL DEFAULT 0,
+          state TEXT NOT NULL DEFAULT 'active',
+          created INTEGER NOT NULL,
+          seen INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS node_scope ON node(scope, state, kind, seen);
+        CREATE INDEX IF NOT EXISTS node_anchor ON node(scope, anchor);
+
+        CREATE TABLE IF NOT EXISTS edge(
+          id TEXT PRIMARY KEY,
+          scope TEXT NOT NULL,
+          src TEXT NOT NULL,
+          dst TEXT NOT NULL,
+          rel TEXT NOT NULL,
+          w REAL NOT NULL DEFAULT 1.0,
+          created INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS edge_scope ON edge(scope, src);
+        CREATE INDEX IF NOT EXISTS edge_dst ON edge(scope, dst);
+
+        -- Addressable span index (1.10). Derived data: it is rebuilt from the logs, so schema
+        -- changes drop and recreate rather than migrate.
+        --
+        -- session is part of the identity. Sequence numbers restart at zero in every session,
+        -- so a project-wide index keyed only by (scope, seq) cannot tell two sessions apart —
+        -- and a project-wide watermark silently skips every session after the first.
+        CREATE TABLE IF NOT EXISTS span(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          scope TEXT NOT NULL,
+          session TEXT NOT NULL,
+          seq INTEGER NOT NULL,
+          kind TEXT NOT NULL DEFAULT '',
+          hash TEXT NOT NULL,
+          text TEXT NOT NULL,
+          bytes INTEGER NOT NULL);
+        CREATE UNIQUE INDEX IF NOT EXISTS span_hash ON span(scope, hash);
+        CREATE INDEX IF NOT EXISTS span_seq ON span(scope, session, seq);
+        CREATE TABLE IF NOT EXISTS span_meta(
+          scope TEXT NOT NULL,
+          session TEXT NOT NULL,
+          watermark INTEGER NOT NULL DEFAULT -1,
+          PRIMARY KEY(scope, session));
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS span_fts USING fts5(text, scope UNINDEXED, session UNINDEXED, seq UNINDEXED);
+
+        CREATE TABLE IF NOT EXISTS activation(
+          id TEXT PRIMARY KEY,
+          scope TEXT NOT NULL,
+          node TEXT NOT NULL,
+          query TEXT,
+          at INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS activation_scope ON activation(scope, at);
+
         COMMIT;
       `)
       // Version 1 databases predate the lesson column; CREATE TABLE IF NOT EXISTS cannot add
@@ -213,6 +287,20 @@ export class Store {
   }
 
   bump() { this.db.prepare("UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='epoch'").run() }
+
+  readMeta(key) {
+    return this.db.prepare('SELECT value FROM meta WHERE key=?').get(key)?.value ?? null
+  }
+
+  writeMeta(key, value) {
+    this.db.prepare('INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)').run(key, String(value))
+  }
+
+  /** Newest node of one kind, used to carry a session's last known position forward. */
+  latestNode(scope, kind) {
+    return this.parseNode(this.db.prepare(
+      'SELECT * FROM node WHERE scope=? AND kind=? ORDER BY seen DESC, rowid DESC LIMIT 1').get(scope, kind))
+  }
 
   // -- blobs ---------------------------------------------------------------
 
@@ -504,6 +592,227 @@ export class Store {
     return this.db.prepare(`SELECT c.phase, c.outcome, COUNT(*) n, COALESCE(SUM(c.input_bytes),0) bytes
       FROM call c JOIN episode e ON e.id=c.episode WHERE e.scope=?
       GROUP BY c.phase, c.outcome`).all(scope)
+  }
+
+  // -- memory skeleton -----------------------------------------------------
+
+  /**
+   * Persist extracted nodes and edges. Repeating the same node only raises its support:
+   * recurrence is evidence, but it must never create a second copy of the same claim.
+   */
+  recordNodes(scope, { nodes = [], edges = [] } = {}) {
+    if (!scope || (!nodes.length && !edges.length)) return 0
+    const now = this.now()
+    this.tx(() => {
+      const insert = this.db.prepare(`INSERT INTO node(
+        id,scope,kind,claim,terms,anchor,hash,source,seq,pin,valid_from,valid_to,recorded_at,
+        weight,support,hits,state,created,seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET support=support+1, seen=excluded.seen, claim=excluded.claim`)
+      for (const node of nodes) {
+        const claim = bounded(redactText(String(node.claim ?? '')), 400)
+        insert.run(node.id, scope, String(node.kind), claim, JSON.stringify(termSet(claim)),
+          node.anchor ?? null, node.hash ?? null, node.source ?? null, Number(node.seq) || 0,
+          node.pin ? 1 : 0, now, null, now, 1, 1, 0, 'active', now, now)
+      }
+      const link = this.db.prepare('INSERT OR IGNORE INTO edge(id,scope,src,dst,rel,w,created) VALUES (?,?,?,?,?,?,?)')
+      for (const edge of edges) {
+        if (!edge?.src || !edge?.dst) continue
+        link.run(hash(`${scope}\u0000${edge.src}\u0000${edge.dst}\u0000${edge.rel}`),
+          scope, edge.src, edge.dst, String(edge.rel), Number(edge.w) || 1, now)
+      }
+      this.pruneNodes(scope)
+    })
+    return nodes.length
+  }
+
+  /** Keep the newest unpinned nodes and their surviving edges; pinned nodes never expire. */
+  pruneNodes(scope, limit = 500) {
+    this.db.prepare(`DELETE FROM node WHERE scope=? AND pin=0 AND id NOT IN (
+      SELECT id FROM node WHERE scope=? AND pin=0 ORDER BY seen DESC LIMIT ?)`).run(scope, scope, limit)
+    this.db.prepare(`DELETE FROM edge WHERE scope=? AND (
+      src NOT IN (SELECT id FROM node WHERE scope=?) OR dst NOT IN (SELECT id FROM node WHERE scope=?))`)
+      .run(scope, scope, scope)
+  }
+
+  parseNode(row) {
+    return row ? { ...row, terms: parseJson(row.terms, []) } : null
+  }
+
+  activeNodes(scope, limit = 400) {
+    return this.db.prepare(`SELECT * FROM node WHERE scope=? AND state='active' AND valid_to IS NULL
+      ORDER BY pin DESC, seen DESC LIMIT ?`).all(scope, limit).map(row => this.parseNode(row))
+  }
+
+  nodeRow(id) {
+    return this.parseNode(this.db.prepare('SELECT * FROM node WHERE id=?').get(id))
+  }
+
+  /**
+   * Term-overlap lookup. Deliberately lexical: an embedding would need a model at write time
+   * and would make every recall unauditable.
+   */
+  searchNodes(scope, queryTerms, limit = 12) {
+    const wanted = new Set(queryTerms ?? [])
+    if (!wanted.size) return []
+    return this.activeNodes(scope)
+      .map(node => {
+        const own = new Set(node.terms)
+        let shared = 0
+        for (const term of wanted) if (own.has(term)) shared++
+        return { node, score: shared / Math.max(1, own.size + wanted.size - shared) }
+      })
+      .filter(entry => entry.score > 0)
+      .sort((a, b) => b.score - a.score || b.node.seen - a.node.seen)
+      .slice(0, limit)
+      .map(entry => entry.node)
+  }
+
+  /** One hop out from the given nodes, in either direction. */
+  neighbours(scope, ids) {
+    if (!ids.length) return []
+    const slots = ids.map(() => '?').join(',')
+    const rows = this.db.prepare(`SELECT * FROM edge WHERE scope=? AND (src IN (${slots}) OR dst IN (${slots}))`)
+      .all(scope, ...ids, ...ids)
+    const other = new Set()
+    for (const row of rows) other.add(ids.includes(row.src) ? row.dst : row.src)
+    return [...other]
+      .filter(id => !ids.includes(id))
+      .map(id => this.nodeRow(id))
+      .filter(Boolean)
+  }
+
+  /** Record that a node was surfaced. The log is the Hebbian signal and the GC evidence. */
+  activate(scope, { node, query = null }) {
+    this.db.prepare('INSERT INTO activation VALUES (?,?,?,?,?)').run(id(), scope, node, query, this.now())
+    this.db.prepare('UPDATE node SET hits=hits+1, weight=MIN(3.0, weight+0.1), seen=? WHERE id=?').run(this.now(), node)
+  }
+
+  /** Evidence invalidated by a later state change: withheld from every projection. */
+  markStale(nodeId, reason = null) {
+    this.db.prepare("UPDATE node SET state='stale', valid_to=?, seen=? WHERE id=?").run(this.now(), this.now(), nodeId)
+    return reason
+  }
+
+  memoryStats(scope) {
+    const byKind = Object.fromEntries(this.db.prepare(
+      "SELECT kind, COUNT(*) n FROM node WHERE scope=? AND state='active' GROUP BY kind").all(scope)
+      .map(row => [row.kind, row.n]))
+    const byState = Object.fromEntries(this.db.prepare(
+      'SELECT state, COUNT(*) n FROM node WHERE scope=? GROUP BY state').all(scope)
+      .map(row => [row.state, row.n]))
+    const edges = this.db.prepare('SELECT COUNT(*) n FROM edge WHERE scope=?').get(scope)?.n ?? 0
+    const bytes = this.db.prepare("SELECT COALESCE(SUM(LENGTH(claim)),0) b FROM node WHERE scope=? AND state='active'")
+      .get(scope)?.b ?? 0
+    const pinned = this.db.prepare("SELECT COUNT(*) n FROM node WHERE scope=? AND pin=1 AND state='active'")
+      .get(scope)?.n ?? 0
+    const hits = this.db.prepare('SELECT COUNT(*) n FROM activation WHERE scope=?').get(scope)?.n ?? 0
+    return { byKind, byState, edges, bytes, pinned, activations: hits }
+  }
+
+  // -- knowledge graph -----------------------------------------------------
+
+  /**
+   * Upsert one typed edge, accumulating weight.
+   *
+   * Weight is the point: an edge that keeps firing gets stronger, one that never does decays
+   * away. That is the only mechanism here that makes the graph learn instead of merely record.
+   */
+  link(scope, { src, dst, rel, delta = 0.1, cap = 5, mode = 'add' }) {
+    if (!scope || !src || !dst || src === dst) return null
+    const id = hash(`${scope}\u0000${src}\u0000${dst}\u0000${rel}`)
+    const existing = this.db.prepare('SELECT w FROM edge WHERE id=?').get(id)
+    if (existing) {
+      // Usage accumulates; similarity is a property and only ever takes its best value.
+      if (mode === 'max') this.db.prepare('UPDATE edge SET w=MAX(w, MIN(?, ?)) WHERE id=?').run(cap, delta, id)
+      else this.db.prepare('UPDATE edge SET w=MIN(?, w+?) WHERE id=?').run(cap, delta, id)
+    }
+    else {
+      this.db.prepare('INSERT INTO edge(id,scope,src,dst,rel,w,created) VALUES (?,?,?,?,?,?,?)')
+        .run(id, scope, src, dst, String(rel), Math.min(cap, delta), this.now())
+    }
+    return id
+  }
+
+  /** Every edge touching a node, strongest first. */
+  edgesOf(scope, id) {
+    return this.db.prepare('SELECT * FROM edge WHERE scope=? AND (src=? OR dst=?) ORDER BY w DESC')
+      .all(scope, id, id)
+  }
+
+  /** Decay every edge and drop what has faded below noise. Returns how many were removed. */
+  decayEdges(scope, { factor = 0.97, floor = 0.05 } = {}) {
+    this.db.prepare('UPDATE edge SET w=w*? WHERE scope=?').run(factor, scope)
+    return this.db.prepare('DELETE FROM edge WHERE scope=? AND w < ?').run(scope, floor).changes ?? 0
+  }
+
+  /** Every edge weight in a scope, for callers that score nodes by connectivity. */
+  edgeWeights(scope) {
+    return this.db.prepare('SELECT src, dst, w FROM edge WHERE scope=?').all(scope)
+  }
+
+  graphStats(scope) {
+    const byRel = Object.fromEntries(this.db.prepare(
+      'SELECT rel, COUNT(*) n, ROUND(AVG(w),2) avg FROM edge WHERE scope=? GROUP BY rel').all(scope)
+      .map(row => [row.rel, { n: row.n, avg: row.avg }]))
+    const hubs = this.db.prepare(`SELECT n.id, n.kind, n.claim, COUNT(e.id) degree, ROUND(MAX(e.w),2) peak
+      FROM node n JOIN edge e ON (e.src = n.id OR e.dst = n.id)
+      WHERE n.scope=? GROUP BY n.id ORDER BY degree DESC, peak DESC LIMIT 5`).all(scope)
+    return { edges: this.db.prepare('SELECT COUNT(*) n FROM edge WHERE scope=?').get(scope)?.n ?? 0, byRel, hubs }
+  }
+
+  // -- span index ----------------------------------------------------------
+
+  /**
+   * Store addressable spans, skipping duplicates by content hash.
+   *
+   * De-duplication is not an optimisation here: a long session repeats the same tool output
+   * and the same error dozens of times, and without it those copies crowd the top of every
+   * result list while the rest of the history stays invisible.
+   */
+  putSpans(scope, session, rows) {
+    if (!rows?.length) return 0
+    let added = 0
+    this.tx(() => {
+      const insert = this.db.prepare('INSERT OR IGNORE INTO span(scope,session,seq,kind,hash,text,bytes) VALUES (?,?,?,?,?,?,?)')
+      const index = this.db.prepare('INSERT INTO span_fts(rowid, text, scope, session, seq) VALUES (?,?,?,?,?)')
+      for (const row of rows) {
+        const result = insert.run(scope, session, row.seq, String(row.kind ?? ''), row.hash, row.text, Buffer.byteLength(row.text))
+        if (!result.changes) continue
+        // rowid ties the FTS row to the span row, so a result can carry its session and seq
+        // without a second lookup — and without the seq collision two sessions would cause.
+        index.run(Number(result.lastInsertRowid), row.indexText ?? row.text, scope, session, row.seq)
+        added++
+      }
+    })
+    return added
+  }
+
+  spanWatermark(scope, session) {
+    return this.db.prepare('SELECT watermark FROM span_meta WHERE scope=? AND session=?').get(scope, session)?.watermark ?? -1
+  }
+
+  setSpanWatermark(scope, session, seq) {
+    this.db.prepare(`INSERT INTO span_meta(scope,session,watermark) VALUES (?,?,?)
+      ON CONFLICT(scope,session) DO UPDATE SET watermark=MAX(watermark, excluded.watermark)`).run(scope, session, seq)
+  }
+
+  spanCoverage(scope) {
+    const row = this.db.prepare('SELECT COUNT(*) n, MIN(seq) a, MAX(seq) b, COUNT(DISTINCT session) s FROM span WHERE scope=?').get(scope)
+    return { spans: row?.n ?? 0, from: row?.a ?? null, to: row?.b ?? null, sessions: row?.s ?? 0 }
+  }
+
+  /** Full-text search over stored spans. bm25 is lower-is-better. */
+  searchSpans(scope, match, limit) {
+    return this.db.prepare(`SELECT s.seq, s.session, s.text, bm25(span_fts) score
+      FROM span_fts JOIN span s ON s.id = span_fts.rowid
+      WHERE span_fts MATCH ? AND span_fts.scope=?
+      ORDER BY score LIMIT ?`).all(match, scope, limit)
+  }
+
+  /** Substring fallback for queries the tokenizer cannot express (paths, mixed scripts). */
+  findSpans(scope, needle, limit) {
+    return this.db.prepare('SELECT seq, session, text FROM span WHERE scope=? AND text LIKE ? ORDER BY seq LIMIT ?')
+      .all(scope, `%${String(needle).replaceAll('%', '')}%`, limit)
   }
 
   // -- watch ---------------------------------------------------------------

@@ -22,6 +22,8 @@ export function redact(text) {
     .replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g, '[REDACTED KEY]')
     .replace(/\b(?:sk-|gh[pousr]_|xox[baprs]-|AKIA)[A-Za-z0-9_\-]{12,}/g, '[REDACTED TOKEN]')
     .replace(/((?:api[_-]?key|access[_-]?token|password|passwd|secret|sessdata|authorization|cookie)\s*[=:]\s*)([^\r\n]+)/gi, '$1[REDACTED]')
+    .replace(/(\bBearer\s+)[A-Za-z0-9._~+\/-]+=*/gi, '$1[REDACTED]')
+    .replace(/((?:【(?:会话令牌|访问令牌|会话密钥|密码|密钥)】|(?:会话令牌|访问令牌|会话密钥|密码|密钥)\s*[:：=])\s*)[^\r\n]+/g, '$1[REDACTED]')
     .replace(/(https?:\/\/)[^\s/@:]+:[^\s/@]+@/g, '$1[REDACTED]@')
 }
 
@@ -30,7 +32,7 @@ export function redactData(value) {
   if (typeof value === 'string') return redact(value)
   if (Array.isArray(value)) return value.map(redactData)
   if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [
-    key, /^(?:api[_-]?key|access[_-]?token|password|passwd|secret|sessdata|authorization|cookie)$/i.test(key)
+    key, /^(?:api[_-]?key|access[_-]?token|password|passwd|secret|sessdata|authorization|cookie|会话令牌|访问令牌|会话密钥|密码|密钥)$/i.test(key)
       ? '[REDACTED]' : redactData(item),
   ]))
   return value

@@ -2,8 +2,13 @@ import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { hash, id, day, clean, bounded, redact, redactData, redactText, terms as termSet, sameTask } from './util.js'
+import { segment } from './span-index.js'
 
-export const SCHEMA_VERSION = 6
+export const SCHEMA_VERSION = 8
+
+/** Retention caps for the two append-only tables. Oldest rows go first. */
+export const MAX_SPANS_PER_SCOPE = 20000
+export const MAX_ACTIVATIONS_PER_SCOPE = 20000
 
 const jsonText = value => value === null || value === undefined ? null : bounded(JSON.stringify(redactData(value)), 4000)
 const parseJson = (value, fallback) => {
@@ -24,8 +29,11 @@ const parseJson = (value, fallback) => {
  * - `ledger` is append-only: every adoption must be explainable after the fact.
  */
 export class Store {
-  constructor(path, { now = Date.now } = {}) {
+  constructor(path, { now = Date.now, maxNodes = 500 } = {}) {
     this.now = now
+    // The configured cap, so the automatic prune after every write honours `memory.maxNodes`
+    // instead of a hard-coded 500 that only `/mem prune` could override.
+    this.maxNodes = maxNodes
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
     this.db = new DatabaseSync(path)
     this.db.exec(`PRAGMA busy_timeout=200; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;`)
@@ -234,9 +242,19 @@ export class Store {
       this.db.exec('CREATE INDEX IF NOT EXISTS episode_lesson ON episode(lesson)')
       this.tx(() => {
         if (version < 3) this.scrubObservationData()
+        // v7: spans used to be stored verbatim. Redact them in place rather than dropping the
+        // table, because spans from earlier sessions cannot be re-ingested.
+        if (version < 8) {
+          this.scrubSpans()
+          const update = this.db.prepare('UPDATE node SET claim=?, terms=? WHERE id=?')
+          for (const row of this.db.prepare('SELECT id, claim FROM node').all()) {
+            const claim = redactText(row.claim)
+            if (claim !== row.claim) update.run(claim, JSON.stringify(termSet(claim)), row.id)
+          }
+        }
         this.db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`)
       })
-      if (version < 3) this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+      if (version < 8) this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
     } catch (error) {
       this.db.close()
       throw error
@@ -272,6 +290,20 @@ export class Store {
     for (const row of this.db.prepare('SELECT id,detail,gate FROM ledger').all()) {
       this.db.prepare('UPDATE ledger SET detail=?,gate=? WHERE id=?')
         .run(row.detail === null ? null : redactText(row.detail), row.gate === null ? null : redactText(row.gate), row.id)
+    }
+  }
+
+  /** One-time redaction of spans written before v7. Only rows that actually change are rewritten. */
+  scrubSpans() {
+    const update = this.db.prepare('UPDATE span SET text=?, bytes=? WHERE id=?')
+    const reindex = this.db.prepare('UPDATE span_fts SET text=? WHERE rowid=?')
+    for (const row of this.db.prepare('SELECT id, text FROM span').all()) {
+      const text = redact(row.text)
+      if (text === row.text) continue
+      // The hash column stays as written: it only de-duplicates, and rehashing could collide
+      // two spans that differed only in a secret.
+      update.run(text, Buffer.byteLength(text), row.id)
+      reindex.run(segment(text), row.id)
     }
   }
 
@@ -620,15 +652,44 @@ export class Store {
         link.run(hash(`${scope}\u0000${edge.src}\u0000${edge.dst}\u0000${edge.rel}`),
           scope, edge.src, edge.dst, String(edge.rel), Number(edge.w) || 1, now)
       }
-      this.pruneNodes(scope)
+      this.pruneNodes(scope, this.maxNodes)
     })
     return nodes.length
   }
 
-  /** Keep the newest unpinned nodes and their surviving edges; pinned nodes never expire. */
-  pruneNodes(scope, limit = 500) {
-    this.db.prepare(`DELETE FROM node WHERE scope=? AND pin=0 AND id NOT IN (
-      SELECT id FROM node WHERE scope=? AND pin=0 ORDER BY seen DESC LIMIT ?)`).run(scope, scope, limit)
+  /**
+   * Keep the graph bounded, and prefer to let go of what was already let go of.
+   *
+   * The old rule kept the newest 500 by `seen` and deleted the rest, which is a recency policy
+   * wearing a capacity policy's clothes: a decision that had been reused for weeks lost to a
+   * progress line written thirty seconds ago. Deleting on age is the one thing this project
+   * says it does not do.
+   *
+   * Two stages, and the order is the point:
+   *   1. delete only nodes that were already retired *and* are old. Retirement is the reversible
+   *      step; by the time a node reaches here a person has had a chance to `restore` it.
+   *   2. if that was not enough, fall back to the old recency rule, but never touch a pinned
+   *      node or one that was actually retrieved.
+   *
+   * The second stage keeps the table bounded even on a project that never calls `/mem sleep`.
+   */
+  pruneNodes(scope, limit = this.maxNodes) {
+    // Stage 1: retired and settled. Nothing load-bearing, nothing recently reachable. With the
+    // new switches off there are no retired nodes, so this deletes nothing and the default path
+    // is unchanged.
+    this.db.prepare(`DELETE FROM node WHERE scope=? AND pin=0 AND state='retired'
+      AND seen < ?`).run(scope, this.now() - 30 * 24 * 3600 * 1000)
+    // Stage 2: still over the cap. Oldest-first ranking, but retrieved nodes rank ahead of
+    // equally old ones — the cap is still enforced, because a table that cannot shrink is an
+    // operational bug, not a fairness win. Exempting `hits > 0` entirely (the first attempt)
+    // did exactly that: 30 nodes with a cap of 5 kept 10.
+    const active = this.db.prepare(
+      "SELECT COUNT(*) n FROM node WHERE scope=? AND pin=0 AND state='active'").get(scope)?.n ?? 0
+    if (active > limit) {
+      this.db.prepare(`DELETE FROM node WHERE scope=? AND pin=0 AND state='active' AND id NOT IN (
+        SELECT id FROM node WHERE scope=? AND pin=0 AND state='active'
+        ORDER BY hits DESC, seen DESC LIMIT ?)`).run(scope, scope, limit)
+    }
     this.db.prepare(`DELETE FROM edge WHERE scope=? AND (
       src NOT IN (SELECT id FROM node WHERE scope=?) OR dst NOT IN (SELECT id FROM node WHERE scope=?))`)
       .run(scope, scope, scope)
@@ -638,9 +699,16 @@ export class Store {
     return row ? { ...row, terms: parseJson(row.terms, []) } : null
   }
 
-  activeNodes(scope, limit = 400) {
-    return this.db.prepare(`SELECT * FROM node WHERE scope=? AND state='active' AND valid_to IS NULL
+  activeNodes(scope, limit = 400, { includeSuperseded = false } = {}) {
+    return this.db.prepare(`SELECT * FROM node WHERE scope=? AND state='active'
+      ${includeSuperseded ? '' : 'AND valid_to IS NULL'}
       ORDER BY pin DESC, seen DESC LIMIT ?`).all(scope, limit).map(row => this.parseNode(row))
+  }
+
+  /** Close a node's validity interval. The row stays; only its claim on the present ends. */
+  supersede(nodeId, at = this.now()) {
+    return this.db.prepare('UPDATE node SET valid_to=?, seen=? WHERE id=? AND valid_to IS NULL')
+      .run(at, at, nodeId).changes ?? 0
   }
 
   nodeRow(id) {
@@ -651,10 +719,10 @@ export class Store {
    * Term-overlap lookup. Deliberately lexical: an embedding would need a model at write time
    * and would make every recall unauditable.
    */
-  searchNodes(scope, queryTerms, limit = 12) {
+  searchNodes(scope, queryTerms, limit = 12, { includeSuperseded = false } = {}) {
     const wanted = new Set(queryTerms ?? [])
     if (!wanted.size) return []
-    return this.activeNodes(scope)
+    return this.activeNodes(scope, 400, { includeSuperseded })
       .map(node => {
         const own = new Set(node.terms)
         let shared = 0
@@ -685,6 +753,23 @@ export class Store {
   activate(scope, { node, query = null }) {
     this.db.prepare('INSERT INTO activation VALUES (?,?,?,?,?)').run(id(), scope, node, query, this.now())
     this.db.prepare('UPDATE node SET hits=hits+1, weight=MIN(3.0, weight+0.1), seen=? WHERE id=?').run(this.now(), node)
+    this.pruneActivations(scope)
+  }
+
+  /**
+   * Bound the activation log. Rows for deleted nodes go first — they can no longer move any
+   * score — then the oldest rows past the cap, which contribute least to a power-law sum.
+   */
+  pruneActivations(scope, limit = MAX_ACTIVATIONS_PER_SCOPE) {
+    const n = this.db.prepare('SELECT COUNT(*) n FROM activation WHERE scope=?').get(scope)?.n ?? 0
+    if (n <= limit) return 0
+    let removed = this.db.prepare('DELETE FROM activation WHERE scope=? AND node NOT IN (SELECT id FROM node WHERE scope=?)')
+      .run(scope, scope).changes ?? 0
+    if (n - removed > limit) {
+      removed += this.db.prepare(`DELETE FROM activation WHERE scope=? AND rowid NOT IN (
+        SELECT rowid FROM activation WHERE scope=? ORDER BY at DESC, rowid DESC LIMIT ?)`).run(scope, scope, limit).changes ?? 0
+    }
+    return removed
   }
 
   /** Evidence invalidated by a later state change: withheld from every projection. */
@@ -783,8 +868,22 @@ export class Store {
         index.run(Number(result.lastInsertRowid), row.indexText ?? row.text, scope, session, row.seq)
         added++
       }
+      if (added) this.pruneSpans(scope)
     })
     return added
+  }
+
+  /**
+   * Keep the span index bounded per project. Oldest rows go first (id is insertion order);
+   * watermarks are left alone, so a pruned span is gone for good rather than re-ingested.
+   */
+  pruneSpans(scope, limit = MAX_SPANS_PER_SCOPE) {
+    const n = this.db.prepare('SELECT COUNT(*) n FROM span WHERE scope=?').get(scope)?.n ?? 0
+    if (n <= limit) return 0
+    const cutoff = this.db.prepare('SELECT id FROM span WHERE scope=? ORDER BY id DESC LIMIT 1 OFFSET ?').get(scope, limit)?.id
+    if (cutoff === undefined) return 0
+    this.db.prepare('DELETE FROM span_fts WHERE rowid IN (SELECT id FROM span WHERE scope=? AND id<=?)').run(scope, cutoff)
+    return this.db.prepare('DELETE FROM span WHERE scope=? AND id<=?').run(scope, cutoff).changes ?? 0
   }
 
   spanWatermark(scope, session) {

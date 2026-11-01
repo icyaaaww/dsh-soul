@@ -11,16 +11,17 @@ import { turnCounter } from './src/gate.js'
 import { hostProbe } from './src/host-probe.js'
 import { createHostRunner } from './src/host-runner.js'
 import { projectScope, bounded, boolean, integer, human, textBlocks, fail, sameTask, redact, terms as termSet } from './src/util.js'
-import { MemoryBuffer, capture, projectionText, recall, neighbourhood, consolidate, recordLookup, recordHandoff, view, fileFingerprint } from './src/memory.js'
+import { MemoryBuffer, capture, projectionText, recall, neighbourhood, consolidate, recordLookup, recordHandoff, recordCorrection, mergeDuplicates, view, fileFingerprint, promoteTurn } from './src/memory.js'
+import { memoryView, explain, retire, restore, periphery } from './src/graph-memory.js'
 import { searchSession, expandRange } from './src/session-search.js'
 import { ingest, searchIndex } from './src/span-index.js'
 import { sizeReport, COMPONENTS } from './src/tree.js'
-import { createComponents } from './src/components.js'
+import { createComponents, cwdForAgent } from './src/components.js'
 import { assertVerifier, validationSettings } from './src/validation.js'
 import { runChecks } from './src/probe.js'
 
 export const name = 'dsh-soul'
-export const inject = ['tools', 'systemPrompt', 'commands', 'llm', 'skills']
+export const inject = ['tools', 'systemPrompt', 'commands']
 
 export function settings(input = {}) {
   const profileMatch = fileURLToPath(import.meta.url).replaceAll('\\', '/').match(/\/profiles\/([^/]+)\/node_modules\//)
@@ -28,9 +29,12 @@ export function settings(input = {}) {
   if (!profile) throw new Error('无法确定 profile；请显式配置 profile 或独立 database 路径，拒绝回落到共享库')
   if (!/^[a-zA-Z0-9_-]{1,80}$/.test(profile)) throw new Error('profile 标识无效')
 
-  const enabled = boolean(input.enabled, false, 'enabled')
+  // `enabled` remains the legacy evolution switch; the explicit switch wins.
+  const legacyEnabled = boolean(input.enabled, false, 'enabled')
+  const enabled = boolean(input.evolution?.enabled, legacyEnabled, 'evolution.enabled')
   const config = {
     enabled,
+    evolution: { enabled },
     profile,
     learning: boolean(input.learning, false, 'learning'),
     database: input.database ?? join(process.env.DSH_HOME?.trim() || join(homedir(), '.dsh'), 'dsh-soul', profile, 'evolve.sqlite'),
@@ -51,6 +55,22 @@ export function settings(input = {}) {
       projectionBytes: integer(input.memory?.projectionBytes, 600, 160, 2000, 'memory.projectionBytes'),
       maxNodes: integer(input.memory?.maxNodes, 500, 50, 5000, 'memory.maxNodes'),
       verifyArtifacts: boolean(input.memory?.verifyArtifacts, true, 'memory.verifyArtifacts'),
+      // Off by default, deliberately: it changes what the model sees every turn, and a
+      // scheduling policy that has not been observed on real sessions is a hypothesis, not a
+      // default. Turning it on is one line; turning it off is the same line.
+      dynamics: boolean(input.memory?.dynamics, false, 'memory.dynamics'),
+      // Separate from `dynamics` on purpose. That one reorders the card; this one *writes rows*,
+      // and a write is a different risk from a display change. It also does something the
+      // ordering cannot: extraction is narrow by design, so an error code that lived only in a
+      // tool result never becomes a node, and a shadowed span is then findable only by guessing
+      // its wording. A reference node costs zero card bytes and turns that into a term lookup.
+      promote: boolean(input.memory?.promote, false, 'memory.promote'),
+      // Sleep-time maintenance: merge provably identical nodes and decay unused edges, off the
+      // turn's critical path. Both operations are invisible on the card (duplicates already
+      // render once; edge weights only feed ranking), so this can be on by default — unlike
+      // retirement, which changes what the model sees and stays manual.
+      maintenance: boolean(input.memory?.maintenance, true, 'memory.maintenance'),
+      maintenanceTurns: integer(input.memory?.maintenanceTurns, 20, 5, 500, 'memory.maintenanceTurns'),
     },
   }
   if (config.learning) throw new Error('独立版不提供后台记忆提炼')
@@ -74,7 +94,7 @@ const HELP = `DSH Soul — 真实宿主 harness 演化（单变量编辑 / 真�
 /evolve lint               校验当前树（锚定区、上限、白名单）
 /evolve export [目录]      把当前 harness 导出到项目内供人工审阅
 
-演化默认关闭。开启需在 bundle 中显式配置 enabled: true 与 provider/model。`
+记忆默认开启，演化默认关闭。演化需显式配置 evolution.enabled: true 与 provider/model；旧 enabled 仍作为演化开关。`
 
 /** A stored cluster always carries enough shape to be routed by the same free rule table. */
 const lessonDivergence = lesson => lesson.divergence?.signals?.length ? lesson.divergence : {
@@ -135,11 +155,11 @@ const tools = [
 ]
 
 export function apply(ctx, input = {}) {
-  if (input.enabled === false) return
+  if ((input.evolution?.enabled ?? input.enabled ?? false) === false && input.memory?.enabled === false) return
   const config = settings(input)
-  if (!config.enabled) return
+  if (!config.enabled && !config.memory.enabled) return
 
-  const store = new Store(config.database)
+  const store = new Store(config.database, { maxNodes: config.memory.maxNodes })
   // The compaction backend is a separate plugin; one env var is the whole handshake it needs
   // to weight compression by the knowledge graph instead of by word counts alone.
   if (config.memory.enabled) process.env.DSH_SOUL_DATABASE = config.database
@@ -152,10 +172,42 @@ export function apply(ctx, input = {}) {
   // Sufficiency signal: when the incoming question barely touches the card, the card is not
   // enough and the model must be told so before it answers from imagination.
   const needsLookup = new Map()
+  // The current turn's question, as terms. Feeds the card's cue ranking: a node the question
+  // points at is shown ahead of a node it does not, within its importance band.
+  const cues = new Map()
   // Retrieval budget per turn. Without it the sufficiency hint becomes an open invitation:
   // one question produced twenty lookups, which costs more than the summary it replaced.
   const lookups = new Map()
   const MAX_LOOKUPS_PER_TURN = 3
+  // Idle maintenance bookkeeping: a project is due once `maintenanceTurns` turns have passed
+  // since its last pass. The counter lives in meta so a restart does not restart the clock.
+  const maintenanceDue = new Set()
+  let maintenanceTimer = null
+  const scheduleMaintenance = scope => {
+    if (!config.memory.enabled || !config.memory.maintenance || disposed) return
+    maintenanceDue.add(scope)
+    if (maintenanceTimer) return
+    // `setTimeout` rather than `setImmediate`: the point is to run after the turn the user is
+    // waiting for has anything left to say, and to collapse a burst of turns into one pass.
+    maintenanceTimer = setTimeout(runMaintenance, 0)
+    maintenanceTimer.unref?.()
+  }
+  const runMaintenance = () => {
+    maintenanceTimer = null
+    if (disposed) { maintenanceDue.clear(); return }
+    for (const scope of maintenanceDue) {
+      try {
+        const turns = turnCounter(store, scope).get()
+        const last = Number(store.readMeta(`maintenance:${scope}`) ?? 0)
+        if (turns - last < config.memory.maintenanceTurns) continue
+        const merged = mergeDuplicates(store, scope, { limit: config.memory.maxNodes })
+        const graph = consolidate(store, scope)
+        store.writeMeta(`maintenance:${scope}`, turns)
+        if (merged.length) store.log({ scope, action: 'maintenance_merge', actor: 'system', detail: { merged: merged.length } })
+      } catch { /* maintenance is opportunistic; a failure must not surface as a turn error */ }
+    }
+    maintenanceDue.clear()
+  }
   let disposed = false
   const commandLifetime = new AbortController(), commandJobs = new Set()
   const trackedCommand = fn => input => {
@@ -165,8 +217,8 @@ export function apply(ctx, input = {}) {
     return job
   }
 
-  const llm = typeof ctx.get === 'function' ? ctx.get('llm') : ctx.llm
-  if (!llm?.stream) { store.close(); throw new Error('演化需要宿主的 llm 服务') }
+  const llm = config.enabled ? (typeof ctx.get === 'function' ? ctx.get('llm') : ctx.llm) : null
+  if (config.enabled && !llm?.stream) { store.close(); throw new Error('演化需要宿主的 llm 服务') }
 
   const generate = async ({ system, data, phase, signal, onUsage }) => {
     const text = JSON.stringify(data)
@@ -192,9 +244,9 @@ export function apply(ctx, input = {}) {
   // Capability and clean-worktree checks run before any paid editor call.
   let evolve, components, runner
   try {
+  if (config.enabled) {
   components = createComponents(ctx, { current: scope => evolve?.current(scope), enabled: () => config.injectHarness && !disposed,
     audit: (agent, detail) => store.log({ scope: projectScope(agent.session), action: 'hook', actor: 'runtime', detail }) })
-  const describe = agent => ({ session: agent.session, scope: projectScope({ id: agent.session.id, header: { cwd: components.cwdFor(agent) } }) })
   runner = createHostRunner(ctx, { requestTimeoutMs: config.budget.requestTimeoutMs, components })
   const execute = hostProbe({
         spawn: runner.spawn, capability: runner.capability,
@@ -215,6 +267,10 @@ export function apply(ctx, input = {}) {
     return runner.spawn({ ...input, delegation: true, provider: config.provider, model: config.model,
       reasoningEffort: config.reasoningEffort, maxSteps: config.budget.probeSteps, reserve })
   })
+  } else {
+    components = { cwdFor: agent => cwdForAgent(ctx, agent) }
+  }
+  const describe = agent => ({ session: agent.session, scope: projectScope({ id: agent.session.id, header: { cwd: components.cwdFor(agent) } }) })
   const safe = fn => (...args) => { try { return fn(...args) } catch { /* observation must never break a turn */ } }
   const listen = (event, handler) => disposers.push(ctx.on(event, handler))
 
@@ -238,12 +294,13 @@ export function apply(ctx, input = {}) {
             // anything the card already says?". Below the threshold the model is about to
             // answer from a card that cannot contain the answer.
             const { scope } = describe(payload.agent)
-            const card = projectionText(store, scope, config.memory.projectionBytes, { sessionId: String(payload.agent.session.id) })
+            const card = projectionText(store, scope, config.memory.projectionBytes, { sessionId: String(payload.agent.session.id), dynamics: config.memory.dynamics, promote: config.memory.promote })
             const wanted = new Set(termSet(text))
             const have = new Set(termSet(card))
             let shared = 0
             for (const term of wanted) if (have.has(term)) shared++
             needsLookup.set(sid, card.length > 32 && wanted.size > 0 && shared / wanted.size < 0.2)
+            cues.set(sid, [...wanted])
             lookups.delete(sid)
           }
           const correction = !!previous?.intent && isCorrection(text)
@@ -251,14 +308,17 @@ export function apply(ctx, input = {}) {
           lastTurn.set(sid, { intent: bounded(intent, 2000) })
           if (!recorder.get(sid)) {
             const state = recorder.start(sid, { scope: describe(payload.agent).scope, turn: Date.now(), intent })
-            state.revision = evolve.current(state.scope)?.rev
+            state.revision = evolve?.current(state.scope)?.rev
           }
           if (correction) {
             recorder.markCorrection(sid)
             const state = recorder.get(sid)
             state.text = bounded(`${intent}\n用户纠正：${text}`, 2000)
             // The correction refers to the preceding task, even when its wording differs.
-            evolve.observe({ scope: state.scope, taskKey: state.taskKey, taskTerms: state.terms, corrections: 1, toolErrors: 0, complete: true })
+            evolve?.observe({ scope: state.scope, taskKey: state.taskKey, taskTerms: state.terms, corrections: 1, toolErrors: 0, complete: true })
+            // And it is a memory, not only an evolution signal: the one thing the user stopped
+            // to correct is the one thing that must survive the next compaction.
+            if (config.memory.enabled) safe(() => recordCorrection(store, state.scope, { text, intent, seq: 0 }))()
           }
         }
       })()
@@ -274,6 +334,8 @@ export function apply(ctx, input = {}) {
         const state = recorder.end(sid)
         if (state) {
           turnCounter(store, state.scope).bump()
+          scheduleMaintenance(state.scope)
+          if (evolve) {
           const divergence = divergenceOf(state)
           recent.set(sid, { state, divergence })
           if (divergence) {
@@ -306,6 +368,7 @@ export function apply(ctx, input = {}) {
             store.log({ scope: state.scope, action: 'lesson_candidate', actor: 'observe',
               detail: { lesson: lesson.id, kind: lesson.kind, support: lesson.support } })
           }
+          }
         }
         // Compile the finished turn into the skeleton. Free, local, and outside the prompt:
         // the model never sees an experience until the projection decides it is worth bytes.
@@ -315,6 +378,10 @@ export function apply(ctx, input = {}) {
           if (events.length) safe(() => capture(store, state.scope, events, {
             hashOf: config.memory.verifyArtifacts && cwd ? path => fileFingerprint(cwd, path) : null,
           }))()
+          // Then, and only then, close the coverage gap: whatever extraction did not turn into a
+          // node gets a reference pointer, because a shadowed span with no node behind it is
+          // findable only by guessing its wording. Zero checkpoint bytes; a handful of rows.
+          if (events.length && config.memory.promote) safe(() => promoteTurn(store, state.scope, events))()
           // Keep the addressable index current at turn end rather than on first lookup:
           // otherwise the card cannot say how far back it reaches until after a search.
           safe(() => ingest(store, state.scope, session))()
@@ -331,13 +398,13 @@ export function apply(ctx, input = {}) {
     listen('agent/disposed', safe(({ agent }) => {
       const sid = String(agent.session.id)
       recorder.turns.delete(sid); lastTurn.delete(sid); recent.delete(sid)
-      memory.clear(sid); cwdBySession.delete(sid)
+      memory.clear(sid); cwdBySession.delete(sid); cues.delete(sid); needsLookup.delete(sid); lookups.delete(sid)
     }))
 
     // ---- harness injection ------------------------------------------------
     // Only the four every-call components are injected, and each is its own context so a
     // stable component keeps its cache prefix while the volatile one changes.
-    if (config.injectHarness) {
+    if (config.enabled && config.injectHarness) {
       for (const [key, spec, order] of [['C1', COMPONENTS.C1, 900], ['C2', COMPONENTS.C2, 910], ['C4', COMPONENTS.C4, 920], ['C3', COMPONENTS.C3, 950]]) {
         disposers.push(ctx.systemPrompt.context({
           name: `dsh-soul:${key}`, order, interpolate: false,
@@ -351,6 +418,7 @@ export function apply(ctx, input = {}) {
           },
         }))
       }
+    }
       // The skeleton sits between C4 and C3: recomputed every call, never written into
       // history, so compaction cannot erase it. Empty while the graph is empty, which is why
       // it costs nothing on a fresh project.
@@ -363,7 +431,7 @@ export function apply(ctx, input = {}) {
             if (!cwd) return ''
             try {
               const scope = projectScope({ id: agent.session.id, header: { cwd } })
-              const card = projectionText(store, scope, config.memory.projectionBytes, { sessionId: String(agent.session.id) })
+              const card = projectionText(store, scope, config.memory.projectionBytes, { sessionId: String(agent.session.id), dynamics: config.memory.dynamics, promote: config.memory.promote, cues: cues.get(String(agent.session.id)) ?? null })
               if (!card) return ''
               return needsLookup.get(String(agent.session.id))
                 ? `${card}\n[提示] 本轮问题与卡片重合很低：先 soul_recall 查原文（本轮最多 3 次），再回答，不要凭印象。`
@@ -372,10 +440,10 @@ export function apply(ctx, input = {}) {
           },
         }))
       }
-    }
 
     // ---- tools ------------------------------------------------------------
     for (const definition of tools) {
+      if (definition.name.startsWith('soul_') ? !config.memory.enabled : !config.enabled) continue
       disposers.push(ctx.tools.register({
         name: definition.name, description: definition.description, output,
         parameters: { type: 'object', properties: definition.properties, required: definition.required, additionalProperties: false },
@@ -385,7 +453,7 @@ export function apply(ctx, input = {}) {
           for (const key of Object.keys(args ?? {})) if (!(key in definition.properties)) throw new Error('不支持的参数')
           for (const key of definition.required) if (typeof args?.[key] !== 'string') throw new Error(`缺少参数 ${key}`)
           const { session, scope } = describe(exec.agent)
-          const current = evolve.current(scope)
+          const current = evolve?.current(scope)
           let value
           if (definition.name === 'evolve_status') value = { ...evolve.status(scope), hostProbe: runner.capability(session && exec.agent) }
           else if (definition.name === 'evolve_tree') value = current ? sizeReport(current.files) : sizeReport(readDefaults())
@@ -402,7 +470,10 @@ export function apply(ctx, input = {}) {
                 // One tool, two layers. Asking the model to choose between "graph" and "raw
                 // text" made it alternate between them and give up; the layers are an
                 // implementation detail, so the tool always consults both.
-                const graph = recall(store, scope, args.query, { limit: 6 })
+                const graph = recall(store, scope, args.query, {
+                  limit: 6,
+                  dynamicsView: config.memory.dynamics ? memoryView(store, scope, { now: Date.now() }) : null,
+                })
                 let spans = []
                 let indexed = null
                 if (graph.hits.length < 2) {
@@ -475,6 +546,10 @@ export function apply(ctx, input = {}) {
           signal?.throwIfAborted()
           const text = String(rawInput ?? '').trim()
           const [verb = 'status', ...args] = text.split(/\s+/)
+          if (!config.enabled) return {
+            kind: ['status', 'help'].includes(verb) ? 'success' : 'error',
+            text: '演化已关闭；记忆可独立运行。启用演化请配置 evolution.enabled: true、provider 和 model。',
+          }
           const { scope } = describe(agent)
           const cwd = components.cwdFor(agent)
           if (cwd) {
@@ -483,7 +558,7 @@ export function apply(ctx, input = {}) {
           if (verb === 'help') return { kind: 'success', text: HELP }
           if (verb === 'status') return { kind: 'success', text: JSON.stringify({ ...evolve.status(scope), hostProbe: runner.capability(agent) }, null, 2) }
           if (verb === 'tree') {
-            const current = evolve.current(scope)
+            const current = evolve?.current(scope)
             const report = sizeReport(current?.files ?? readDefaults())
             return { kind: 'success', text: JSON.stringify(report, null, 2) }
           }
@@ -547,7 +622,7 @@ export function apply(ctx, input = {}) {
           }
           if (verb === 'verify') {
             const observation = recent.get(String(agent.session.id))?.state
-            const current = evolve.current(scope)
+            const current = evolve?.current(scope)
             const window = store.openWatches(scope).find(w => w.rev === current?.rev)
             if (!window || !observation || observation.revision !== window.rev ||
               !sameTask({ taskKey: window.task_key, terms: window.baseline?.taskTerms },
@@ -603,14 +678,14 @@ export function apply(ctx, input = {}) {
             return { kind: result.ok ? 'success' : 'error', text: JSON.stringify(result, null, 2) }
           }
           if (verb === 'lint') {
-            const current = evolve.current(scope)
+            const current = evolve?.current(scope)
             const { checkStructure } = await import('./src/gate.js')
             const files = current?.files ?? readDefaults()
             const result = checkStructure({ target: 'C1', base: files, next: files, allowUnchanged: true })
             return { kind: 'success', text: JSON.stringify({ ok: result.ok, violations: result.violations, tax: result.tax }, null, 2) }
           }
           if (verb === 'export') {
-            const current = evolve.current(scope)
+            const current = evolve?.current(scope)
             const target = args[0] ?? '.dsh-soul/export'
             if (!cwd) return { kind: 'error', text: '需要项目工作目录。' }
             const { installTree } = await import('./src/probe.js')
@@ -625,9 +700,9 @@ export function apply(ctx, input = {}) {
     }))
 
     // ---- memory command ---------------------------------------------------
-    disposers.push(ctx.commands.register({
+    if (config.memory.enabled) disposers.push(ctx.commands.register({
       name: 'mem', description: '查看与维护记忆骨架（不调用模型）',
-      input: { hint: 'show / stats / recall <关键词> / prune' }, recordInput: false,
+      input: { hint: 'show / stats / dynamics / recall <关键词> / sleep / restore <id> / prune' }, recordInput: false,
       handler: trackedCommand(async ({ agent, rawInput, signal }) => {
         try {
           signal?.throwIfAborted()
@@ -635,13 +710,15 @@ export function apply(ctx, input = {}) {
           const { scope } = describe(agent)
           if (verb === 'stats') return { kind: 'success', text: JSON.stringify({ ...store.memoryStats(scope), graph: store.graphStats(scope) }, null, 2) }
           if (verb === 'show') {
-            const card = projectionText(store, scope, config.memory.projectionBytes, { sessionId: String(agent.session.id) })
+            const card = projectionText(store, scope, config.memory.projectionBytes, { sessionId: String(agent.session.id), dynamics: config.memory.dynamics, promote: config.memory.promote })
             return { kind: 'success', text: card || '记忆骨架为空：完成一轮任务后才会生成节点。' }
           }
           if (verb === 'recall') {
             const query = args.join(' ').trim()
             if (!query) return { kind: 'error', text: '用法：/mem recall <关键词>' }
-            return { kind: 'success', text: JSON.stringify(recall(store, scope, query), null, 2) }
+            return { kind: 'success', text: JSON.stringify(recall(store, scope, query, {
+              dynamicsView: config.memory.dynamics ? memoryView(store, scope, { now: Date.now() }) : null,
+            }), null, 2) }
           }
           if (verb === 'graph') {
             const query = args.join(' ').trim()
@@ -654,12 +731,43 @@ export function apply(ctx, input = {}) {
               graph: store.graphStats(scope),
             }, null, 2) }
           }
-          if (verb === 'sleep') return { kind: 'success', text: JSON.stringify(consolidate(store, scope), null, 2) }
+          if (verb === 'dynamics') {
+            // The ledger. A score nobody can inspect is a rumour, and this one decides what the
+            // model sees every turn.
+            const built = memoryView(store, scope, { now: Date.now() })
+            const order = explain(built, [...built.byId.keys()], { limit: 20 })
+            return { kind: 'success', text: JSON.stringify({
+              clock: new Date(built.at).toISOString(),
+              switch: config.memory.dynamics ? 'on' : 'off',
+              sizes: built.sizes,
+              q25: Number(built.q25.toFixed(4)),
+              nodes: order,
+              retireCandidates: periphery(built).map(entry => entry.id),
+            }, null, 2) }
+          }
+          if (verb === 'sleep') {
+            // Decay the associations, and — only when the dynamics layer is on — retire what is
+            // left with nothing holding it up. Retirement is reversible; deleting is not, so
+            // `prune` stays a separate verb. Gated because an upgrade that changes nothing must
+            // not start hiding nodes behind an unchanged command.
+            // Merge identical claims first: a duplicate pair is two half-connected copies of one
+            // memory, and consolidating around that keeps both halves weak.
+            const merged = mergeDuplicates(store, scope, { limit: config.memory.maxNodes })
+            const graph = consolidate(store, scope)
+            const retired = config.memory.dynamics
+              ? retire(store, scope, memoryView(store, scope, { now: Date.now() }))
+              : []
+            return { kind: 'success', text: JSON.stringify({ ...graph, merged: merged.length, retired }, null, 2) }
+          }
+          if (verb === 'restore') {
+            if (!args.length) return { kind: 'error', text: '用法：/mem restore <节点 id…>' }
+            return { kind: 'success', text: JSON.stringify({ restored: restore(store, args) }, null, 2) }
+          }
           if (verb === 'prune') {
             store.pruneNodes(scope, config.memory.maxNodes)
             return { kind: 'success', text: JSON.stringify({ ...store.memoryStats(scope), graph: store.graphStats(scope) }, null, 2) }
           }
-          return { kind: 'error', text: '未知子命令：show / stats / graph / recall / sleep / prune' }
+          return { kind: 'error', text: '未知子命令：show / stats / dynamics / graph / recall / sleep / restore / prune' }
         } catch (error) {
           return { kind: 'error', text: bounded(error?.message ?? '执行失败', 500) }
         }
@@ -669,19 +777,21 @@ export function apply(ctx, input = {}) {
     const stop = async () => {
       if (disposed) return
       disposed = true
+      if (maintenanceTimer) { clearTimeout(maintenanceTimer); maintenanceTimer = null }
+      maintenanceDue.clear()
       commandLifetime.abort(fail('plugin_stopped'))
       for (const dispose of disposers.reverse()) if (typeof dispose === 'function') dispose()
-      await evolve.stop()
+      await evolve?.stop()
       await Promise.allSettled([...commandJobs])
-      await runner.stop()
-      await components.stop()
+      await runner?.stop()
+      await components.stop?.()
       store.close()
     }
     return Object.assign(stop, { store, evolve, stop, config, recorder, recent, components })
   } catch (error) {
     for (const dispose of disposers.reverse()) if (typeof dispose === 'function') dispose()
     runner?.stop()
-    components?.stop()
+    components?.stop?.()
     store.close()
     throw error
   }

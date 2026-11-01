@@ -115,3 +115,50 @@ test('the index survives reopening the database', () => {
     assert.equal(after, 1, 'opening the database must not wipe the derived index')
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
+
+test('spans are redacted before they reach disk', () => {
+  const store = new Store(':memory:')
+  try {
+    const secret = 'sk-' + 'A'.repeat(24)
+    ingest(store, 'p', fakeSession([user(`token 是 ${secret}，部署到 staging`), user('api_key=hunter2hunter2')]))
+    const raw = JSON.stringify(store.db.prepare('SELECT text FROM span').all()) +
+      JSON.stringify(store.db.prepare('SELECT text FROM span_fts').all())
+    assert.equal(raw.includes(secret), false)
+    assert.equal(raw.includes('hunter2hunter2'), false)
+    assert.equal(searchIndex(store, 'p', 'staging').spans.length, 1, 'the rest of the span stays searchable')
+  } finally { store.close() }
+})
+
+test('migrating a v6 database redacts spans already on disk', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'soul-index-'))
+  const path = join(dir, 'index.sqlite')
+  const secret = 'ghp_' + 'B'.repeat(24)
+  try {
+    const first = new Store(path)
+    first.putSpans('p', 's', [{ seq: 0, kind: 'user/message', hash: 'h0', text: `推送用 ${secret}`, indexText: `推送用 ${secret}` }])
+    first.db.exec('PRAGMA user_version=6')
+    first.close()
+
+    const second = new Store(path)
+    try {
+      const text = second.db.prepare('SELECT text FROM span').get().text
+      const indexed = second.db.prepare('SELECT text FROM span_fts').get().text
+      assert.equal(text.includes(secret), false)
+      assert.equal(indexed.includes(secret), false)
+      assert.equal(second.spanCoverage('p').spans, 1, 'migration must redact in place, not drop')
+    } finally { second.close() }
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('the span index is bounded per project, oldest first', () => {
+  const store = new Store(':memory:')
+  try {
+    const rows = Array.from({ length: 12 }, (_, seq) => ({ seq, kind: 'user/message', hash: `h${seq}`, text: `span ${seq}` }))
+    store.putSpans('p', 's', rows.slice(0, 6))
+    store.putSpans('q', 's', rows.slice(0, 3))
+    store.pruneSpans('p', 4)
+    assert.deepEqual(store.db.prepare("SELECT seq FROM span WHERE scope='p' ORDER BY seq").all().map(r => r.seq), [2, 3, 4, 5])
+    assert.equal(store.db.prepare("SELECT COUNT(*) n FROM span_fts WHERE scope='p'").get().n, 4, 'FTS rows go with their spans')
+    assert.equal(store.spanCoverage('q').spans, 3, 'other projects are untouched')
+  } finally { store.close() }
+})

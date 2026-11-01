@@ -1,6 +1,6 @@
 {
   "name": "dsh-soul",
-  "version": "1.5.0",
+  "version": "2.0.0",
   "description": "Memory skeleton and graph compaction for DSH: recover what compression removed",
   "license": "MIT",
   "repository": {
@@ -45,6 +45,13 @@
     "check": "node --check index.js && npm test",
     "demo": "node scripts/demo.mjs",
     "bench": "node bench/compaction-loss.mjs",
+    "bench:memory": "node bench/memory-dynamics.mjs",
+    "bench:graph": "node bench/graph-memory.mjs",
+    "bench:continuation": "node bench/continuation.mjs",
+    "bench:consolidation": "node bench/consolidation.mjs",
+    "test:dynamics": "node --test tests/dynamics.test.mjs",
+    "test:graph": "node --test tests/graph-memory.test.mjs",
+    "test:projection": "node --test tests/projection.test.mjs tests/mem-command.test.mjs",
     "demo:memory": "node scripts/memory-demo.mjs",
     "demo:compaction": "node scripts/compaction-demo.mjs",
     "test:host": "node scripts/test-host.mjs",
@@ -54,5 +61,13 @@
     "dsh-plugin",
     "deepseek-harness",
     "evolution"
-  ]
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/dsh-compaction-basic": ">=0.2.1-rc.2 <0.3.0-0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-compaction-basic": {
+      "optional": true
+    }
+  }
 }

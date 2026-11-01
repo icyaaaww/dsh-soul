@@ -6,7 +6,7 @@ import { budgetFor, skeletonSummarize } from '../src/compaction.js'
  * No model is called anywhere in this file.
  */
 
-const user = text => ({ role: 'user', content: [{ type: 'text', text }] })
+const user = text => ({ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] })
 const say = (text, calls = []) => ({ role: 'assistant', content: [{ type: 'text', text }, ...calls] })
 const write = path => ({ type: 'tool-call', name: 'write', input: { path } })
 const result = text => ({ role: 'user', content: [{ type: 'tool-result', content: [{ type: 'text', text }] }] })

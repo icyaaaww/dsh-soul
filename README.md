@@ -1,6 +1,6 @@
-# DSH Soul 1.6.0 — 经验编译 + 图压缩
+# DSH Soul 2.0.0 — 独立记忆、图压缩与受控演化
 
-从真实任务的分歧中精炼运行策略。保留独立 Evolve 架构，不包含旧 Soul 的记忆检索、后台学习或固定答案套件。
+记住会话中的约束、决策和产物，用图目录压缩上下文，并在显式启动后通过成对验证改进运行策略。记忆与演化独立开关，不修改模型权重，不运行按关键词触发的后台付费演化。
 
 1.5 增加记忆骨架：会话被编译成一张小图（约束/决策/产物/进度），每轮投影 600 字节进系统提示。投影不写进历史，所以压缩擦不到它；细节留在库里，用 `soul_recall` 按需回捞。1.6 把同一张图接成压缩后端：压缩不再由模型写摘要，改由图选子集。
 
@@ -8,18 +8,33 @@
 
 ## 安装与配置
 
-需要 Node.js 24+、Git、DSH 0.2.1-rc.2 起的 0.2.x，以及本地 spawn、skills、tools、systemPrompt、commands、llm 服务。实际接口测试覆盖 0.2.1-rc.2；0.2.0-rc.2 缺少 startActivation，不能探测。后续宿主版本仍需能力检查。
+需要 Node.js 24+、DSH 0.2.1-rc.2 起的兼容 0.2.x。记忆模式依赖 tools、systemPrompt、commands；开启演化还需要 Git、可用模型路由，以及支持相关组件的 llm、skills 与本地 spawn 服务。实际接口测试覆盖 0.2.1-rc.2；0.2.0-rc.2 不在支持范围。后续宿主版本仍需能力检查。
 
 ~~~powershell
-dsh plugin --profile tui add "C:\path\dsh-soul-1.0.0.tgz"
+dsh plugin --profile tui add "C:\path\dsh-soul-2.0.0.tgz"
 ~~~
 
-插件默认关闭。在 profile 的用户 patch 中配置已有节点，provider/model 使用宿主已注册的路由：
+记忆默认开启，演化默认关闭。只使用记忆骨架、投影和回捞时，不需要为 Soul 配置 provider/model，也不要求 llm 或 skills 服务；不会创建演化执行器、调用编辑模型或注入 C1–C8。
+
+只开记忆的配置（profile 使用你实际的 profile 名称）：
 
 ~~~yaml
 - id: dsh-soul
   config:
-    enabled: true
+    profile: tui
+    memory:
+      enabled: true
+    evolution:
+      enabled: false
+~~~
+
+`memory.enabled` 控制记忆，`evolution.enabled` 控制演化。旧的顶层 `enabled` 继续作为演化开关的别名；显式 `evolution.enabled` 优先。旧配置只有 `enabled: false` 时，现在仍会开启默认记忆；若要完全停用，两个开关都设为 false。`injectHarness: false` 只关闭演化组件注入，不关闭记忆投影。开启演化后，provider/model 使用宿主已注册的路由：
+
+~~~yaml
+- id: dsh-soul
+  config:
+    evolution:
+      enabled: true
     profile: tui
     provider: your-provider
     model: your-model
@@ -113,6 +128,40 @@ export function run(event) {
 
 **回捞**是显式的，一个工具两层次：`soul_recall` 先查节点图（约束/决策/产物）及其一跳邻居，命中不足时自动翻会话原文（含历史会话），返回里用 `source` 标明来源是 `node` 还是 `span`。每次回捞写一条 `activation`，既是边权来源，也是垃圾节点的判据；命中原文时还会回写成 `reference` 指针，同一个问题第二次就是卡片命中。
 
+### 记忆的时效与整理（1.17）
+
+**作废而不是堆积。** 用户先说「必须用 npm」，后说「改用 pnpm」——以前两条都会以 `pin=1` 永久挂在卡片上。现在写入时会检测「替换式表述 + 同一对象」，给旧节点写 `valid_to` 并连一条 `supersedes` 边。旧节点退出卡片，但仍可被 `soul_recall` 查到，返回里带 `supersededAt`：**「这条已被取代」是答案，沉默不是**。判断刻意保守，只在同一个 kind 内作废且要求共享标识符或两个稀有词——错误的作废会藏住一条有效约束，比显示一条过时的更糟。
+
+**卡片跟着问题变。** `memory.dynamics` 打开时，排序在 `importance × due(A)` 之外再乘一个线索因子，线索是本轮用户消息的词项。权重按 fan effect 除以共享该词的节点数，和 IDF 同一个道理，所以「src」这类词抬不起任何东西。系数有界，线索只能在重要性带内调整。
+
+**回捞是扩散的。** `recall` 以词面命中为种子，在项目图上做 3 轮带重启的扩散，`supersedes` 边不参与（被取代的声明不是关联）。一跳之外仍有足够质量的节点会作为候选返回，带 `reach` 字段。
+
+**空闲整理（`memory.maintenance`，默认开）。** 每 `maintenanceTurns`（默认 20）轮在定时器里跑一次「合并完全相同的节点 + 边衰减」。不占对话等待时间、不调模型、不做卡片上看不见之外的任何事。副本取自连边最多的那个，被吸收者的边重新指向、支持度相加、然后退役而非删除。
+
+| 配置 | 默认 | 作用 |
+|---|---|---|
+| `memory.maintenance` | `true` | 空闲整理开关 |
+| `memory.maintenanceTurns` | `20` | 两次整理之间至少间隔多少轮 |
+| `memory.maxNodes` | `500` | 自动剪枝与合并的上限 |
+
+### 记忆动力学（`memory.dynamics`，默认关）
+
+关着的时候卡片按"最新优先"排：`pin → kind → seq DESC`。打开之后卡片变成**复习排期**——三个正交信号各用一次，不合成一个数：
+
+| 信号 | 回答什么 | 用在哪 |
+|---|---|---|
+| 激活 `A = ln Σ(t−tⱼ)^−d` | 现在问起来答得出来吗 | 排序主项 + 退役门槛 |
+| 度数 / coreness | 还有东西连着它吗 | 退役门槛（coreness 只做解释） |
+| `kind` / `pin` | 错了会不会出事 | 排序上限 + 退役否决 |
+
+强度不是存下来的，是读时从已有的 `activation` 表算出来的，所以**没有迁移**。读路径成本 3.7 ms（500 节点 / 896 边），其中 1.2 ms 是原本就要付的扫描。
+
+`/mem dynamics` 打印账本（A / deg / core / importance / 去向），`/mem sleep` 先衰减边再退役"没人连、没人用、没有重要性"的节点，`/mem restore <id>` 把它拉回来——**退役只改可见性，从不删行**。
+
+时钟量化到 5 分钟桶：同一桶内卡片逐字节相同（prompt cache 前缀不碎），跨桶才轮转。
+
+实测（500 节点 / 60 轮 / 600 字节）：关键节点落入低四分位 14/65 → **0/65**，覆盖到的不同节点 10 → **57**，琐碎节点反而衰减得更多。默认关，因为一个没在真实会话里观察过的排期策略是假设，不是默认值。
+
 `/mem show | stats | recall <关键词> | prune` 全部本地，零调用。
 
 实测（`npm run bench`，300 个场景，历史 7 KB）：预算 1200 字节时，细节保留 **25.5% → 83.4%**，约束 **0% → 100%**，损失率 **74.5% → 16.6%**。方法与局限见 [docs/SKELETON-BENCH.md](docs/SKELETON-BENCH.md)——包括 2400 字节时均匀采样反超骨架这件事。
@@ -160,7 +209,7 @@ async summarize(input, agent, signal)   // 决定用什么文本替换被压掉�
 - 引擎**不读** soul 的库，而是从被压缩的消息重新抽取。这样它不依赖数据库是否可用，代价是压缩时重算一遍图。共享库是后续优化。
 - 卡片比摘要长。跨度极大时会触及基础后端的重试上限而报错，所以预算按比例而不是固定值。`/compact` 手动压缩同样走这条路径。
 - **跨度小于 1200 bytes 时直接拒绝压缩。** checkpoint 的固定框架（"这一段是自动生成的摘要……"）由宿主添加，跨度本身比框架还小时，任何后端都只能让它变大；宿主会以"summary is not smaller"拒绝提交。宁可报错，也不提交一个变大的 checkpoint。
-- 需要宿主提供 `@deepseek-ai/dsh-compaction-basic`；缺失时该入口在加载期直接报错，不影响主插件。
+- 需要宿主提供 `@deepseek-ai/dsh-compaction-basic`。入口在挂载时使用 DSH 的包解析表选择后端；普通导入不会立即加载宿主依赖，缺少依赖或接口时在挂载时明确报错。通过 DSH profile 使用无需另装一套宿主；自建宿主需要自行提供与宿主同版本的后端。
 
 真实宿主实测（DSH 0.2.0-rc.2，Cordis + AgentLoop + TokenMeter + 官方后端）：
 
@@ -262,3 +311,7 @@ npm run test:host
 ~~~
 
 宿主测试使用真实 Cordis、AgentLoop、技能服务、工具执行链和 spawn，只在模型供应商边界使用确定性响应，不调用付费 API。离线 demo 的编辑器和执行器都是替身。测试证明实现路径和拒绝条件，不证明真实模型在未知项目上的提升。1.0 新增经验分类、聚类、contrast、编译/退役/回滚、报告与 schema 迁移测试；完整结果见 docs/VALIDATION-1.0.0.md。
+
+## 2.0 兼容与开关说明
+
+记忆与演化开关拆分，默认不启动付费演化；压缩入口改为挂载时解析当前宿主依赖。图压缩仍需手动替换默认压缩后端，不由记忆开关自动切换。`npm run test:host` 现在覆盖演化、正式压缩入口及无 Soul 模型路由的记忆模式。宿主集成使用确定性测试适配器，不代表真实模型的任务效果。

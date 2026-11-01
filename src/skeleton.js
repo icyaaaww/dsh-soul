@@ -1,4 +1,8 @@
-import { bounded, bytes as sizeOf, terms as termSet, hash } from './util.js'
+import { bounded, bytes as sizeOf, terms as termSet, hash, redact } from './util.js'
+// One-way: consolidation reads the memory model and the store, never this module. Keeping the
+// arrow pointing this way is what lets `compact()` stay a pure function of its inputs — the
+// caller passes a profile in, so the same span and the same profile always render the same bytes.
+import { nodeBudgetRatio as memoryRatio, lossRisk, shadowRisk } from './consolidation.js'
 
 /**
  * Skeleton: deterministic extraction + graph selection for compressed context.
@@ -19,7 +23,7 @@ export const EDGE_RELS = Object.freeze(['derived', 'supersedes', 'depends', 'sup
 
 // A standing instruction, not a question or a correction of past work. Kept narrow: a false
 // positive pins unrelated prose into every projection, which is worse than missing one.
-const CONSTRAINT = /(?:不要|不能|别|禁止|必须|只能|只准|不许|务必|记得|don't|do not|never|must|only|always)/i
+const CONSTRAINT = /(?:不要|不能|(?<![分区告类级识特个性差离辨鉴判甄诀永送拜惜临])别|禁止|必须|只能|只准|不许|务必|记得|(?<![\w-])(?:don't|do not|never|must|only|always)\b)/i
 const DECISION = /(?:因为|所以|因此|决定|改成|改用|走.{0,12}而不是|instead of|because)/i
 const WRITE_TOOL = /^(?:write|edit|apply_patch|create|multiedit|str_replace|insert)$/i
 const PATH_IN_TEXT = /(?:^|[\s`'"(])((?:[\w.@-]+\/){1,}[\w.@-]+\.[a-z0-9]{1,8})\b/gi
@@ -36,7 +40,7 @@ const MAX_EXCERPT = 400
  * see that the whole path is unique, unguessable, and the first thing a summary drops.
  */
 const IDENTIFIER = /[A-Za-z]:\\[^\s"'`,;)\]]+|\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+|--[a-z0-9][a-z0-9-]*/g
-const identifierTerms = text => {
+export const identifierTerms = text => {
   const set = new Set()
   for (const match of String(text ?? '').matchAll(IDENTIFIER)) {
     set.add(match[0].toLowerCase().replaceAll('\\', '/'))
@@ -87,7 +91,7 @@ export function normalize(events = []) {
       // They are content, but they are not the human, and treating them as standing instructions
       // turns a paragraph of boilerplate into a pinned constraint.
       const source = event?.data?.source ?? event?.data?.message?.source ?? null
-      if (text) push({ seq, kind: 'user', sourceKind: source?.kind ?? 'user', text })
+      if (text) push({ seq, kind: 'user', sourceKind: source?.kind ?? 'unknown', text })
       continue
     }
     if (type === 'assistant/message' || type === 'assistant') {
@@ -160,9 +164,7 @@ function firstMeaningful(text) {
 
 // Extraction stores de-identified text only; the store layer already does this on write, but
 // nodes are built before persistence here, so repeat the cheap denylist.
-const redactLocal = text => String(text ?? '')
-  .replace(/\b(?:sk-|gh[pousr]_|xox[baprs]-|AKIA)[A-Za-z0-9_-]{12,}/g, '[REDACTED]')
-  .replace(/((?:api[_-]?key|access[_-]?token|password|passwd|secret)\s*[=:]\s*)([^\s]+)/gi, '$1[REDACTED]')
+const redactLocal = redact
 
 /**
  * Turn normalized blocks into nodes and edges.
@@ -189,9 +191,11 @@ export function extract(blocks, { scope = 'default', hashOf = null } = {}) {
       turnArtifacts = []
       // Only the human speaks with authority. Injected runtime context and job notices are
       // content, not instructions — pinning them would make boilerplate immortal.
-      if (block.sourceKind && block.sourceKind !== 'user') continue
-      if (!CONSTRAINT.test(block.text) || QUESTION.test(block.text.trim())) continue
-      add({ kind: 'constraint', seq: block.seq, claim: sentenceWith(block.text, CONSTRAINT), anchor: `seq:${block.seq}`, pin: 1 })
+      if (block.sourceKind !== 'user') continue
+      // A trailing acknowledgement question does not negate an explicit instruction.
+      const instruction = block.text.trim().replace(/[，,。；;]\s*(?:明白了吗|明白吗|知道了吗|知道吗|记住了吗|记住吗)[？?]?$/, '').trim()
+      if (!CONSTRAINT.test(instruction) || QUESTION.test(instruction)) continue
+      add({ kind: 'constraint', seq: block.seq, claim: sentenceWith(instruction, CONSTRAINT), anchor: `seq:${block.seq}`, pin: 1 })
       continue
     }
     if (block.kind === 'tool-call') {
@@ -324,7 +328,7 @@ export function ppr(adjacency, seeds, { alpha = 0.5, iterations = 2 } = {}) {
  * twice for the same topic and gives the usual (1 - 1/e) guarantee. This is the graph part
  * of the compressor: PPR supplies the prior, coverage makes the choice.
  */
-export function select(blocks, { adjacency, seeds, budget, mandatory = [], kindWeight = {}, priceCap = Infinity, boost = null }) {
+export function select(blocks, { adjacency, seeds, budget, mandatory = [], kindWeight = {}, priceCap = Infinity, boost = null, need = null }) {
   const n = blocks.length
   if (!n || budget <= 0) return { picked: [], bytes: 0 }
 
@@ -383,7 +387,10 @@ export function select(blocks, { adjacency, seeds, budget, mandatory = [], kindW
       // on bytes — every surviving block costs a line, a bullet and a newline anyway.
       // A block that carries a well-connected knowledge point is worth more than its words
       // suggest: the graph already knows which claims other claims hang off.
-      const ratio = (gain * (kindWeight[blocks[i].kind] ?? 1) * (boost?.get(i) ?? 1)) / (price + 32)
+      // `need` is the memory dimension: a block whose knowledge is fading is worth keeping
+      // because dropping it is not recoverable — the same argument as IDF, applied to time
+      // rather than to rarity. Both default to 1, so a caller with no graph sees no change.
+      const ratio = (gain * (kindWeight[blocks[i].kind] ?? 1) * (boost?.get(i) ?? 1) * (need?.get(i) ?? 1)) / (price + 32)
       if (ratio > bestRatio) { bestRatio = ratio; best = i }
     }
     if (best < 0) break
@@ -426,9 +433,9 @@ function renderNode(node) {
  * a violating one. The remaining budget buys raw excerpts, because a claim that says "see
  * seq 4120" is worth nothing to a model that will not go and look.
  */
-export function compact({ events = [], budget = 1200, hashOf = null, storedHash = null, scope = 'default', nodeBudgetRatio = 0.45, boost = null } = {}) {
+export function compact({ events = [], budget = 1200, hashOf = null, storedHash = null, scope = 'default', nodeBudgetRatio = null, boost = null, memory = null } = {}) {
   const blocks = normalize(events)
-  if (!blocks.length) return { text: '', stats: { blocks: 0, nodes: 0, excerpts: 0, bytes: 0, stale: 0 } }
+  if (!blocks.length) return { text: '', stats: { blocks: 0, nodes: 0, excerpts: 0, bytes: 0, stale: 0, atRisk: 0 } }
 
   // `storedHash` is the fingerprint recorded when the file was written; `hashOf` reads the file
   // now. Only the difference between the two can prove that evidence went stale.
@@ -445,18 +452,36 @@ export function compact({ events = [], budget = 1200, hashOf = null, storedHash 
   const pinnedSeqs = new Set(pinned.map(n => n.seq))
   const mandatory = blocks.map((b, i) => pinnedSeqs.has(b.seq) ? i : -1).filter(i => i >= 0)
 
-  const nodeBudget = Math.floor(budget * nodeBudgetRatio)
+  // The claim/excerpt split is normally fixed at 45%. When the graph is available it is derived
+  // from how consolidated the span's claims are: trustworthy claims deserve the budget, fragile
+  // ones do not, and a fixed split is what makes three constraints eat the node share at 600 B.
+  const ratio = typeof nodeBudgetRatio === 'number'
+    ? nodeBudgetRatio
+    : (memory ? memoryRatio(memory) : 0.45)
+  const nodeBudget = Math.floor(budget * ratio)
   const nodeLines = []
   let nodeSpent = 0
   // Rank by value density, not by kind order. Insertion order makes a long decision claim
   // crowd out two short artifacts that together say more per byte, and the loss is silent.
   const KIND_WEIGHT = { constraint: 3, decision: 2.4, progress: 2, artifact: 1.6 }
   const seedTerms = new Set(seeds.flatMap(index => termSet(blocks[index].text)))
+  // A claim that is about to be lost is worth showing while it is still legible; one that is
+  // fresh in mind can wait a turn. Half-weight, because the excerpt path already carries the
+  // same signal and double-counting it would drown the seed overlap term.
+  const memoryWeight = node => {
+    if (!memory) return 1
+    const state = memory.bySeq?.get(Number(node.seq))
+    if (!state || state.pin) return 1
+    return 1 + 0.5 * (1 - state.A)
+  }
   const recentProgress = nodes.filter(n => n.kind === 'progress').slice(-2).reverse()
   const ranked = [...recentProgress, ...nodes.filter(n => !n.pin && n.kind !== 'progress')]
     .map(node => {
       const overlap = [...termSet(node.claim)].filter(term => seedTerms.has(term)).length
-      return { node, density: (KIND_WEIGHT[node.kind] ?? 1) * (1 + overlap) / (sizeOf(node.claim) + 24) }
+      return {
+        node,
+        density: (KIND_WEIGHT[node.kind] ?? 1) * (1 + overlap) * memoryWeight(node) / (sizeOf(node.claim) + 24),
+      }
     })
     .sort((a, b) => b.density - a.density)
     .map(entry => entry.node)
@@ -484,6 +509,9 @@ export function compact({ events = [], budget = 1200, hashOf = null, storedHash 
     budget: remaining, mandatory, priceCap: MAX_EXCERPT,
     // Keyed by block index; built from the knowledge graph's edge weights.
     boost: boost ? new Map(blocks.map((block, index) => [index, boost.get(block.seq) ?? 1])) : null,
+    // The memory dimension: blocks whose knowledge is fading are worth their bytes because
+    // shadowing them is not recoverable, not merely inconvenient.
+    need: memory ? new Map(blocks.map((block, index) => [index, lossRisk(memory, block.seq)])) : null,
     kindWeight: { user: 1.4, assistant: 1.2, 'tool-call': 1.1, 'tool-result': 0.8 },
   })
 
@@ -506,15 +534,23 @@ export function compact({ events = [], budget = 1200, hashOf = null, storedHash 
 
   const pickedSet = new Set(picked)
   const shadowed = blocks.filter((_, index) => !pickedSet.has(index)).map(b => b.seq)
+  // "另有 N 段可用 recall 回捞" is true for a span whose knowledge is consolidated and false for
+  // one that is not: recall is lexical, so a block nobody remembers the words of is gone. When
+  // the graph is available, say which is which instead of promising a recovery path that does
+  // not exist.
+  const atRisk = memory ? shadowRisk(memory, shadowed) : []
   if (shadowed.length) {
-    lines.push('---', `另有 ${shadowed.length} 个原文片段未展开（seq ${shadowed[0]}–${shadowed.at(-1)}），可用 recall 回捞。`)
+    const reachable = shadowed.length - atRisk.length
+    lines.push('---', atRisk.length
+      ? `另有 ${reachable} 段可按 recall 回捞；${atRisk.length} 段没有固化过的骨架支撑（seq ${atRisk.slice(0, 6).map(r => r.seq).join(', ')}），检索不到就等于丢失。`
+      : `另有 ${shadowed.length} 个原文片段未展开（seq ${shadowed[0]}–${shadowed.at(-1)}），可用 recall 回捞。`)
   }
 
   const text = lines.join('\n')
   return {
     text,
     nodes, edges,
-    stats: { blocks: blocks.length, nodes: nodeLines.length, excerpts: excerpts.length, bytes: sizeOf(text), stale },
+    stats: { blocks: blocks.length, nodes: nodeLines.length, excerpts: excerpts.length, bytes: sizeOf(text), stale, atRisk: atRisk.length },
   }
 }
 
@@ -522,8 +558,16 @@ export function compact({ events = [], budget = 1200, hashOf = null, storedHash 
  * Per-turn projection: the small standing card. Pure function of the graph, so the same
  * state always renders the same bytes and the prompt cache prefix stays stable.
  */
-export function project(nodes, { budget = 600 } = {}) {
-  const order = { constraint: 0, reference: 1, decision: 2, artifact: 3, progress: 4 }
+export function project(nodes, { budget = 600, referenceLast = false } = {}) {
+  // `reference` ranks second in the 1.5 order, and that is left alone by default: a plugin
+  // upgrade must not reshuffle a card nobody asked to change. When the dynamics or promotion
+  // paths are on, `referenceLast` moves it to the end — a reference node is a pointer that says
+  // where to look, not knowledge, and promoting a lookup should not be able to displace the
+  // decision that made the session work. Measured: with reference ranked second and promotion
+  // on, a decision was pushed off the card.
+  const order = referenceLast
+    ? { constraint: 0, decision: 1, artifact: 2, progress: 3, reference: 4 }
+    : { constraint: 0, reference: 1, decision: 2, artifact: 3, progress: 4 }
   const sorted = [...nodes].sort((a, b) =>
     (b.pin - a.pin) || (order[a.kind] - order[b.kind]) || (b.seq - a.seq))
   const lines = ['[骨架]']

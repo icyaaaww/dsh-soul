@@ -5,7 +5,7 @@ import {
   budgetFor, createSkeletonEngine, fromConversation, skeletonSummarize, spanBytes,
 } from '../src/compaction.js'
 
-const user = text => ({ role: 'user', content: [{ type: 'text', text }] })
+const user = text => ({ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] })
 const assistant = (text, calls = []) => ({ role: 'assistant', content: [{ type: 'text', text }, ...calls] })
 const toolCall = (name, input) => ({ type: 'tool-call', name, input })
 const toolResult = text => ({ role: 'user', content: [{ type: 'tool-result', content: [{ type: 'text', text }] }] })

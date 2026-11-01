@@ -23,6 +23,14 @@ function graphStore() {
  *
  * A claim that many other claims hang off is worth more than its word count suggests. The cap
  * keeps a single hub from monopolising the budget.
+ *
+ * This is the whole memory handoff, and it is deliberately just a number. An earlier version
+ * also passed the full memory profile through so the compressor could weight blocks by loss risk
+ * and derive the claim/excerpt split from consolidation — both were measured and both were
+ * inert to mildly harmful (`bench/consolidation.mjs`: the node share is already flat-optimal at
+ * 0.45, and per-block weighting has no discriminating power because a compaction span is by
+ * definition recent, so every block in it has high availability). Measured-inert code does not
+ * belong on the production path, so it stayed a bench result.
  */
 export function graphBoost(agent) {
   const store = graphStore()

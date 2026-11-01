@@ -1,4 +1,4 @@
-import { hash, terms as termSet } from './util.js'
+import { hash, redact, terms as termSet } from './util.js'
 import { densestWindow, textOfEvent } from './session-search.js'
 
 /**
@@ -24,7 +24,7 @@ const CJK = /[\u3400-\u9FFF\uF900-\uFAFF]/g
  * " 反 作 弊 …" turns every character into a token, and phrase queries then behave like
  * substring search.
  */
-const segment = text => String(text ?? '')
+export const segment = text => String(text ?? '')
   .replace(CJK, ch => ` ${ch} `)
   .replace(/\s+/g, ' ')
   .trim()
@@ -57,7 +57,9 @@ export function ingest(store, scope, session, { max = MAX_INGEST_PER_CALL, budge
     for (let seq = from; seq <= to; seq++) {
       const event = session.eventAt(seq)
       if (!event) continue
-      const text = textOfEvent(event).trim()
+      // Spans are raw tool output and user text: the one table that stores verbatim history
+      // must pass the same denylist as every other write before it reaches disk.
+      const text = redact(textOfEvent(event)).trim()
       if (!text) continue
       rows.push({ seq, kind: String(event.type ?? ''), text, indexText: segment(text), hash: hash(text) })
     }

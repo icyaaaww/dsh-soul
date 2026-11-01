@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { compact, extract, normalize, ppr, project, select, buildGraph } from '../src/skeleton.js'
 
-const user = (seq, text) => ({ seq, type: 'user/message', data: { message: { content: [{ type: 'text', text }] } } })
+const user = (seq, text) => ({ seq, type: 'user/message', data: { message: { source: { kind: 'user' }, content: [{ type: 'text', text }] } } })
 const say = (seq, text) => ({ seq, type: 'assistant/message', data: { message: { content: [{ type: 'text', text }] } } })
 const call = (seq, name, input) => ({ seq, type: 'assistant/message', data: { message: { content: [{ type: 'tool-call', name, input }] } } })
 const result = (seq, text, isError = false) => ({ seq, type: 'tool/result', data: { content: [{ type: 'text', text }], isError } })

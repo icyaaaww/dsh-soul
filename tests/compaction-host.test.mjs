@@ -5,19 +5,20 @@ import { pathToFileURL } from 'node:url'
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { createSkeletonEngine } from '../src/compaction.js'
+const entry = await import(process.env.DSH_SOUL_TEST_COMPACTION_ENTRY ?? new URL('../compaction.js', import.meta.url).href)
 
 /**
  * Real-host compaction test.
  *
- * Boots the actual DSH runtime (Cordis + AgentLoop + TokenMeter + the shipped compaction
- * backend), replaces only `summarize()` with the graph selector, and compacts a real session.
+ * Boots the actual DSH runtime and its module resolution, mounts the public compaction
+ * entry, and compacts a real session. No constructor injection bypasses the entry.
  * Skipped unless DSH_TEST_PACKAGE points at an installed `@deepseek-ai/dsh/package.json`.
  */
 
 const manifest = process.env.DSH_TEST_PACKAGE
+const unsupported = manifest && JSON.parse(readFileSync(manifest, 'utf8')).version === '0.2.0-rc.2'
 
-test('real DSH: graph compaction condenses a live session without a model call', { skip: !manifest, timeout: 120000 }, async () => {
+test('real DSH: graph compaction condenses a live session without a model call', { skip: !manifest ? 'DSH_TEST_PACKAGE not set' : unsupported ? '0.2.0 is outside engines.dsh; rejection is tested in host.test.mjs' : false, timeout: 120000 }, async () => {
   const req = createRequire(resolve(manifest))
   const load = name => import(pathToFileURL(req.resolve('@deepseek-ai/' + name)).href)
   const version = JSON.parse(readFileSync(manifest, 'utf8')).version
@@ -30,10 +31,11 @@ test('real DSH: graph compaction condenses a live session without a model call',
   const { SystemPrompt } = await load('dsh-system-prompt')
   const { LlmRuntime, LlmAdapter, createUserMessage } = await load('dsh-llm')
   const { TokenMeter } = await load('dsh-token-meter')
-  const { BasicCompactionEngine } = await load('dsh-compaction-basic')
+  const { PluginPackages, createRuntimeResolution } = await load('dsh-app-boot')
 
   const dir = mkdtempSync(join(tmpdir(), 'soul-compact-host-'))
   const ctx = new Context()
+  new PluginPackages(ctx, { resolution: await createRuntimeResolution({ installAnchor: resolve(manifest), home: dir }) })
   new SessionStore(ctx)
   new SessionProjectionRegistry(ctx)
   new SystemPrompt(ctx, { includeHarnessIdentity: false, includeRuntimeContext: false })
@@ -59,8 +61,11 @@ test('real DSH: graph compaction condenses a live session without a model call',
   const adapter = new LocalAdapter()
   llm.registerAdapter(['local-test'], adapter)
 
-  const Engine = createSkeletonEngine(BasicCompactionEngine)
-  const engine = new Engine(ctx, { thresholdRatio: 0.8, headroomTokens: 0, maxTokens: 64, auto: false })
+  const fiber = ctx.plugin(entry, { thresholdRatio: 0.8, headroomTokens: 0, maxTokens: 64, auto: false })
+  await fiber.await()
+  assert.equal(fiber.state, 2, 'public compaction entry did not activate: ' + String(fiber._error?.stack))
+  const engine = ctx.compaction
+  assert.equal(typeof engine?.compactNow, 'function')
 
   const parent = await agents.create({
     sessionId: 'compact-host', meta: { cwd: dir },

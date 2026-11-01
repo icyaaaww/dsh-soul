@@ -51,6 +51,11 @@ export function runComponent(code, input, { kind = 'script', signal, timeoutMs =
   })
 }
 
+export function cwdForAgent(ctx, agent) {
+  const service = typeof ctx.get === 'function' ? ctx.get('workingDirectory') : ctx.workingDirectory
+  return agent?.session ? service?.get?.(agent.session) ?? agent.session.header?.cwd : null
+}
+
 export function createComponents(ctx, { current, enabled = () => true, audit = () => {} }) {
   const leases = new Map(), disposers = []
   const lifetime = new AbortController(), jobs = new Set()
@@ -74,7 +79,7 @@ export function createComponents(ctx, { current, enabled = () => true, audit = (
     if (stopped || !cwd || !enabled()) return null
     return leases.get(keyOf(cwd)) ?? current(projectScope({ header: { cwd } }))?.files ?? null
   }
-  const cwdFor = agent => agent?.session ? get('workingDirectory')?.get?.(agent.session) ?? agent.session.header?.cwd : null
+  const cwdFor = agent => cwdForAgent(ctx, agent)
   const filesFor = agent => filesAt(cwdFor(agent))
   const invalidate = () => control?.invalidate()
   const skills = get('skills')

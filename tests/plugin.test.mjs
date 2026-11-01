@@ -22,14 +22,45 @@ function fakeContext() {
 
 const session = (cwd = process.cwd()) => ({ id: 's1', header: { cwd } })
 
-test('plugin is disabled by default and registers nothing until asked', () => {
+test('memory starts without a model; evolution remains off and both can be disabled', async () => {
   assert.equal(name, 'dsh-soul')
-  assert.deepEqual(inject, ['tools', 'systemPrompt', 'commands', 'llm', 'skills'])
-  const { ctx, tools, contexts } = fakeContext()
-  const out = apply(ctx, { profile: 'test', database: ':memory:' })
-  assert.equal(out, undefined)
-  assert.equal(tools.length, 0)
-  assert.equal(contexts.length, 0)
+  assert.deepEqual(inject, ['tools', 'systemPrompt', 'commands'])
+  const { ctx, tools, contexts, commands, handlers } = fakeContext()
+  ctx.get = () => undefined
+  const handle = apply(ctx, { profile: 'test', database: ':memory:', injectHarness: false })
+  try {
+    assert.equal(handle.evolve, undefined)
+    assert.deepEqual(tools.map(t => t.name).sort(), ['soul_expand', 'soul_recall'])
+    assert.deepEqual(contexts.map(c => c.name), ['dsh-soul:memory'])
+    const agent = { session: session() }
+    const message = { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '不要修改 package.json' }] }
+    await handlers.get('agent/pre-step')({ agent, messages: [message] }, async () => ({ messages: [message] }))
+    handlers.get('session/event')(agent.session, { type: 'turn/end', data: {} })
+    assert.match(contexts[0].text({ agent }), /package.json/)
+    const mem = commands.find(c => c.name === 'mem')
+    assert.match((await mem.handler({ agent, rawInput: 'show' })).text, /package.json/)
+    const disabled = await commands.find(c => c.name === 'evolve').handler({ agent, rawInput: 'run' })
+    assert.equal(disabled.kind, 'error')
+    assert.match(disabled.text, /演化已关闭/)
+    assert.equal(handle.store.db.prepare('SELECT COUNT(*) AS n FROM call').get().n, 0)
+  } finally { await handle.stop() }
+  const off = fakeContext()
+  assert.equal(apply(off.ctx, { enabled: false, memory: { enabled: false } }), undefined)
+  assert.equal(off.tools.length, 0)
+})
+
+test('explicit evolution switch overrides the legacy alias and memory can be disabled separately', async () => {
+  assert.equal(settings({ profile: 'test', enabled: true, evolution: { enabled: false } }).enabled, false)
+  assert.throws(() => settings({ profile: 'test', evolution: { enabled: true } }), /显式配置 provider/)
+  const { ctx, tools, contexts, commands } = fakeContext()
+  const handle = apply(ctx, { profile: 'test', database: ':memory:', evolution: { enabled: true }, memory: { enabled: false }, provider: 'p', model: 'm' })
+  try {
+    assert.ok(handle.evolve)
+    assert.ok(tools.some(t => t.name === 'evolve_status'))
+    assert.equal(tools.some(t => t.name.startsWith('soul_')), false)
+    assert.equal(contexts.some(c => c.name === 'dsh-soul:memory'), false)
+    assert.equal(commands.some(c => c.name === 'mem'), false)
+  } finally { await handle.stop() }
 })
 
 test('enabling requires an explicit model route and never inherits learning', () => {

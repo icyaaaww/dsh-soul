@@ -56,7 +56,7 @@ function scenario(seed) {
   const rnd = mulberry32(seed)
   const events = []
   let seq = 0
-  const user = text => events.push({ seq: seq++, type: 'user/message', data: { message: { content: [{ type: 'text', text }] } } })
+  const user = text => events.push({ seq: seq++, type: 'user/message', data: { message: { source: { kind: 'user' }, content: [{ type: 'text', text }] } } })
   const say = text => events.push({ seq: seq++, type: 'assistant/message', data: { message: { content: [{ type: 'text', text }] } } })
   const write = path => {
     events.push({

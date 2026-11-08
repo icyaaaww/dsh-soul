@@ -57,6 +57,9 @@ export function ingest(store, scope, session, { max = MAX_INGEST_PER_CALL, budge
     for (let seq = from; seq <= to; seq++) {
       const event = session.eventAt(seq)
       if (!event) continue
+      // The runtime-context snapshot is the memory card itself; indexing it would make recall
+      // find the card's own lines and present them as history.
+      if (event.type === 'user/message' && (event.data?.source?.kind ?? event.data?.message?.source?.kind) === 'runtime-context') continue
       // Spans are raw tool output and user text: the one table that stores verbatim history
       // must pass the same denylist as every other write before it reaches disk.
       const text = redact(textOfEvent(event)).trim()

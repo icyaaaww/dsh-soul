@@ -1,6 +1,6 @@
 {
   "name": "dsh-soul",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Memory skeleton and graph compaction for DSH: recover what compression removed",
   "license": "MIT",
   "repository": {
@@ -45,11 +45,11 @@
     "check": "node --check index.js && npm test",
     "demo": "node scripts/demo.mjs",
     "bench": "node bench/compaction-loss.mjs",
-    "bench:memory": "node bench/memory-dynamics.mjs",
+    "bench:memory": "node bench/replay.mjs",
     "bench:graph": "node bench/graph-memory.mjs",
     "bench:continuation": "node bench/continuation.mjs",
     "bench:consolidation": "node bench/consolidation.mjs",
-    "test:dynamics": "node --test tests/dynamics.test.mjs",
+    "test:dynamics": "node --test tests/graph-memory.test.mjs tests/neuro.test.mjs",
     "test:graph": "node --test tests/graph-memory.test.mjs",
     "test:projection": "node --test tests/projection.test.mjs tests/mem-command.test.mjs",
     "demo:memory": "node scripts/memory-demo.mjs",

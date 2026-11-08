@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { normalize, extract } from '../src/skeleton.js'
 import { fromConversation } from '../src/compaction.js'
 import { capture, projectionText } from '../src/memory.js'
-import { Store } from '../src/store.js'
+import { Store, SCHEMA_VERSION } from '../src/store.js'
 import { redact, redactData } from '../src/util.js'
 const user = (text, seq = 0, source = { kind: 'user' }) => ({ seq, type: 'user/message', data: { message: { content: [{ type: 'text', text }], source } } })
 const constraints = events => extract(normalize(events)).nodes.filter(n => n.kind === 'constraint')
@@ -78,6 +78,6 @@ test('issue 2: schema 7 upgrade scrubs persisted spans, FTS and node claims', ()
     store.db.exec('PRAGMA user_version=7')
     store.close(); store = new Store(path)
     for (const table of ['span', 'span_fts', 'node']) assert.equal(JSON.stringify(store.db.prepare('SELECT * FROM ' + table).all()).includes(secret), false, table)
-    assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 8)
+    assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, SCHEMA_VERSION)
   } finally { store?.close(); rmSync(dir, { recursive: true, force: true }) }
 })

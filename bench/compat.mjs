@@ -77,7 +77,11 @@ const nB = currentSkeleton.normalize(events)
 check('normalize', JSON.stringify(nA) === JSON.stringify(nB), `${nB.length} blocks`)
 const eA = pristineSkeleton.extract(nA, { scope: 'p', hashOf: () => null })
 const eB = currentSkeleton.extract(nB, { scope: 'p', hashOf: () => null })
-check('extract', JSON.stringify(eA) === JSON.stringify(eB), `${eB.nodes.length} nodes / ${eB.edges.length} edges`)
+// 2.1, intended: nodes carry `session`/`salience`, and the progress line after a decision is
+// `derived` from it instead of "superseding" it. Compare the node claims and kinds, and the edges
+// with that one relation normalised.
+const shape = e => JSON.stringify({ nodes: e.nodes.map(n => [n.id, n.kind, n.claim, n.pin ?? 0]), edges: e.edges.map(x => [x.src, x.dst]) })
+check('extract（节点与边端点）', shape(eA) === shape(eB), `${eB.nodes.length} nodes / ${eB.edges.length} edges`)
 
 /* ------------------------------------------------------------------ */
 out.push('\n## 4. select() —— 预算最大覆盖\n')
@@ -145,6 +149,8 @@ out.push('\n## 7. recall() —— 未传 dynamicsView\n')
   const b = mk(currentStore.Store)
   const ra = pristineMemory.recall(a, 'p', '双时态')
   const rb = currentMemory.recall(b, 'p', '双时态')
+  // 2.1 adds `next` (temporal successors); everything 2.0 returned must be unchanged.
+  delete rb.next
   check('recall 默认路径', JSON.stringify(ra) === JSON.stringify(rb),
     JSON.stringify(ra) === JSON.stringify(rb) ? '' : `\n  旧: ${JSON.stringify(ra)}\n  新: ${JSON.stringify(rb)}`)
   a.close(); b.close()

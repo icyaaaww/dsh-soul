@@ -19,18 +19,12 @@ function graphStore() {
 }
 
 /**
- * Map seq -> selection multiplier from edge connectivity.
+ * Entity -> centrality, from the knowledge graph.
  *
- * A claim that many other claims hang off is worth more than its word count suggests. The cap
- * keeps a single hub from monopolising the budget.
- *
- * This is the whole memory handoff, and it is deliberately just a number. An earlier version
- * also passed the full memory profile through so the compressor could weight blocks by loss risk
- * and derive the claim/excerpt split from consolidation — both were measured and both were
- * inert to mildly harmful (`bench/consolidation.mjs`: the node share is already flat-optimal at
- * 0.45, and per-block weighting has no discriminating power because a compaction span is by
- * definition recent, so every block in it has high availability). Measured-inert code does not
- * belong on the production path, so it stayed a bench result.
+ * A claim that many other claims hang off is worth more than its word count suggests, and the
+ * entities it names are how a compaction block can be recognised as "about" it. 2.0 keyed this
+ * map by node seq and looked it up by block seq; the two numbering spaces never met, so the
+ * weighting fell on arbitrary blocks. Entities are the one key both sides share.
  */
 export function graphBoost(agent) {
   const store = graphStore()
@@ -38,20 +32,60 @@ export function graphBoost(agent) {
   if (!store || !cwd) return null
   try {
     const scope = projectScope({ id: agent.session.id, header: { cwd } })
-    const nodes = store.activeNodes(scope, 400)
+    const nodes = store.activeNodes(scope)
     if (!nodes.length) return null
     const weight = new Map()
     for (const row of store.edgeWeights(scope)) {
+      if (row.rel === 'supersedes' || row.rel === 'contradicts') continue
       weight.set(row.src, (weight.get(row.src) ?? 0) + row.w)
       weight.set(row.dst, (weight.get(row.dst) ?? 0) + row.w)
     }
+    const mentions = store.mentions(scope)
+    const fan = new Map()
+    for (const list of mentions.values()) for (const entity of list) fan.set(entity, (fan.get(entity) ?? 0) + 1)
     const boost = new Map()
     for (const node of nodes) {
       const value = (weight.get(node.id) ?? 0) + (node.pin ? 3 : 0)
-      if (value > 0) boost.set(node.seq, 1 + Math.min(value, 4) * 0.25)
+      if (!(value > 0)) continue
+      for (const entity of mentions.get(node.id) ?? []) {
+        // An entity half the graph names says nothing about any one block.
+        if ((fan.get(entity) ?? 0) > Math.max(3, nodes.length * 0.2)) continue
+        boost.set(entity, Math.max(boost.get(entity) ?? 0, value))
+      }
     }
     return boost.size ? boost : null
   } catch { return null }
+}
+
+/**
+ * Host event seqs for the messages of a compaction input.
+ *
+ * The backend receives derived messages without positions, while `soul_expand` reads the session
+ * by event seq. Without this the directory card printed block indices of the span as if they were
+ * seqs, and expanding `[12-30]` returned unrelated events. The host derives each surface node with
+ * `deriveEventMessage`; matching those derivations in order recovers each message's seq. Any
+ * mismatch returns null — a wrong pointer is worse than none.
+ */
+export function alignSeqs(messages, session) {
+  if (!Array.isArray(messages) || !session?.surface?.nodes || typeof session.eventAt !== 'function'
+    || typeof session.deriveEventMessage !== 'function') return null
+  const key = message => { try { return JSON.stringify(message) } catch { return null } }
+  const derived = []
+  for (const seq of session.surface.nodes) {
+    let message = null
+    try { message = session.deriveEventMessage(session.eventAt(seq)) } catch { message = null }
+    if (message) derived.push({ seq: Number(seq), key: key(message) })
+  }
+  const out = []
+  let cursor = 0
+  for (const message of messages) {
+    const wanted = key(message)
+    while (cursor < derived.length && derived[cursor].key !== wanted) cursor++
+    if (cursor >= derived.length) return null
+    out.push(derived[cursor].seq)
+    cursor++
+  }
+  return out
 }
 
 /**
@@ -90,10 +124,14 @@ const textOfBlock = block => {
  * session carries typed events. Doing the mapping here keeps `skeleton.normalize` the only
  * place that decides what a block is.
  */
-export function fromConversation(messages = []) {
+export function fromConversation(messages = [], seqs = null) {
   const events = []
-  for (const message of messages) {
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index]
     if (!message || typeof message !== 'object') continue
+    // With aligned host seqs every event of a message carries the message's seq; without them
+    // the normalizer numbers blocks itself, and the card must not present those as seqs.
+    const seq = Array.isArray(seqs) && Number.isInteger(seqs[index]) ? { seq: seqs[index] } : {}
     const content = Array.isArray(message.content)
       ? message.content
       : typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : []
@@ -102,15 +140,15 @@ export function fromConversation(messages = []) {
     const results = content.filter(block => block?.type === 'tool-result')
 
     if (message.role === 'assistant') {
-      if (texts.length) events.push({ type: 'assistant/message', data: { message: { content: texts } } })
-      if (calls.length) events.push({ type: 'assistant/message', data: { message: { content: calls } } })
+      if (texts.length) events.push({ type: 'assistant/message', ...seq, data: { message: { content: texts } } })
+      if (calls.length) events.push({ type: 'assistant/message', ...seq, data: { message: { content: calls } } })
       continue
     }
     // A tool result arrives as a user-role message; emit it before any prose in the same turn
     // so the normalizer pairs it with the call that precedes it.
     if (results.length) {
       events.push({
-        type: 'tool/result',
+        type: 'tool/result', ...seq,
         data: {
           content: results.map(block => ({ type: 'text', text: bounded(textOfBlock(block), 4000) })),
           isError: Boolean(results[0]?.isError ?? results[0]?.is_error),
@@ -119,7 +157,7 @@ export function fromConversation(messages = []) {
     }
     // Carry the source through: without it a runtime-context message looks like the human and
     // its boilerplate gets pinned as a standing constraint.
-    if (texts.length) events.push({ type: 'user/message', data: { message: { content: texts }, source: message.source } })
+    if (texts.length) events.push({ type: 'user/message', ...seq, data: { message: { content: texts }, source: message.source } })
   }
   return events
 }
@@ -145,13 +183,13 @@ export const MIN_COMPACTABLE_SPAN_BYTES = 1200
  * framing is paid by the caller, not by this card, so a span smaller than the framing can
  * never shrink — failing loudly there is better than committing a checkpoint that grew.
  */
-export function skeletonSummarize(input, { mode = 'directory', budget = budgetFor(input), boost = null } = {}) {
+export function skeletonSummarize(input, { mode = 'directory', budget = budgetFor(input), boost = null, seqs = null } = {}) {
   const span = spanBytes(input)
   if (span < MIN_COMPACTABLE_SPAN_BYTES) {
     throw new Error(`跨度仅 ${span} bytes，小于可压缩下限 ${MIN_COMPACTABLE_SPAN_BYTES}（checkpoint 固定开销所致）`)
   }
   const ceiling = Math.floor(span * 0.45)
-  const events = fromConversation(input?.messages ?? [])
+  const events = fromConversation(input?.messages ?? [], seqs)
   const limit = Math.min(budget, ceiling)
   // A directory is the default: it never claims to know what the future needs, and every line
   // resolves to bytes that already exist. The skeleton remains the fallback for spans too short
@@ -163,7 +201,7 @@ export function skeletonSummarize(input, { mode = 'directory', budget = budgetFo
     const pinned = extract(blocks, { scope: 'compaction' }).nodes.filter(node => node.pin).slice(0, 3)
     const pinnedText = pinned.map(node => `- 约束: ${bounded(node.claim, 72)}`).join('\n')
     const pinnedBytes = Buffer.byteLength(pinnedText)
-    const directory = buildDirectory(blocks, { budget: Math.max(200, limit - pinnedBytes - 1) })
+    const directory = buildDirectory(blocks, { budget: Math.max(200, limit - pinnedBytes - 1), addressable: Array.isArray(seqs) })
     if (directory.entries.length >= 2) text = [pinnedText, directory.text].filter(Boolean).join('\n')
   }
   if (!text) text = compact({ events, budget: limit, scope: 'compaction', boost }).text.trim()
@@ -200,7 +238,7 @@ export function createSkeletonEngine(Base) {
       if (!Array.isArray(input?.messages) || !input.messages.length) {
         throw new Error('compaction 需要可重放的消息前缀')
       }
-      const result = skeletonSummarize(input, { budget: budgetFor(input), boost: graphBoost(agent) })
+      const result = skeletonSummarize(input, { budget: budgetFor(input), boost: graphBoost(agent), seqs: alignSeqs(input.messages, agent?.session) })
       // Re-check after building: a cancellation between selection and return must not produce
       // a checkpoint that the caller then aborts halfway through writing.
       signal?.throwIfAborted?.()

@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Store } from '../src/store.js'
+import { Store, SCHEMA_VERSION } from '../src/store.js'
 import { Evolve } from '../src/evolve.js'
 import { budgetSettings } from '../src/budget.js'
 import { buildContrast, patternOf, snapshot } from '../src/lesson.js'
@@ -285,7 +285,7 @@ test('a version 1 database gains the lesson column and keeps old episodes', () =
 
     const store = new Store(path)
     try {
-      assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 8)
+      assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, SCHEMA_VERSION)
       const columns = store.db.prepare('PRAGMA table_info(episode)').all().map(c => c.name)
       assert(columns.includes('lesson'))
       const row = store.recentEpisodes('p', 1)[0]

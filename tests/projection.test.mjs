@@ -39,7 +39,8 @@ test('with no recall history the two orderings agree — a fresh graph holds no 
   try {
     seed(store, 'p')
     const off = projectionText(store, 'p', 600, { dynamics: false })
-    const on = projectionText(store, 'p', 600, { dynamics: true, now: T0 })
+    // Far from the turn that wrote anything, so working memory is empty too.
+    const on = projectionText(store, 'p', 600, { dynamics: true, now: T0, turn: 1000 })
     assert.ok(off.length > 0 && on.length > 0, 'neither branch may return an empty card for a populated graph')
     // Every node has the same activation here, so `importance x due` ties and falls through to
     // the same tiebreak the static order uses. That is the intended behaviour: switching the
@@ -48,23 +49,18 @@ test('with no recall history the two orderings agree — a fresh graph holds no 
   } finally { store.close() }
 })
 
-test('with a recall history the two orderings diverge', () => {
+test('a memory that was needed recently ranks higher — the reader is stateless, so need, not spacing', () => {
   const store = new Store(':memory:')
   try {
     seed(store, 'p')
-    // The first few decisions were shown repeatedly and very recently; the rest were not.
+    // d0 is the oldest decision, last on the static card; it was just used five times.
     const insert = store.db.prepare('INSERT INTO activation(id,scope,node,query,at) VALUES (?,?,?,?,?)')
-    for (const id of ['d21', 'd18', 'd15']) {
-      for (const hoursAgo of [1, 2, 3, 5, 8]) insert.run(`a-${id}-${hoursAgo}`, 'p', id, 'projection', T0 - hoursAgo * 3_600_000)
-    }
+    for (const hoursAgo of [1, 2, 3, 5, 8]) insert.run(`a-d0-${hoursAgo}`, 'p', 'd0', 'q', T0 - hoursAgo * 3_600_000)
     const off = projectionText(store, 'p', 600, { dynamics: false })
-    const on = projectionText(store, 'p', 600, { dynamics: true, now: T0 })
-    assert.notEqual(off, on, 'a recalled node must yield to one that was not')
-    // The one just shown drops down the dynamic card; it stays at the top of the static one.
-    const dynamicFirstDecisions = on.split('\n').filter(line => line.startsWith('- 决策')).slice(0, 3).join('\n')
-    assert.ok(!dynamicFirstDecisions.includes('mod21.js'), 'the node shown an hour ago yields')
-    const staticFirstDecision = off.split('\n').find(line => line.startsWith('- 决策'))
-    assert.ok(staticFirstDecision.includes('mod21.js'), `static keeps it first, got "${staticFirstDecision}"`)
+    const on = projectionText(store, 'p', 600, { dynamics: true, now: T0, turn: 1000 })
+    const first = text => text.split('\n').find(line => line.startsWith('- 决策'))
+    assert.ok(first(off).includes('mod21.js'), 'static keeps the newest decision first')
+    assert.ok(first(on).includes('mod0.js'), `the used decision leads the dynamic card, got "${first(on)}"`)
   } finally { store.close() }
 })
 
@@ -92,29 +88,27 @@ test('the card is byte-identical inside one clock bucket — the prompt cache de
   } finally { store.close() }
 })
 
-test('the card rotates across buckets instead of repeating itself', () => {
+test('a recall inside a bucket does not change the card — the log is read up to the bucket start', () => {
+  const store = new Store(':memory:', { now: () => clock(T0) + 60_000 })
+  try {
+    seed(store, 'p', { count: 40 })
+    const before = projectionText(store, 'p', 300, { dynamics: true, now: clock(T0) + 30_000, turn: 1000 })
+    recall(store, 'p', 'mod2', { limit: 3 })
+    const after = projectionText(store, 'p', 300, { dynamics: true, now: clock(T0) + QUANTUM_MS - 1000, turn: 1000 })
+    assert.equal(after, before, 'same bucket, same bytes, recalls included')
+    const next = projectionText(store, 'p', 300, { dynamics: true, now: clock(T0) + QUANTUM_MS, turn: 1000 })
+    assert.ok(next.includes('mod2.js'), 'the next bucket reflects the use')
+  } finally { store.close() }
+})
+
+test('the card follows the question: a cue on a cold node brings it onto a full card', () => {
   const store = new Store(':memory:')
   try {
     seed(store, 'p', { count: 40 })
-    const seen = new Set()
-    let last = ''
-    let overlapping = 0
-    for (let step = 0; step < 8; step++) {
-      const now = clock(T0) + step * QUANTUM_MS
-      const card = projectionText(store, 'p', 300, { dynamics: true, now })
-      for (const line of card.split('\n')) if (line.startsWith('- ')) seen.add(line)
-      if (step > 0) overlapping += card === last ? 1 : 0
-      last = card
-      // A shown node is a recall: record it, exactly as the tool path does.
-      for (const line of card.split('\n')) {
-        const match = line.match(/mod(\d+)\.js/)
-        if (match) {
-          store.db.prepare('INSERT INTO activation(id,scope,node,query,at) VALUES (?,?,?,?,?)')
-            .run(`t-${step}-${match[1]}`, 'p', `d${match[1]}`, 'projection', now)
-        }
-      }
-    }
-    assert.ok(seen.size > 6, `rotation should surface more than a handful of lines, got ${seen.size}`)
+    const plain = projectionText(store, 'p', 300, { dynamics: true, now: T0, turn: 1000 })
+    assert.ok(!plain.includes('mod4.js'), 'an old artifact is off a small card')
+    const cued = projectionText(store, 'p', 300, { dynamics: true, now: T0, turn: 1000, cues: { terms: [], entities: ['src/mod4.js'] } })
+    assert.ok(cued.includes('mod4.js'), 'naming it brings it on')
   } finally { store.close() }
 })
 

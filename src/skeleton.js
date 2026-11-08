@@ -1,4 +1,4 @@
-import { bounded, bytes as sizeOf, terms as termSet, hash, redact } from './util.js'
+import { bounded, bytes as sizeOf, terms as termSet, hash, redact, entities as entitySet } from './util.js'
 // One-way: consolidation reads the memory model and the store, never this module. Keeping the
 // arrow pointing this way is what lets `compact()` stay a pure function of its inputs — the
 // caller passes a profile in, so the same span and the same profile always render the same bytes.
@@ -19,7 +19,9 @@ import { nodeBudgetRatio as memoryRatio, lossRisk, shadowRisk } from './consolid
  */
 
 export const NODE_KINDS = Object.freeze(['constraint', 'decision', 'artifact', 'progress'])
-export const EDGE_RELS = Object.freeze(['derived', 'supersedes', 'depends', 'supports', 'contradicts'])
+// The relations the code actually writes. 2.0 declared `depends` and `supports`, which nothing
+// ever produced; a vocabulary that promises more than the graph holds misleads every reader.
+export const EDGE_RELS = Object.freeze(['derived', 'supersedes', 'related', 'coactivated', 'precedes', 'contradicts'])
 
 // A standing instruction, not a question or a correction of past work. Kept narrow: a false
 // positive pins unrelated prose into every projection, which is worse than missing one.
@@ -166,6 +168,9 @@ function firstMeaningful(text) {
 // nodes are built before persistence here, so repeat the cheap denylist.
 const redactLocal = redact
 
+/** A pointer only when the position is real: an unknown host seq must not become `seq:-1`. */
+const anchorOf = seq => Number.isInteger(seq) && seq >= 0 ? `seq:${seq}` : null
+
 /**
  * Turn normalized blocks into nodes and edges.
  *
@@ -173,15 +178,24 @@ const redactLocal = redact
  * grows without bound, while these four map one-to-one onto the three failure modes in the
  * design note (violation / lost rationale / stale evidence / lost progress).
  */
-export function extract(blocks, { scope = 'default', hashOf = null } = {}) {
+export function extract(blocks, { scope = 'default', hashOf = null, session = null } = {}) {
   const nodes = []
   const edges = []
   const artifactsByPath = new Map()
+  // Two cursors, because they answer different questions: a new progress line replaces the
+  // previous *progress* line (where the work stands), while a decision is what the following
+  // progress was derived from. One shared cursor made a progress note "supersede" a decision —
+  // and since supersedes is not an association, it also cut the decision off from the graph.
   let progress = null
+  let lastStep = null
   let turnArtifacts = []
+  // Prediction error, the cheap way: a failed tool call is a surprise, and the decision that
+  // follows one in the same turn is a recovery. Both are encoded more strongly than routine
+  // steps. Salience feeds the read path; it never pins anything.
+  let failed = false
 
   const add = node => {
-    const record = { id: hash(`${scope}\u0000${node.kind}\u0000${node.seq}\u0000${node.claim}`).slice(0, 16), scope, ...node }
+    const record = { id: hash(`${scope}\u0000${node.kind}\u0000${node.seq}\u0000${node.claim}`).slice(0, 16), scope, session, ...node }
     nodes.push(record)
     return record
   }
@@ -189,13 +203,14 @@ export function extract(blocks, { scope = 'default', hashOf = null } = {}) {
   for (const block of blocks) {
     if (block.kind === 'user') {
       turnArtifacts = []
+      failed = false
       // Only the human speaks with authority. Injected runtime context and job notices are
       // content, not instructions — pinning them would make boilerplate immortal.
       if (block.sourceKind !== 'user') continue
       // A trailing acknowledgement question does not negate an explicit instruction.
       const instruction = block.text.trim().replace(/[，,。；;]\s*(?:明白了吗|明白吗|知道了吗|知道吗|记住了吗|记住吗)[？?]?$/, '').trim()
       if (!CONSTRAINT.test(instruction) || QUESTION.test(instruction)) continue
-      add({ kind: 'constraint', seq: block.seq, claim: sentenceWith(instruction, CONSTRAINT), anchor: `seq:${block.seq}`, pin: 1 })
+      add({ kind: 'constraint', seq: block.seq, claim: sentenceWith(instruction, CONSTRAINT), anchor: anchorOf(block.seq), pin: 1 })
       continue
     }
     if (block.kind === 'tool-call') {
@@ -219,10 +234,10 @@ export function extract(blocks, { scope = 'default', hashOf = null } = {}) {
       // node budget.
       const isDecision = DECISION.test(block.text)
       if (isDecision) {
-        const node = add({ kind: 'decision', seq: block.seq, claim: sentenceWith(block.text, DECISION), anchor: `seq:${block.seq}` })
+        const node = add({ kind: 'decision', seq: block.seq, claim: sentenceWith(block.text, DECISION), anchor: anchorOf(block.seq), salience: failed ? 0.5 : 0 })
         for (const artifact of turnArtifacts) edges.push({ src: node.id, dst: artifact.id, rel: 'derived', w: 0.6 })
-        if (progress) edges.push({ src: node.id, dst: progress, rel: 'derived', w: 0.5 })
-        progress = node.id
+        if (lastStep) edges.push({ src: node.id, dst: lastStep, rel: 'derived', w: 0.5 })
+        lastStep = node.id
         continue
       }
       // A two-word acknowledgement ("继续", "写入产物") is not progress. Keeping it as a node
@@ -230,16 +245,19 @@ export function extract(blocks, { scope = 'default', hashOf = null } = {}) {
       if (block.text.trim().length < 12) continue
       const node = add({
         kind: 'progress', seq: block.seq, claim: bounded(block.text, 120).trim(),
-        anchor: `seq:${block.seq}`,
+        anchor: anchorOf(block.seq),
       })
       if (progress) edges.push({ src: node.id, dst: progress, rel: 'supersedes', w: 1 })
+      if (lastStep && lastStep !== progress) edges.push({ src: node.id, dst: lastStep, rel: 'derived', w: 0.5 })
       progress = node.id
+      lastStep = node.id
       continue
     }
     if (block.kind === 'tool-result' && block.ok === false) {
+      failed = true
       add({
         kind: 'progress', seq: block.seq, claim: `${block.tool || '工具'} 失败：${bounded(block.text, 100)}`,
-        anchor: `seq:${block.seq}`,
+        anchor: anchorOf(block.seq), salience: 0.6,
       })
     }
   }
@@ -403,6 +421,13 @@ export function select(blocks, { adjacency, seeds, budget, mandatory = [], kindW
 
 const KIND_LABEL = { constraint: '约束', reference: '索引', decision: '决策', artifact: '产物', progress: '进度' }
 
+/** Selection multiplier for one block: its most central entity, capped so no hub monopolises. */
+export function boostOf(weights, text) {
+  let best = 0
+  for (const entity of entitySet(text, 48)) best = Math.max(best, weights.get(entity) ?? 0)
+  return 1 + Math.min(best, 4) * 0.25
+}
+
 /**
  * Pick the most identifier-dense window of a long block instead of its head. A 20 KB tool
  * result is quoted at 400 bytes; the head is usually a banner while the paths, flags and
@@ -507,8 +532,10 @@ export function compact({ events = [], budget = 1200, hashOf = null, storedHash 
   const { picked } = select(blocks, {
     adjacency, seeds: mandatory.length ? [...mandatory, ...seeds] : seeds,
     budget: remaining, mandatory, priceCap: MAX_EXCERPT,
-    // Keyed by block index; built from the knowledge graph's edge weights.
-    boost: boost ? new Map(blocks.map((block, index) => [index, boost.get(block.seq) ?? 1])) : null,
+    // `boost` maps an entity to how central the knowledge graph thinks it is. A block is worth
+    // more when it names a central entity. 2.0 keyed this by node seq and looked it up by block
+    // seq — two numbering spaces that never met — so the weighting landed on arbitrary blocks.
+    boost: boost ? new Map(blocks.map((block, index) => [index, boostOf(boost, block.text)])) : null,
     // The memory dimension: blocks whose knowledge is fading are worth their bytes because
     // shadowing them is not recoverable, not merely inconvenient.
     need: memory ? new Map(blocks.map((block, index) => [index, lossRisk(memory, block.seq)])) : null,
@@ -568,8 +595,10 @@ export function project(nodes, { budget = 600, referenceLast = false } = {}) {
   const order = referenceLast
     ? { constraint: 0, decision: 1, artifact: 2, progress: 3, reference: 4 }
     : { constraint: 0, reference: 1, decision: 2, artifact: 3, progress: 4 }
+  // Newest first within a kind. `created` decides across turns; `seq` only orders the blocks of
+  // one turn, and was never comparable across turns or sessions.
   const sorted = [...nodes].sort((a, b) =>
-    (b.pin - a.pin) || (order[a.kind] - order[b.kind]) || (b.seq - a.seq))
+    (b.pin - a.pin) || (order[a.kind] - order[b.kind]) || ((Number(b.created) || 0) - (Number(a.created) || 0)) || (b.seq - a.seq))
   const lines = ['[骨架]']
   let spent = sizeOf(lines[0])
   const seen = new Set()

@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  activation, availability, coreness, importanceOf, due, clock,
+  activation, availability, coreness, importanceOf, clock, propagate, selectCard,
   memoryView, orderProjection, rankRecall, periphery, retire, restore, render, explain,
   QUANTUM_MS,
 } from '../src/graph-memory.js'
@@ -60,10 +60,16 @@ test('importance is a property of the node, never of its age', () => {
   assert.ok(importanceOf({ kind: 'decision' }) > importanceOf({ kind: 'progress' }))
 })
 
-test('due rises as a memory approaches being lost', () => {
-  assert.ok(due(0.5) > due(0.9), 'a fading memory is more worth a byte')
-  assert.ok(due(0.99) < due(0.9), 'a safe memory is worth almost nothing')
-  assert.ok(due(0.9999) > 0)
+test('need rises with recent use — higher activation ranks higher, not lower', () => {
+  const store = new Store(':memory:')
+  try {
+    store.recordNodes('p', { nodes: [node('used', { kind: 'decision' }), node('idle', { kind: 'decision' })] })
+    age(store, 'used', 10, T0); age(store, 'idle', 10, T0)
+    store.db.prepare('INSERT INTO activation(id,scope,node,query,at) VALUES (?,?,?,?,?)').run('u1', 'p', 'used', 'q', T0 - 3_600_000)
+    const view = memoryView(store, 'p', { now: T0 })
+    assert.ok(view.byId.get('used').score > view.byId.get('idle').score)
+    assert.equal(orderProjection(view)[0].id, 'used')
+  } finally { store.close() }
 })
 
 test('the clock is quantised, so the card cannot change inside one bucket', () => {

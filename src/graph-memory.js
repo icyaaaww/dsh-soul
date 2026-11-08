@@ -1,66 +1,65 @@
 /**
- * Graph memory — activation, periphery, and the read path that was missing.
+ * Graph memory — the read path.
  *
- * The store already keeps everything needed to know what is fading: `activation.at` (when a
- * node was recalled), `edge.w` (how strongly things are associated), `node.kind`/`pin` (what
- * must not be lost). None of it reached the projection, which sorted by `pin -> kind -> seq`.
- * A weight was accumulated and never read.
+ * The question the card answers is "what will the model need *now*", and the reader matters:
+ * the model is stateless. Nothing it saw last call is still in its head unless it is in the
+ * context again, so a spacing-effect schedule — show what is about to be forgotten — has no
+ * reader whose forgetting it could slow down. 2.0 shipped exactly that schedule (`due(A)`:
+ * lower activation, higher priority) and in production it showed the *oldest* items of every
+ * kind, statically, because nothing logged an exposure.
  *
- * This module is the read path. Its whole design rests on one claim: **there are three
- * orthogonal signals and they must not be collapsed into one number.**
+ * Anderson & Schooler (1991) is the right reading of ACT-R here: base-level activation is the
+ * log-odds that an item is needed, estimated from when it was needed before. So activation is
+ * computed from *use* — a recall, the user naming it, a tool touching its path, the reply
+ * referring to it — and a higher value ranks *higher*.
  *
- *   A  activation   — "could I produce this if asked right now?"   frequency x recency
- *   C  coreness     — "how central is this in the association graph?"  structure only
- *   I  importance   — "what happens if this is wrong?"               human-assigned, static
+ * Everything is summed in that log-odds space, the way ACT-R sums it:
  *
- * Each has a specific, observed failure when used alone:
- *   A only  -> whatever was mentioned most recently monopolises the card, trivia included
- *   C only  -> a hub is fed forever (the mega-hub problem), and structure carries no clock
- *   I only  -> a static order starves: measured 280 reviews delivered to 7 of 60 nodes
+ *   need  = B            base level: ln Σ (t − t_j)^−d over creation and every use
+ *         + ln(1 + W)    working memory: a leaky integrator over the last few turns
+ *         + Σ w_j S_ji   cue: the current message (and the drifting topic), S_ji = S − ln fan_j
+ *         + β·P          graph context: personalized PageRank from the cue-matched nodes
+ *         + ln(1 + 2s)   salience: surprise at encoding (a failure, a recovery, a correction)
+ *         − penalty      contradicted by a later correction (reconsolidation)
+ *   score = need + ln(importance)
  *
- * So each signal is used exactly once, where it is the right instrument:
- *   A  orders what to show, and gates what to retire
- *   C  gates retirement only — never display, because a load-bearing decision is often low-degree
- *   I  caps the order, so a fresh `progress` line cannot outrank a standing constraint
+ * Three signals still stay out of the sum because they answer other questions: coreness
+ * explains, degree gates retirement, and `pin` puts a constraint on the card regardless.
  *
- * Cost: one pass over `activation` and `edge` per call, O(V + E + A) with no per-node history
- * scan — the activation rows are grouped once, not queried per node. No new tables, no new
- * columns, no model call, nothing to migrate. Everything here is derived from data the store
- * already writes.
+ * Cost: one pass over nodes, edges, mentions and the activation log, O(V + E + A), no model
+ * call. The log is read only up to the start of the current clock bucket, so a recall in the
+ * middle of a turn cannot change the card under the next model call.
  */
 
 const DAY = 86_400_000
 const MIN_EDGE_WEIGHT = 0.1
-// `supersedes` means "replaced", not "associated". Letting it link nodes would make an obsolete
-// claim look central precisely because something newer points at it.
-const NON_ASSOCIATIVE = new Set(['supersedes'])
+// `supersedes` means "replaced" and `contradicts` means "corrected": neither is an association.
+// Letting them carry the walk would make an obsolete claim look central precisely because
+// something newer points at it.
+export const NON_ASSOCIATIVE = new Set(['supersedes', 'contradicts'])
 
-/**
- * Time quantum for the projection.
- *
- * `A` depends on a clock, so a naive read path makes the card change between two calls in the
- * same turn — which breaks "same state, same bytes" and with it the prompt cache prefix. The
- * clock is quantised instead: the card is byte-identical for every call inside one bucket, and
- * rotates across buckets. Five minutes is the default because it is longer than a tool loop and
- * shorter than a working session; a turn-anchored clock is the stricter option.
- */
+/** Time quantum for the projection: same bucket, same bytes. */
 export const QUANTUM_MS = 5 * 60_000
 export const clock = (now = Date.now(), quantum = QUANTUM_MS) => Math.floor(now / quantum) * quantum
 
-const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v))
+/** Tunables, named once. Fitted values (see `bench/replay.mjs --fit`) replace these, not code. */
+export const PARAMS = Object.freeze({
+  d: 0.5,          // ACT-R decay
+  leak: 0.5,       // working-memory retention per turn
+  beta: 1.5,       // weight of the graph context term
+  inhibition: Math.LN2, // each already-shown node about the same object halves the next one
+  contradicted: 1.5,
+  pinShare: 0.6,   // pinned lines may take this much of the card before they compete
+})
 
 /**
- * ACT-R base-level activation: `B = ln Σ (t - t_j)^-d`.
+ * ACT-R base-level activation: `B = ln Σ (t - t_j)^-d`, t in days.
  *
  * One parameter, and it produces power-law forgetting, the spacing effect and the frequency
- * effect together. Creation counts as an encoding event, so a node that was never retrieved
- * still decays from birth instead of being undefined.
- *
- * `d = 0.5` is ACT-R's canonical value. Anderson & Schooler (1991) showed the power law is not
- * an arbitrary fit: the need-probability of items in the environment follows a power function,
- * and this is the Bayes-optimal estimate of it.
+ * effect together. Creation counts as an encoding event, so a node that was never used still
+ * has a finite value that decays from birth.
  */
-export function activation(times, now = Date.now(), { d = 0.5, floorMs = 60_000 } = {}) {
+export function activation(times, now = Date.now(), { d = PARAMS.d, floorMs = 60_000 } = {}) {
   if (!times?.length) return -Infinity
   let sum = 0
   for (const at of times) {
@@ -70,30 +69,15 @@ export function activation(times, now = Date.now(), { d = 0.5, floorMs = 60_000 
   return sum > 0 ? Math.log(sum) : -Infinity
 }
 
-/**
- * Normalise activation to [0,1] for ranking, via the logistic ACT-R uses for recall probability.
- *
- * Ordinal, not calibrated: read it as "more available than", never as "N% chance". The threshold
- * is expressed as a **quantile of the current distribution** rather than an absolute number, so
- * the rule self-calibrates and there is no magic constant to tune per project.
- */
+/** ACT-R's recall probability, mapped to [0,1]. Ordinal, not calibrated. */
 export function availability(B, { threshold = 0, noise = 0.4 } = {}) {
   if (!Number.isFinite(B)) return 0
   return 1 / (1 + Math.exp(-(B - threshold) / noise))
 }
 
 /**
- * k-core decomposition, Batagelj–Zaversnik O(V + E).
- *
- * `coreness(v)` is the largest k for which v survives k rounds of "delete every node of degree
- * < k". It is the formal version of "how buried in the core" a memory is.
- *
- * It is **not** the right instrument for "does anything still link to this": the centre of a
- * star has three neighbours and coreness 1, exactly like a leaf. Measured on a barbell-plus-
- * pendant fixture, a degree-3 hub and a dangling pendant were indistinguishable to the k-core,
- * so retirement cannot be gated on it. Degree answers that question directly. Coreness keeps
- * its place where it does add something — explaining *why* a node is peripheral, and weighting
- * compaction — but not as the retirement gate.
+ * k-core decomposition, Batagelj–Zaversnik O(V + E). Explains *why* a node is peripheral; it is
+ * not the retirement gate (a star's centre and a leaf both have coreness 1 — degree is).
  */
 export function coreness(ids, edges, { minWeight = MIN_EDGE_WEIGHT } = {}) {
   const { core } = adjacency(ids, edges, { minWeight })
@@ -159,49 +143,31 @@ export function importanceOf(node) {
   }
 }
 
-/** Per-turn value of a memory: high when it is about to be lost, low when it is safe. */
-export function due(A, { aHigh = 0.95 } = {}) {
-  return A <= aHigh ? 1 + (1 - A) : 1 / (1 + 4 * (A - aHigh))
-}
-
 /**
- * Prepared statements, cached per store.
+ * The activation log, read incrementally.
  *
- * `projectionText` runs on every model call, so a `prepare()` per call is pure overhead —
- * measured at roughly two thirds of the read-path cost at 500 nodes. The cache is keyed by the
- * store instance and holds nothing else, so a closed store simply drops its entry.
- */
-/**
- * Incremental read of the activation log.
- *
- * The activation table is append-only and large, and `memoryView` runs on every model call. Most
- * of those calls see a log that has not changed since the previous one, so the whole scan is
- * repeated work. The cache key is `(MAX(rowid), COUNT(*))`: appends move the rowid, and pruning
- * moves the count without necessarily moving the rowid, so both together detect every change a
- * `DELETE` can make. Keyed by store instance, so a closed store drops its entry with it.
- *
- * This is the cheap half of Petrov's approximation: instead of storing a running summary per
- * node, remember the scan. It leaves the activation rows as the single source of truth — no
- * second copy to drift out of sync — and costs one indexed aggregate per call when cold.
+ * Keyed by `(MAX(rowid), COUNT(*))`: appends move the rowid, pruning moves the count. Keyed by
+ * store instance, so a closed store drops its entry with it. The rows themselves stay the single
+ * source of truth — no running summary to drift out of sync.
  */
 const ACTIVATIONS = new WeakMap()
 
-function activationTimes(store, scope) {
+function activationLog(store, scope) {
   const stamp = store.db.prepare(
     'SELECT COALESCE(MAX(rowid),0) m, COUNT(*) n FROM activation WHERE scope=?').get(scope)
   const key = `${stamp.m}:${stamp.n}`
   const cached = ACTIVATIONS.get(store)?.get(scope)
   if (cached && cached.key === key) return cached
-
-  const times = new Map()
+  const rows = new Map()
   let activations = 0
-  for (const row of store.db.prepare('SELECT node, at FROM activation WHERE scope=?').all(scope)) {
-    const list = times.get(row.node)
-    if (list) list.push(Number(row.at))
-    else times.set(row.node, [Number(row.at)])
+  for (const row of store.db.prepare('SELECT node, at, turn FROM activation WHERE scope=?').all(scope)) {
+    const list = rows.get(row.node)
+    const entry = { at: Number(row.at), turn: row.turn == null ? null : Number(row.turn) }
+    if (list) list.push(entry)
+    else rows.set(row.node, [entry])
     activations++
   }
-  const value = { key, times, activations }
+  const value = { key, rows, activations }
   const byScope = ACTIVATIONS.get(store) ?? new Map()
   byScope.set(scope, value)
   ACTIVATIONS.set(store, byScope)
@@ -215,75 +181,121 @@ function statements(store) {
   set = {
     edge: store.db.prepare('SELECT src, dst, rel, w FROM edge WHERE scope=?'),
     retire: store.db.prepare("UPDATE node SET state='retired', seen=? WHERE id=? AND pin=0"),
-    restore: store.db.prepare("UPDATE node SET state='active', valid_to=NULL WHERE id=?"),
+    restore: store.db.prepare("UPDATE node SET state='active' WHERE id=? AND state='retired'"),
   }
   PREPARED.set(store, set)
   return set
 }
 
+/** Normalise a cue argument: a term list (2.0 callers) or `{ terms, entities }`. */
+function cueSources(cues, context) {
+  const sources = new Map()
+  const add = (key, weight) => { if (key) sources.set(key, (sources.get(key) ?? 0) + weight) }
+  if (Array.isArray(cues)) for (const term of cues) add(term, 1)
+  else if (cues) {
+    for (const term of cues.terms ?? []) add(term, 1)
+    // A named path or package says much more about what is needed than a shared bigram.
+    for (const entity of cues.entities ?? []) add(entity, 2)
+  }
+  // The drifting topic of the last few turns (a temporal context model, TCM): weaker than what
+  // was just said, but it keeps "what we have been working on" in play across a short question.
+  if (context) for (const [term, weight] of context) add(term, 0.5 * weight)
+  return sources
+}
+
 /**
  * Build the whole read view in one pass.
  *
- * This replaces four separate scans (`activeNodes`, `searchNodes`, `neighbours`, `pruneNodes`)
- * with one, because all four wanted the same numbers. At the store's own ceiling — 500 nodes,
- * ~2000 edges — the whole thing runs in single-digit milliseconds, against a model call
- * measured in seconds.
+ * `cues` is the current message; `context` the drifting topic; `turn` the current turn number,
+ * for the working-memory term. All optional: without them the view is the base level plus
+ * importance and salience, which is still a pure function of (graph, clock bucket).
  */
-export function memoryView(store, scope, { now = Date.now(), quantum = QUANTUM_MS, limit = 500, cues = null } = {}) {
+export function memoryView(store, scope, { now = Date.now(), quantum = QUANTUM_MS, limit = store.maxNodes ?? 500, cues = null, context = null, turn = null, params = PARAMS } = {}) {
   const at = clock(now, quantum)
-  const nodes = store.activeNodes(scope, limit)
-  if (!nodes.length) return { at, byId: new Map(), list: [], q25: 0, maxCore: 0, sizes: { nodes: 0, edges: 0, activations: 0 } }
+  const all = store.activeNodes(scope, limit)
+  // A lookup written back in the middle of a bucket waits for the next one; a constraint does
+  // not — a correction is meant to change the very next call.
+  const nodes = all.filter(node => node.kind !== 'reference' || Number(node.created) <= at)
+  const empty = { at, byId: new Map(), list: [], q25: 0, maxCore: 0, sizes: { nodes: 0, edges: 0, activations: 0 } }
+  if (!nodes.length) return empty
 
   const sql = statements(store)
-  const log = activationTimes(store, scope)
-  const times = log.times
-  const activations = log.activations
+  const log = activationLog(store, scope)
   const edges = sql.edge.all(scope)
   const ids = nodes.map(node => node.id)
+  const index = new Map(ids.map((id, i) => [id, i]))
   const { degree, core } = adjacency(ids, edges)
+  const mentions = typeof store.mentions === 'function' ? store.mentions(scope) : new Map()
+
+  // Cue: ACT-R's associative term. Each source j spreads W_j·(S − ln fan_j) to the nodes that
+  // contain it; a term every node shares carries no information (fan = N, strength 0).
+  const sources = cueSources(cues, context)
+  const fan = new Map()
+  const featuresOf = node => {
+    const own = new Set(node.terms ?? [])
+    for (const entity of mentions.get(node.id) ?? []) own.add(entity)
+    return own
+  }
+  const features = nodes.map(featuresOf)
+  if (sources.size) for (const set of features) for (const key of set) if (sources.has(key)) fan.set(key, (fan.get(key) ?? 0) + 1)
+  const S = Math.log(nodes.length + 1)
+  const total = [...sources.values()].reduce((sum, w) => sum + w, 0) || 1
+  const cueOf = i => {
+    if (!sources.size) return 0
+    let sum = 0
+    for (const key of features[i]) {
+      const weight = sources.get(key)
+      if (!weight) continue
+      sum += (weight / total) * Math.max(0, S - Math.log(fan.get(key) ?? 1))
+    }
+    // The sum is over the node's features, so a long claim cannot win by repeating a cue: the
+    // normaliser is the cue's total weight, and the result is bounded by S.
+    return sum
+  }
+  const cue = nodes.map((_, i) => cueOf(i))
+
+  // Graph context: what the cue-matched nodes are connected to. Without it, a question about
+  // the loader lifts the loader node and nothing that explains it.
+  const seeds = []
+  cue.forEach((value, i) => { if (value > 0) seeds.push({ id: ids[i], score: value }) })
+  const seeded = new Set(seeds.map(seed => seed.id))
+  const reach = seeds.length ? propagate(nodes, edges, seeds, { mentions }) : new Map()
+
+  // Contradicted by a live correction: the memory was re-opened and found wrong.
+  const contradicted = new Set()
+  for (const edge of edges) if (edge.rel === 'contradicts' && index.has(edge.src)) contradicted.add(edge.dst)
 
   const byId = new Map()
   const scored = []
-  // Associative activation (ACT-R's other half). Base-level `A` answers "how recently have I
-  // needed this"; a cue adds "does the current question point at it". Without this the card is
-  // a standing summary and the only thing that makes it contextual is a separate `soul_recall`
-  // round-trip — which the model has to decide to make, and usually does not.
-  //
-  // The fan effect is the reason for the divisor: a cue term that many nodes share carries
-  // little information about any of them, exactly like IDF. Without it, "src" or "文件" would
-  // lift half the graph and the cue would rank nothing.
-  const cueSet = new Set(cues ?? [])
-  const cueFan = new Map()
-  if (cueSet.size) {
-    for (const node of nodes) for (const term of node.terms) {
-      if (cueSet.has(term)) cueFan.set(term, (cueFan.get(term) ?? 0) + 1)
-    }
-  }
-  const strength = node => {
-    if (!cueSet.size) return 0
-    let sum = 0
-    for (const term of node.terms) if (cueSet.has(term)) sum += 1 / (cueFan.get(term) ?? 1)
-    return sum
-  }
-  const rawStrengths = cueSet.size ? nodes.map(node => strength(node)) : []
-  const maxStrength = rawStrengths.reduce((m, v) => Math.max(m, v), 0)
-
   for (let i = 0; i < nodes.length; i++) {
     const node = nodes[i]
-    const list = times.get(node.id)
-    // Creation is an encoding event, so it is always in the trace. Without it a node that was
-    // never recalled has no activation at all, and the rule would treat "brand new" and "long
-    // forgotten" as the same thing.
-    const trace = list ? [Number(node.created), ...list] : [Number(node.created)]
-    const A = availability(activation(trace, at))
+    const uses = (log.rows.get(node.id) ?? []).filter(row => row.at <= at)
+    const B = activation([Number(node.created), ...uses.map(row => row.at)], at, { d: params.d })
+    let W = 0
+    if (Number.isInteger(turn)) {
+      const turns = [Number.isInteger(node.turn) ? node.turn : null, ...uses.map(row => row.turn)]
+      for (const t of turns) if (t != null && t <= turn) W += params.leak ** (turn - t)
+    }
+    const P = reach.get(node.id) ?? 0
+    const salience = Number(node.salience) || 0
+    const importance = importanceOf(node)
+    const need = (Number.isFinite(B) ? B : -10)
+      + Math.log(1 + W)
+      + cue[i]
+      // A seed already counts through its cue; P is for what the cue reaches, not what it hit.
+      + params.beta * (seeded.has(node.id) ? 0 : P)
+      + Math.log(1 + 2 * salience)
+      - (contradicted.has(node.id) ? params.contradicted : 0)
     const entry = {
       id: node.id, kind: node.kind, claim: node.claim, pin: Boolean(node.pin),
-      hits: Number(node.hits) || 0, seq: Number(node.seq) || 0,
-      A, deg: degree.get(node.id) ?? 0, core: core.get(node.id) ?? 0,
-      importance: importanceOf(node),
+      hits: Number(node.hits) || 0, seq: Number(node.seq) || 0, created: Number(node.created) || 0,
+      anchor: node.anchor ?? null,
+      A: availability(B), need, score: need + Math.log(importance),
+      deg: degree.get(node.id) ?? 0, core: core.get(node.id) ?? 0,
+      importance, salience, contradicted: contradicted.has(node.id),
+      entities: mentions.get(node.id) ?? [],
       ageDays: (at - Number(node.created)) / DAY,
-      // Normalised to [0,1] so it can multiply the order without a magic scale factor.
-      cue: maxStrength ? rawStrengths[i] / maxStrength : 0,
+      cue: cue[i], reach: P,
     }
     byId.set(node.id, entry)
     scored.push(entry)
@@ -292,56 +304,42 @@ export function memoryView(store, scope, { now = Date.now(), quantum = QUANTUM_M
   const A = scored.map(entry => entry.A).sort((a, b) => a - b)
   const q25 = A.length ? A[Math.floor(A.length * 0.25)] : 0
   const maxCore = scored.reduce((m, entry) => Math.max(m, entry.core), 0)
-  return { at, byId, list: scored, q25, maxCore, sizes: { nodes: nodes.length, edges: edges.length, activations } }
+  return { at, byId, list: scored, q25, maxCore, sizes: { nodes: nodes.length, edges: edges.length, activations: log.activations } }
 }
 
-/**
- * Order for the standing card.
- *
- * Pinned first unconditionally: a violated constraint is an error, not a low-probability recall,
- * so its availability is irrelevant. Everything else competes on `importance x due(A)`, which is
- * what produces rotation — a memory that was shown last turn has high A and a low due, so it
- * yields to one that was not. A static order, by any criterion, cannot do that.
- *
- * A cue multiplies the order rather than replacing it. `1 + 2 * cue` is bounded, so a strong
- * match can promote a peripheral node but cannot let one outrank a pinned constraint or a
- * load-bearing decision — the cue adjusts *within* the importance band, never across it.
- */
-export function orderProjection(view, { aHigh = 0.95, cueWeight = 2 } = {}) {
-  const score = entry => entry.importance * due(entry.A, { aHigh }) * (1 + cueWeight * (entry.cue ?? 0))
+/** Pinned first, then by score; equal scores fall back to the static order's tiebreak. */
+export function orderProjection(view) {
   return [...view.list].sort((a, b) =>
     (b.pin ? 1 : 0) - (a.pin ? 1 : 0)
-    || score(b) - score(a)
+    || b.score - a.score
+    || b.created - a.created
     || b.seq - a.seq)
 }
 
-/** Order for recall: the query is the cue, so activation matters more than standing value. */
+/** Order for recall: the query is the cue, so the score already contains it. */
 export function rankRecall(view, ids) {
   return [...ids]
     .map(id => view.byId.get(id))
     .filter(Boolean)
-    .sort((a, b) => (b.A * (1 + b.importance / 12)) - (a.A * (1 + a.importance / 12)))
+    .sort((a, b) => b.score - a.score)
 }
 
 /**
- * Spread a query's mass over the association graph (HippoRAG's idea, applied at project scale).
+ * Spread a query's mass over the association graph (HippoRAG's mechanism at project scale).
  *
- * A lexical hit is a seed, not an answer. The question "为什么加载器失效" matches the node that
- * says "加载器" and says nothing about the constraint two hops away that explains it. One-hop
- * neighbours only reach the first ring; stationary propagation reaches the rest at a strength
- * that decays with distance, which is exactly the ranking we want.
+ * Edges carry the walk in proportion to weight; `supersedes` and `contradicts` never do. When
+ * `mentions` is given, entities act as hub nodes: two claims that never share a rare bigram
+ * still meet at the path or package they both name (HippoRAG's phrase nodes, Graphiti's entity
+ * nodes). Entities everyone mentions are skipped — they connect everything to everything.
  *
- * `alpha` is the teleport probability — the share of mass that stays on the seeds. 0.5 over
- * three iterations is shallow on purpose: at this graph size (≤500 nodes) a long random walk
- * makes everything reachable from everything, and the ranking stops discriminating. Edge weight
- * is the transition probability, so `supersedes` is excluded (a replaced claim is not an
- * association) and the `related` / `coactivated` / `derived` edges carry the walk.
+ * `alpha` is the teleport share; three shallow rounds, because at ≤500 nodes a long walk makes
+ * everything reachable and the ranking stops discriminating.
  */
-export function propagate(nodes, edges, seeds, { alpha = 0.5, iterations = 3, minWeight = MIN_EDGE_WEIGHT } = {}) {
+export function propagate(nodes, edges, seeds, { alpha = 0.5, iterations = 3, minWeight = MIN_EDGE_WEIGHT, mentions = null, entityWeight = 0.5 } = {}) {
   const rank = new Map()
   if (!nodes.length || !seeds.length) return rank
   const index = new Map(nodes.map((node, i) => [node.id, i]))
-  const n = nodes.length
+  let n = nodes.length
   const out = Array.from({ length: n }, () => [])
   for (const edge of edges) {
     if (NON_ASSOCIATIVE.has(edge.rel)) continue
@@ -349,10 +347,24 @@ export function propagate(nodes, edges, seeds, { alpha = 0.5, iterations = 3, mi
     const a = index.get(edge.src)
     const b = index.get(edge.dst)
     if (a == null || b == null || a === b) continue
-    // Undirected: association has no direction, and a seed should lift what points at it as
-    // well as what it points at.
+    // Undirected: a seed lifts what points at it as well as what it points at.
     out[a].push({ to: b, w: edge.w })
     out[b].push({ to: a, w: edge.w })
+  }
+  if (mentions?.size) {
+    const holders = new Map()
+    for (const node of nodes) for (const entity of mentions.get(node.id) ?? []) {
+      const list = holders.get(entity)
+      if (list) list.push(index.get(node.id))
+      else holders.set(entity, [index.get(node.id)])
+    }
+    const maxFan = Math.max(3, Math.floor(nodes.length * 0.2))
+    for (const list of holders.values()) {
+      if (list.length < 2 || list.length > maxFan) continue
+      const hub = n++
+      out.push([])
+      for (const i of list) { out[i].push({ to: hub, w: entityWeight }); out[hub].push({ to: i, w: entityWeight }) }
+    }
   }
 
   const prefer = new Float64Array(n)
@@ -360,7 +372,6 @@ export function propagate(nodes, edges, seeds, { alpha = 0.5, iterations = 3, mi
   for (const seed of seeds) {
     const i = index.get(seed?.id ?? seed)
     if (i == null) continue
-    // A stronger lexical match seeds more mass; every seed still seeds something.
     prefer[i] += Math.max(0.2, Number(seed?.score ?? 1) || 1)
     seeded++
   }
@@ -381,32 +392,19 @@ export function propagate(nodes, edges, seeds, { alpha = 0.5, iterations = 3, mi
     mass = next
   }
 
-  const peak = Math.max(...mass)
-  for (let i = 0; i < n; i++) if (mass[i] > 0) rank.set(nodes[i].id, mass[i] / peak)
+  let peak = 0
+  for (let i = 0; i < nodes.length; i++) peak = Math.max(peak, mass[i])
+  if (!(peak > 0)) return rank
+  for (let i = 0; i < nodes.length; i++) if (mass[i] > 0) rank.set(nodes[i].id, mass[i] / peak)
   return rank
 }
 
 /**
- * What may be retired.
- *
- * The conjunction is the point: any single condition is wrong on its own.
- *   low A only       -> retires a hub nobody happened to need this month
- *   low degree only  -> retires a fresh constraint that has no edges yet
- *   never retrieved  -> retires a node created seconds ago
- *   low importance   -> without it, a decision with no edges and no recalls is retired, and it
- *                       is load-bearing precisely because it is a decision
- *
- * So all three signals appear here, each answering the question it is good at: A is the clock,
- * degree is the structure, importance is the human's verdict. `degFloor` is the operative
- * structural test rather than coreness — a star's centre and a dangling leaf both have
- * coreness 1, so a k-core gate retires the hub and keeps the leaf. Degree asks the actual
- * question: does anything still point at this?
- *
- * Retirement sets `state='retired'`, which removes it from the projection. It does **not**
- * delete: `soul_recall` still finds it, and `restore()` brings it back. Forgetting is a
- * visibility change because that is the only kind that is reversible.
+ * What may be retired: old, never used, unconnected, unimportant — all four at once. Any single
+ * condition retires something load-bearing (a hub, a fresh constraint, a node created seconds
+ * ago, an edge-less decision). Retirement hides; recall still reads retired rows.
  */
-export function periphery(view, { aQuantile = 0.25, degFloor = 1, minAgeDays = 7, maxImportance = 3 } = {}) {
+export function periphery(view, { degFloor = 1, minAgeDays = 7, maxImportance = 3 } = {}) {
   const floor = view.q25
   return view.list.filter(entry =>
     !entry.pin
@@ -428,8 +426,8 @@ export function retire(store, scope, view, options) {
 }
 
 /**
- * Restore a retired node. Retiring must be a decision a person can undo, or it is a delete with
- * extra steps.
+ * Restore a retired node. Only retirement is undone: a node that a later claim superseded stays
+ * superseded, because restoring visibility must not resurrect an instruction the user replaced.
  */
 export function restore(store, ids) {
   const stmt = statements(store).restore
@@ -438,21 +436,108 @@ export function restore(store, ids) {
   return out
 }
 
-/** Plain-text card, byte-budgeted, same contract as `skeleton.project`. */
-export function render(view, { budget = 600, aHigh = 0.95, labels = { constraint: '约束', decision: '决策', artifact: '产物', progress: '进度', reference: '索引' } } = {}) {
-  const lines = ['[骨架]']
-  let spent = Buffer.byteLength(lines[0])
+const LABELS = { constraint: '约束', decision: '决策', artifact: '产物', progress: '进度', reference: '索引' }
+
+/** Artifacts in one directory share a card line: `src/area1/ 下 a.js、b.js 已写入`. */
+const artifactPath = entry => entry.kind === 'artifact' && typeof entry.anchor === 'string' && entry.anchor.startsWith('file:')
+  ? entry.anchor.slice(5) : null
+const dirOf = path => path.includes('/') ? path.slice(0, path.lastIndexOf('/') + 1) : ''
+
+/** What a node is about, for inhibition: its instance entities, or its directory for artifacts. */
+function topicsOf(entry) {
+  const path = artifactPath(entry)
+  if (path) return [`dir:${dirOf(path)}`]
+  return (entry.entities ?? []).filter(entity => /[\d/.]/.test(entity)).slice(0, 4)
+}
+
+/**
+ * Choose the card: greedy by score under a byte budget, with lateral inhibition.
+ *
+ * k-winners-take-all with inhibition between competitors about the same object: every node
+ * already chosen for a topic lowers the next one on that topic by `inhibition` (a halving in
+ * odds). Without it a session that wrote twenty files fills the card with twenty "已写入"
+ * lines and nothing else. Pinned lines go first up to `pinShare` of the budget, then compete
+ * like constraints — an unbounded pin set was how a few long corrections ate the whole card.
+ */
+export function selectCard(view, { budget = 600, labels = LABELS, params = PARAMS } = {}) {
+  const lines = []         // { kind, text } or { kind: 'artifact', dir, names: [] }
+  const groups = new Map() // dir -> line
   const seen = new Set()
-  for (const entry of orderProjection(view, { aHigh })) {
-    if (seen.has(entry.claim)) continue
-    const line = `- ${labels[entry.kind] ?? entry.kind}: ${entry.claim}`
-    const price = Buffer.byteLength(line) + 1
-    if (spent + price > budget) continue
-    lines.push(line)
-    spent += price
-    seen.add(entry.claim)
+  const chosen = []
+  let spent = Buffer.byteLength('[骨架]')
+  // The exact byte change the line makes to the card: a second member turns a plain-path line
+  // into the grouped form, so the price is the difference between the two renderings.
+  const priceOf = entry => {
+    const path = artifactPath(entry)
+    const dir = path ? dirOf(path) : ''
+    if (path && dir) {
+      const group = groups.get(dir)
+      const name = path.slice(dir.length)
+      if (group) return Buffer.byteLength(renderLine({ ...group, names: [...group.names, name] }, labels)) - Buffer.byteLength(renderLine(group, labels))
+      return Buffer.byteLength(renderLine({ kind: 'artifact', dir, names: [name] }, labels)) + 1
+    }
+    return Buffer.byteLength(`- ${labels[entry.kind] ?? entry.kind}: ${entry.claim}`) + 1
   }
-  return lines.length > 1 ? lines.join('\n') : ''
+  const take = entry => {
+    const path = artifactPath(entry)
+    const dir = path ? dirOf(path) : ''
+    if (path && dir) {
+      const group = groups.get(dir)
+      if (group) group.names.push(path.slice(dir.length))
+      else { const line = { kind: 'artifact', dir, names: [path.slice(dir.length)] }; groups.set(dir, line); lines.push(line) }
+    } else lines.push({ kind: entry.kind, text: entry.claim })
+    seen.add(entry.claim)
+    chosen.push(entry)
+  }
+
+  const ordered = orderProjection(view)
+  const pins = ordered.filter(entry => entry.pin)
+  const pinBudget = Math.floor(budget * params.pinShare)
+  const rest = []
+  for (const entry of pins) {
+    if (seen.has(entry.claim)) continue
+    const price = priceOf(entry)
+    if (spent + price <= pinBudget) { take(entry); spent += price }
+    // Over the pin share, a pin competes as an ordinary constraint.
+    else rest.push({ ...entry, score: entry.need + Math.log(12) })
+  }
+  rest.push(...ordered.filter(entry => !entry.pin))
+
+  const load = new Map()
+  const remaining = rest.filter(entry => !seen.has(entry.claim))
+  while (remaining.length) {
+    let best = -1
+    let bestScore = -Infinity
+    for (let i = 0; i < remaining.length; i++) {
+      const entry = remaining[i]
+      if (spent + priceOf(entry) > budget) continue
+      let effective = entry.score
+      for (const topic of topicsOf(entry)) effective -= params.inhibition * (load.get(topic) ?? 0)
+      if (effective > bestScore) { bestScore = effective; best = i }
+    }
+    if (best < 0) break
+    const [entry] = remaining.splice(best, 1)
+    if (seen.has(entry.claim)) continue
+    spent += priceOf(entry)
+    take(entry)
+    for (const topic of topicsOf(entry)) load.set(topic, (load.get(topic) ?? 0) + 1)
+  }
+  return { lines, chosen, spent }
+}
+
+/** Plain-text card, byte-budgeted, same contract as `skeleton.project`. */
+export function render(view, { budget = 600, labels = LABELS, params = PARAMS } = {}) {
+  const { lines } = selectCard(view, { budget, labels, params })
+  if (!lines.length) return ''
+  return ['[骨架]', ...lines.map(line => renderLine(line, labels))].join('\n')
+}
+
+/** One card line. A one-member artifact group reads as its plain path. */
+function renderLine(line, labels = LABELS) {
+  if (!(line.kind === 'artifact' && line.names)) return `- ${labels[line.kind] ?? line.kind}: ${line.text}`
+  return line.names.length === 1
+    ? `- ${labels.artifact}: ${line.dir}${line.names[0]} 已写入`
+    : `- ${labels.artifact}: ${line.dir} 下 ${line.names.join('、')} 已写入`
 }
 
 /** Ledger line for `/mem dynamics`: what the read path currently believes, and why. */
@@ -462,11 +547,12 @@ export function explain(view, ids, { limit = 12 } = {}) {
     if (!entry) return { id, missing: true }
     return {
       id, kind: entry.kind, A: Number(entry.A.toFixed(3)),
+      need: Number(entry.need.toFixed(2)), score: Number(entry.score.toFixed(2)),
+      cue: Number(entry.cue.toFixed(2)), reach: Number(entry.reach.toFixed(2)),
       deg: entry.deg, core: entry.core,
-      importance: entry.importance, hits: entry.hits,
-      due: Number(due(entry.A).toFixed(2)),
+      importance: entry.importance, salience: entry.salience, hits: entry.hits,
       ageDays: Number(entry.ageDays.toFixed(1)),
-      fate: entry.pin ? 'pinned' : entry.A <= view.q25 ? 'periphery' : 'active',
+      fate: entry.pin ? 'pinned' : entry.contradicted ? 'contradicted' : entry.A <= view.q25 ? 'periphery' : 'active',
     }
   })
 }

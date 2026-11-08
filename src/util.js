@@ -94,15 +94,60 @@ export function leadingIntent(text) {
   return [...new Set(words)].slice(0, 6).join(',')
 }
 
-export function terms(text) {
+export function terms(text, limit = 80) {
   const s = redact(String(text ?? '')).replace(/\[REDACTED(?: KEY| TOKEN)?\]/g, '').normalize('NFKC').toLowerCase()
   const words = s.match(/[a-z0-9_]{2,}/g) ?? []
   for (const span of s.match(/[\p{Script=Han}]+/gu) ?? []) {
     if (span.length === 1) words.push(span)
     else for (let i = 0; i < span.length - 1; i++) words.push(span.slice(i, i + 2))
   }
-  return [...new Set(words)].slice(0, 80)
+  return [...new Set(words)].slice(0, limit)
 }
+
+/**
+ * Node claims are short but bigram-dense: 400 bytes of Chinese is ~130 bigrams, and the old
+ * cap of 80 meant the second half of a claim could never be found.
+ */
+export const NODE_TERMS = 200
+
+const ENTITY_STOP = new Set(['the', 'and', 'for', 'with', 'not', 'but', 'from', 'this', 'that', 'then', 'than',
+  'use', 'used', 'using', 'run', 'add', 'set', 'get', 'new', 'old', 'all', 'any', 'one', 'two', 'can', 'should',
+  'must', 'never', 'always', 'only', 'don', 'does', 'instead', 'because', 'switch', 'switched', 'replace',
+  'longer', 'into', 'out', 'are', 'was', 'were', 'has', 'have', 'had', 'will', 'just', 'also', 'when', 'what',
+  'why', 'how', 'its', 'your', 'you', 'our', 'ok', 'yes', 'no', 'file', 'files', 'line', 'step', 'todo', 'fix',
+  'test', 'tests', 'code', 'error', 'redacted'])
+const PATHLIKE = /[A-Za-z]:\\[^\s"'`,;)\]，。；]+|(?:[\w.@-]+\/)+[\w.@-]+|--[a-z0-9][a-z0-9-]*|\bv?\d+(?:\.\d+){1,3}\b|[\w-]+\.(?:[a-z][a-z0-9]{0,7})\b/gi
+
+/**
+ * The things a claim is *about*: paths, file names, flags, versions, package and symbol names.
+ *
+ * Bigram overlap answers "do these sentences sound alike"; entities answer "are they about the
+ * same object", which is the question supersession, spreading and use-tracking actually ask.
+ * Deliberately ASCII-only: a Chinese noun cannot be told from a function bigram without a
+ * segmenter, and a wrong entity is worse than a missing one.
+ */
+export function entities(text, limit = 24) {
+  const source = redact(String(text ?? '')).normalize('NFKC')
+  const out = new Set()
+  const rest = source.replace(PATHLIKE, match => {
+    const entity = match.toLowerCase().replaceAll('\\', '/').replace(/[.,;:]+$/, '')
+    if (entity.length >= 2) out.add(entity)
+    // A path is also findable by its file name, which is how people refer to it.
+    const base = entity.includes('/') ? entity.slice(entity.lastIndexOf('/') + 1) : ''
+    if (base && base.includes('.')) out.add(base)
+    return ' '
+  })
+  for (const word of rest.match(/[A-Za-z_][A-Za-z0-9_-]*/g) ?? []) {
+    const lower = word.toLowerCase()
+    if (ENTITY_STOP.has(lower)) continue
+    if (lower.length < 3 && !/\d/.test(lower)) continue
+    out.add(lower)
+  }
+  return [...out].slice(0, limit)
+}
+
+/** An entity that names one instance (a path, a version, `mod3`) rather than a kind of thing. */
+export const isInstance = entity => /[\d/.\\]/.test(entity)
 
 const TASK_SIMILARITY = 0.5
 

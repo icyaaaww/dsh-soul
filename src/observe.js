@@ -87,7 +87,8 @@ export class Recorder {
   }
 }
 
-const CORRECTION = /不对|错了|不是这个|重新|再试试|没改对|又错|还是不行|别这样|说过|之前提过|wrong|not what|again|still broken|redo|that's not/i
+// "报错了/出错了" reports a failure, it does not say the agent was wrong.
+const CORRECTION = /不对|(?<![报出])错了|不是这个|重新|再试试|没改对|又错|还是不行|别这样|说过|之前提过|wrong|not what|again|still broken|redo|that's not/i
 
 export function isCorrection(text) {
   return CORRECTION.test(String(text ?? ''))

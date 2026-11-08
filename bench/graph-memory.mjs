@@ -11,7 +11,6 @@
 
 import { Store } from '../src/store.js'
 import { memoryView, orderProjection, periphery, explain, render } from '../src/graph-memory.js'
-import { availability, activation, due, importanceOf } from '../src/graph-memory.js'
 
 const arg = (name, fallback) => Number(process.argv.find(a => a.startsWith(`--${name}=`))?.split('=')[1] ?? fallback)
 const TURNS = arg('turns', 60)
@@ -116,73 +115,6 @@ function cost() {
 }
 
 /* ------------------------------------------------------------------ */
-/* 2. same budget, two orderings                                        */
-/* ------------------------------------------------------------------ */
-
-const KIND_ORDER = { constraint: 0, reference: 1, decision: 2, artifact: 3, progress: 4 }
-
-/** Seed the order the code uses today: pinned, then kind, then newest. */
-function orderRecency(view) {
-  return [...view.list].sort((a, b) =>
-    (b.pin ? 1 : 0) - (a.pin ? 1 : 0)
-    || (KIND_ORDER[a.kind] ?? 9) - (KIND_ORDER[b.kind] ?? 9)
-    || b.seq - a.seq)
-}
-
-const priceOf = entry => Buffer.byteLength(`- ${entry.kind}: ${entry.claim}`) + 1
-
-function fill(order, budget) {
-  const picked = []
-  let spent = 0
-  for (const entry of order) {
-    const price = priceOf(entry)
-    if (spent + price > budget) continue
-    picked.push(entry)
-    spent += price
-  }
-  return picked
-}
-
-function experiment({ policy }) {
-  const { store, nodes } = build()
-  try {
-    const state = new Map(nodes.map(n => [n.id, { last: T0 - 30 * DAY, shown: 0 }]))
-    const covered = new Set()
-    let slots = 0
-    for (let turn = 0; turn < TURNS; turn++) {
-      const now = T0 + turn * TURN_DAYS * DAY
-      const view = memoryView(store, 'p', { now })
-      const order = policy === 'recency' ? orderRecency(view) : orderProjection(view)
-      const picked = fill(order, BUDGET)
-      for (const entry of picked) {
-        covered.add(entry.id)
-        slots++
-        // Being shown is a recall: it enters the activation log, exactly as `store.activate` does.
-        store.db.prepare('INSERT INTO activation(id,scope,node,query,at) VALUES (?,?,?,?,?)')
-          .run(`t-${turn}-${entry.id}`, 'p', entry.id, 'projection', now)
-        store.db.prepare('UPDATE node SET hits=hits+1, seen=? WHERE id=?').run(now, entry.id)
-      }
-    }
-    const end = T0 + TURNS * TURN_DAYS * DAY
-    const view = memoryView(store, 'p', { now: end })
-    const critical = view.list.filter(entry => entry.pin || entry.kind === 'decision')
-    const decayed = critical.filter(entry => entry.A <= view.q25)
-    const trash = view.list.filter(entry => entry.kind === 'progress')
-    const trashDecayed = trash.filter(entry => entry.A <= view.q25)
-    return {
-      slots,
-      covered: covered.size,
-      total: nodes.length,
-      critical: critical.length,
-      criticalDecayed: decayed.length,
-      trashDecayed: trashDecayed.length / Math.max(1, trash.length),
-      retired: periphery(view).length,
-      meanA: view.list.reduce((s, e) => s + e.A, 0) / view.list.length,
-    }
-  } finally { store.close() }
-}
-
-/* ------------------------------------------------------------------ */
 
 const out = []
 const c = cost()
@@ -194,18 +126,9 @@ out.push(`memoryView（激活扫描 + 边扫描 + k-core + 全部打分）：${u
 out.push(`它取代的 activeNodes 扫描：                            ${us(c.scanNs)}`)
 out.push(`→ 增量 ${us(c.ns - c.scanNs)}。一次模型调用以秒计，占 ${(c.ns / 1e9 * 100).toFixed(3)}%。`)
 
-const rec = experiment({ policy: 'recency' })
-const dyn = experiment({ policy: 'dynamics' })
-out.push('\n## 2. 同一预算、同一批节点、只有排法不同\n')
-out.push(pad('', 24) + pad('最新优先（现状）', 20) + pad('importance×衰减', 20))
-const rows = [
-  ['期末 A 均值', rec.meanA.toFixed(3), dyn.meanA.toFixed(3)],
-  ['关键节点落入低四分位', `${rec.criticalDecayed}/${rec.critical}`, `${dyn.criticalDecayed}/${dyn.critical}`],
-  ['progress 落入低四分位', pct(rec.trashDecayed), pct(dyn.trashDecayed)],
-  [`覆盖到的不同节点`, `${rec.covered}/${rec.total}`, `${dyn.covered}/${dyn.total}`],
-  ['可退役节点', String(rec.retired), String(dyn.retired)],
-]
-for (const row of rows) out.push(pad(row[0], 24) + pad(row[1], 20) + pad(row[2], 20))
+// The ordering comparison lives in `bench/replay.mjs`: 2.0 measured it here by logging every
+// line shown as a recall, which is exactly the exposure-as-use loop the 2.1 read path removes.
+out.push('\n## 2. 排法对照\n\n见 `npm run bench:memory`（bench/replay.mjs）：以"下一轮实际用到"为标准答案。')
 
 const sample = memoryView(build().store, 'p', { now: T0 })
 out.push('\n## 3. 账本（/mem dynamics 会打印的样子）\n')

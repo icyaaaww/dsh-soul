@@ -11,7 +11,7 @@ import { turnCounter } from './src/gate.js'
 import { hostProbe } from './src/host-probe.js'
 import { createHostRunner } from './src/host-runner.js'
 import { projectScope, bounded, boolean, integer, human, textBlocks, fail, sameTask, redact, terms as termSet } from './src/util.js'
-import { MemoryBuffer, capture, projectionText, recall, neighbourhood, consolidate, recordLookup, recordHandoff, recordCorrection, mergeDuplicates, view, fileFingerprint, promoteTurn } from './src/memory.js'
+import { MemoryBuffer, capture, projectionText, recall, neighbourhood, consolidate, recordLookup, recordHandoff, recordCorrection, mergeDuplicates, view, fileFingerprint, promoteTurn, noteUse, noteTurnUse, wireTurn, reconsolidate, recentlyTouched, verifyArtifacts, driftContext, cuesOf } from './src/memory.js'
 import { memoryView, explain, retire, restore, periphery } from './src/graph-memory.js'
 import { searchSession, expandRange } from './src/session-search.js'
 import { ingest, searchIndex } from './src/span-index.js'
@@ -168,6 +168,26 @@ export function apply(ctx, input = {}) {
   const recent = new Map()      // session -> last finished observation
   const lastTurn = new Map()    // session -> { intent } to detect corrections
   const memory = new MemoryBuffer()
+  // Buffer a host event with its host seq. The human's message was already buffered at pre-step
+  // (that is where its text is known); its session event only supplies the seq. Runtime-context
+  // snapshots are skipped: they are the card itself, and compiling the card back into the graph
+  // would make the memory read its own output.
+  const bufferEvent = (sid, event) => {
+    if (event.type === 'user/message') {
+      const source = event.data?.source?.kind ?? event.data?.message?.source?.kind
+      if (source === 'runtime-context') return
+      if (source === 'user') {
+        const text = textBlocks(event.data?.message?.content ?? event.data?.content)
+        if (memory.settle(sid, buffered => buffered.type === 'user/message'
+          && textBlocks(buffered.data?.message?.content) === text, event.seq)) return
+      }
+    }
+    memory.push(sid, { type: event.type, seq: event.seq, data: event.data })
+  }
+  const turnText = events => events
+    .filter(event => event.type === 'user/message' || event.type === 'assistant/message')
+    .map(event => textBlocks(event.data?.message?.content ?? event.data?.content))
+    .join('\n')
   const cwdBySession = new Map()
   // Sufficiency signal: when the incoming question barely touches the card, the card is not
   // enough and the model must be told so before it answers from imagination.
@@ -199,10 +219,16 @@ export function apply(ctx, input = {}) {
       try {
         const turns = turnCounter(store, scope).get()
         const last = Number(store.readMeta(`maintenance:${scope}`) ?? 0)
-        if (turns - last < config.memory.maintenanceTurns) continue
+        // Event-triggered as well as periodic: enough surprise since the last pass (failures,
+        // recoveries, corrections) is worth consolidating before the interval comes round —
+        // Generative Agents reflect on accumulated importance, not on a clock.
+        const since = Number(store.readMeta(`maintenanceAt:${scope}`) ?? 0)
+        const surprise = store.db.prepare('SELECT COALESCE(SUM(salience),0) s FROM node WHERE scope=? AND created>?').get(scope, since)?.s ?? 0
+        if (turns - last < config.memory.maintenanceTurns && !(turns - last >= 3 && surprise >= 2)) continue
         const merged = mergeDuplicates(store, scope, { limit: config.memory.maxNodes })
         const graph = consolidate(store, scope)
         store.writeMeta(`maintenance:${scope}`, turns)
+        store.writeMeta(`maintenanceAt:${scope}`, Date.now())
         if (merged.length) store.log({ scope, action: 'maintenance_merge', actor: 'system', detail: { merged: merged.length } })
       } catch { /* maintenance is opportunistic; a failure must not surface as a turn error */ }
     }
@@ -300,8 +326,10 @@ export function apply(ctx, input = {}) {
             let shared = 0
             for (const term of wanted) if (have.has(term)) shared++
             needsLookup.set(sid, card.length > 32 && wanted.size > 0 && shared / wanted.size < 0.2)
-            cues.set(sid, [...wanted])
+            cues.set(sid, cuesOf(text))
             lookups.delete(sid)
+            // The user naming a path or package is a use of every memory about it.
+            safe(() => noteUse(store, scope, { text, source: 'cue' }))()
           }
           const correction = !!previous?.intent && isCorrection(text)
           const intent = correction ? previous.intent : text
@@ -318,7 +346,12 @@ export function apply(ctx, input = {}) {
             evolve?.observe({ scope: state.scope, taskKey: state.taskKey, taskTerms: state.terms, corrections: 1, toolErrors: 0, complete: true })
             // And it is a memory, not only an evolution signal: the one thing the user stopped
             // to correct is the one thing that must survive the next compaction.
-            if (config.memory.enabled) safe(() => recordCorrection(store, state.scope, { text, intent, seq: 0 }))()
+            // Reconsolidation: what the last turn used or wrote was re-opened by this correction.
+            if (config.memory.enabled) safe(() => {
+              const touched = recentlyTouched(store, state.scope)
+              const id = recordCorrection(store, state.scope, { text, intent, session: sid })
+              if (id) reconsolidate(store, state.scope, id, touched)
+            })()
           }
         }
       })()
@@ -328,7 +361,7 @@ export function apply(ctx, input = {}) {
     listen('session/event', safe((session, event) => {
       if (disposed || session.header?.origin === 'subagent') return
       const sid = String(session.id)
-      if (config.memory.enabled) memory.push(sid, { type: event.type, data: event.data })
+      if (config.memory.enabled) bufferEvent(sid, event)
       if (event.type === 'turn/end') {
         recorder.observe(sid, event.type, event.data)
         const state = recorder.end(sid)
@@ -375,13 +408,22 @@ export function apply(ctx, input = {}) {
         if (state?.scope && config.memory.enabled) {
           const events = memory.take(sid)
           const cwd = cwdBySession.get(sid) ?? null
-          if (events.length) safe(() => capture(store, state.scope, events, {
-            hashOf: config.memory.verifyArtifacts && cwd ? path => fileFingerprint(cwd, path) : null,
+          const hashOf = config.memory.verifyArtifacts && cwd ? path => fileFingerprint(cwd, path) : null
+          const turn = turnCounter(store, state.scope).get()
+          // Use first, then capture: a node must not count as "used" by the sentence that made it.
+          const used = events.length ? (safe(() => noteTurnUse(store, state.scope, events, { turn }))() ?? []) : []
+          const captured = events.length ? safe(() => capture(store, state.scope, events, { hashOf, session: sid, turn, temporal: false }))() : null
+          // One Hebbian pass for the turn, gated by how the turn went, plus its temporal edges.
+          safe(() => wireTurn(store, state.scope, {
+            used, created: captured?.ids ?? [], turn,
+            outcome: { corrections: state.corrections, toolErrors: state.toolErrors, complete: state.complete },
           }))()
+          if (hashOf) safe(() => verifyArtifacts(store, state.scope, hashOf))()
+          if (events.length) safe(() => driftContext(store, state.scope, turnText(events)))()
           // Then, and only then, close the coverage gap: whatever extraction did not turn into a
           // node gets a reference pointer, because a shadowed span with no node behind it is
           // findable only by guessing its wording. Zero checkpoint bytes; a handful of rows.
-          if (events.length && config.memory.promote) safe(() => promoteTurn(store, state.scope, events))()
+          if (events.length && config.memory.promote) safe(() => promoteTurn(store, state.scope, events, { session: sid }))()
           // Keep the addressable index current at turn end rather than on first lookup:
           // otherwise the card cannot say how far back it reaches until after a search.
           safe(() => ingest(store, state.scope, session))()
@@ -431,7 +473,7 @@ export function apply(ctx, input = {}) {
             if (!cwd) return ''
             try {
               const scope = projectScope({ id: agent.session.id, header: { cwd } })
-              const card = projectionText(store, scope, config.memory.projectionBytes, { sessionId: String(agent.session.id), dynamics: config.memory.dynamics, promote: config.memory.promote, cues: cues.get(String(agent.session.id)) ?? null })
+              const card = projectionText(store, scope, config.memory.projectionBytes, { sessionId: String(agent.session.id), dynamics: config.memory.dynamics, promote: config.memory.promote, cues: cues.get(String(agent.session.id)) ?? null, turn: turnCounter(store, scope).get() })
               if (!card) return ''
               return needsLookup.get(String(agent.session.id))
                 ? `${card}\n[提示] 本轮问题与卡片重合很低：先 soul_recall 查原文（本轮最多 3 次），再回答，不要凭印象。`
@@ -471,9 +513,16 @@ export function apply(ctx, input = {}) {
                 // text" made it alternate between them and give up; the layers are an
                 // implementation detail, so the tool always consults both.
                 const graph = recall(store, scope, args.query, {
-                  limit: 6,
-                  dynamicsView: config.memory.dynamics ? memoryView(store, scope, { now: Date.now() }) : null,
+                  limit: 6, turn: turnCounter(store, scope).get(),
+                  dynamicsView: config.memory.dynamics ? memoryView(store, scope, { now: Date.now(), cues: cuesOf(args.query) }) : null,
                 })
+                // The index half of the hippocampal index: a node points back at the span it was
+                // extracted from, so a hit can bring its own evidence (pattern completion).
+                for (const hit of graph.hits.slice(0, 3)) {
+                  if (!hit.source) continue
+                  const span = store.spanAt(scope, hit.source.session, hit.source.seq)
+                  if (span?.text) hit.excerpt = bounded(span.text.replace(/\s+/g, ' ').trim(), 300)
+                }
                 let spans = []
                 let indexed = null
                 if (graph.hits.length < 2) {
@@ -485,6 +534,10 @@ export function apply(ctx, input = {}) {
                   spans = found.spans
                   // Write the pointer back so the same question becomes a card hit next time.
                   if (spans.length) recordLookup(store, scope, args.query, spans)
+                  // And the other direction: a span hit reactivates the nodes extracted from it.
+                  for (const span of spans) for (const node of store.nodesAt(scope, span.session, span.seq)) {
+                    store.activate(scope, { node: node.id, query: args.query, source: 'recall', turn: turnCounter(store, scope).get() })
+                  }
                 }
                 value = {
                   query: args.query,
@@ -734,7 +787,7 @@ export function apply(ctx, input = {}) {
           if (verb === 'dynamics') {
             // The ledger. A score nobody can inspect is a rumour, and this one decides what the
             // model sees every turn.
-            const built = memoryView(store, scope, { now: Date.now() })
+            const built = memoryView(store, scope, { now: Date.now(), turn: turnCounter(store, scope).get() })
             const order = explain(built, [...built.byId.keys()], { limit: 20 })
             return { kind: 'success', text: JSON.stringify({
               clock: new Date(built.at).toISOString(),

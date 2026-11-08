@@ -1,10 +1,10 @@
 import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { hash, id, day, clean, bounded, redact, redactData, redactText, terms as termSet, sameTask } from './util.js'
+import { hash, id, day, clean, bounded, redact, redactData, redactText, terms as termSet, sameTask, entities, NODE_TERMS } from './util.js'
 import { segment } from './span-index.js'
 
-export const SCHEMA_VERSION = 8
+export const SCHEMA_VERSION = 9
 
 /** Retention caps for the two append-only tables. Oldest rows go first. */
 export const MAX_SPANS_PER_SCOPE = 20000
@@ -233,8 +233,29 @@ export class Store {
           at INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS activation_scope ON activation(scope, at);
 
+        -- Entity index (2.1). A node mentions the identifiers, packages and symbols it talks
+        -- about; two nodes that never share a rare bigram still meet at the entity they share.
+        -- Derived from claims, so it is rebuilt rather than migrated.
+        CREATE TABLE IF NOT EXISTS mention(
+          scope TEXT NOT NULL,
+          node TEXT NOT NULL,
+          entity TEXT NOT NULL,
+          PRIMARY KEY(scope, node, entity));
+        CREATE INDEX IF NOT EXISTS mention_entity ON mention(scope, entity);
+
         COMMIT;
       `)
+      // v9: where a node came from (host session + event seq), how surprising it was when it
+      // was written, and which turn wrote it; activations say what kind of use they record.
+      const addColumn = (table, column, decl) => {
+        const columns = this.db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name)
+        if (!columns.includes(column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`)
+      }
+      addColumn('node', 'session', 'TEXT')
+      addColumn('node', 'salience', 'REAL NOT NULL DEFAULT 0')
+      addColumn('node', 'turn', 'INTEGER')
+      addColumn('activation', 'source', 'TEXT')
+      addColumn('activation', 'turn', 'INTEGER')
       // Version 1 databases predate the lesson column; CREATE TABLE IF NOT EXISTS cannot add
       // it, so migrate explicitly before declaring the schema current.
       const episodeColumns = this.db.prepare('PRAGMA table_info(episode)').all().map(c => c.name)
@@ -251,6 +272,14 @@ export class Store {
             const claim = redactText(row.claim)
             if (claim !== row.claim) update.run(claim, JSON.stringify(termSet(claim)), row.id)
           }
+        }
+        // v9: node terms used to stop at 80, which cut the tail off long Chinese claims; the
+        // entity index is new. Both are derived from the claim, so recompute them once.
+        if (version > 0 && version < 9) {
+          const update = this.db.prepare('UPDATE node SET terms=? WHERE id=?')
+          const rows = this.db.prepare('SELECT id, scope, claim FROM node').all()
+          for (const row of rows) update.run(JSON.stringify(termSet(row.claim, NODE_TERMS)), row.id)
+          this.indexMentions(rows)
         }
         this.db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`)
       })
@@ -636,16 +665,23 @@ export class Store {
     if (!scope || (!nodes.length && !edges.length)) return 0
     const now = this.now()
     this.tx(() => {
+      // A rewritten artifact keeps its newest fingerprint: the stored hash is what later proves
+      // the evidence stale, so keeping the first one would flag every rewrite as stale.
       const insert = this.db.prepare(`INSERT INTO node(
         id,scope,kind,claim,terms,anchor,hash,source,seq,pin,valid_from,valid_to,recorded_at,
-        weight,support,hits,state,created,seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(id) DO UPDATE SET support=support+1, seen=excluded.seen, claim=excluded.claim`)
+        weight,support,hits,state,created,seen,session,salience,turn) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET support=support+1, seen=excluded.seen, claim=excluded.claim,
+          hash=COALESCE(excluded.hash, hash), salience=MAX(salience, excluded.salience)`)
+      const written = []
       for (const node of nodes) {
         const claim = bounded(redactText(String(node.claim ?? '')), 400)
-        insert.run(node.id, scope, String(node.kind), claim, JSON.stringify(termSet(claim)),
-          node.anchor ?? null, node.hash ?? null, node.source ?? null, Number(node.seq) || 0,
-          node.pin ? 1 : 0, now, null, now, 1, 1, 0, 'active', now, now)
+        insert.run(node.id, scope, String(node.kind), claim, JSON.stringify(termSet(claim, NODE_TERMS)),
+          node.anchor ?? null, node.hash ?? null, node.source ?? null, Number.isFinite(Number(node.seq)) ? Number(node.seq) : 0,
+          node.pin ? 1 : 0, now, null, now, 1, 1, 0, 'active', now, now,
+          node.session ?? null, Number(node.salience) || 0, Number.isInteger(node.turn) ? node.turn : null)
+        written.push({ id: node.id, scope, claim })
       }
+      this.indexMentions(written)
       const link = this.db.prepare('INSERT OR IGNORE INTO edge(id,scope,src,dst,rel,w,created) VALUES (?,?,?,?,?,?,?)')
       for (const edge of edges) {
         if (!edge?.src || !edge?.dst) continue
@@ -657,6 +693,36 @@ export class Store {
     return nodes.length
   }
 
+  /** Rebuild the entity rows of the given nodes from their claims. */
+  indexMentions(rows) {
+    const clear = this.db.prepare('DELETE FROM mention WHERE scope=? AND node=?')
+    const add = this.db.prepare('INSERT OR IGNORE INTO mention(scope,node,entity) VALUES (?,?,?)')
+    for (const row of rows) {
+      clear.run(row.scope, row.id)
+      for (const entity of entities(row.claim)) add.run(row.scope, row.id, entity)
+    }
+  }
+
+  /** node id -> entities, for the nodes of one scope. */
+  mentions(scope) {
+    const out = new Map()
+    for (const row of this.db.prepare('SELECT node, entity FROM mention WHERE scope=?').all(scope)) {
+      const list = out.get(row.node)
+      if (list) list.push(row.entity)
+      else out.set(row.node, [row.entity])
+    }
+    return out
+  }
+
+  /** Live nodes that mention any of the given entities. */
+  nodesMentioning(scope, list) {
+    const wanted = [...new Set(list ?? [])]
+    if (!wanted.length) return []
+    const slots = wanted.map(() => '?').join(',')
+    return this.db.prepare(`SELECT DISTINCT m.node id, m.entity FROM mention m JOIN node n ON n.id=m.node
+      WHERE m.scope=? AND m.entity IN (${slots}) AND n.state='active' AND n.valid_to IS NULL`).all(scope, ...wanted)
+  }
+
   /**
    * Keep the graph bounded, and prefer to let go of what was already let go of.
    *
@@ -666,19 +732,21 @@ export class Store {
    * says it does not do.
    *
    * Two stages, and the order is the point:
-   *   1. delete only nodes that were already retired *and* are old. Retirement is the reversible
-   *      step; by the time a node reaches here a person has had a chance to `restore` it.
-   *   2. if that was not enough, fall back to the old recency rule, but never touch a pinned
-   *      node or one that was actually retrieved.
+   *   1. retired rows are kept — retirement is a visibility change, and recall still reads them —
+   *      until the scope holds four times the cap in total. Only then do the oldest retired rows
+   *      go, because a table that cannot shrink is an operational bug.
+   *   2. if the live set is over the cap, fall back to the old recency rule, but never touch a
+   *      pinned node, and rank retrieved nodes ahead of equally old ones.
    *
    * The second stage keeps the table bounded even on a project that never calls `/mem sleep`.
    */
   pruneNodes(scope, limit = this.maxNodes) {
-    // Stage 1: retired and settled. Nothing load-bearing, nothing recently reachable. With the
-    // new switches off there are no retired nodes, so this deletes nothing and the default path
-    // is unchanged.
-    this.db.prepare(`DELETE FROM node WHERE scope=? AND pin=0 AND state='retired'
-      AND seen < ?`).run(scope, this.now() - 30 * 24 * 3600 * 1000)
+    const total = this.db.prepare('SELECT COUNT(*) n FROM node WHERE scope=?').get(scope)?.n ?? 0
+    if (total > limit * 4) {
+      this.db.prepare(`DELETE FROM node WHERE scope=? AND pin=0 AND state!='active' AND id IN (
+        SELECT id FROM node WHERE scope=? AND pin=0 AND state!='active' ORDER BY seen ASC LIMIT ?)`)
+        .run(scope, scope, total - limit * 4)
+    }
     // Stage 2: still over the cap. Oldest-first ranking, but retrieved nodes rank ahead of
     // equally old ones — the cap is still enforced, because a table that cannot shrink is an
     // operational bug, not a fairness win. Exempting `hits > 0` entirely (the first attempt)
@@ -693,14 +761,20 @@ export class Store {
     this.db.prepare(`DELETE FROM edge WHERE scope=? AND (
       src NOT IN (SELECT id FROM node WHERE scope=?) OR dst NOT IN (SELECT id FROM node WHERE scope=?))`)
       .run(scope, scope, scope)
+    this.db.prepare('DELETE FROM mention WHERE scope=? AND node NOT IN (SELECT id FROM node WHERE scope=?)')
+      .run(scope, scope)
   }
 
   parseNode(row) {
     return row ? { ...row, terms: parseJson(row.terms, []) } : null
   }
 
-  activeNodes(scope, limit = 400, { includeSuperseded = false } = {}) {
-    return this.db.prepare(`SELECT * FROM node WHERE scope=? AND state='active'
+  /**
+   * Live nodes, pinned first then most recently seen. The default window is the configured cap:
+   * a narrower window made the oldest fifth of the graph invisible to every lexical lookup.
+   */
+  activeNodes(scope, limit = this.maxNodes, { includeSuperseded = false, includeRetired = false } = {}) {
+    return this.db.prepare(`SELECT * FROM node WHERE scope=? AND ${includeRetired ? "state IN ('active','retired','stale')" : "state='active'"}
       ${includeSuperseded ? '' : 'AND valid_to IS NULL'}
       ORDER BY pin DESC, seen DESC LIMIT ?`).all(scope, limit).map(row => this.parseNode(row))
   }
@@ -719,10 +793,10 @@ export class Store {
    * Term-overlap lookup. Deliberately lexical: an embedding would need a model at write time
    * and would make every recall unauditable.
    */
-  searchNodes(scope, queryTerms, limit = 12, { includeSuperseded = false } = {}) {
+  searchNodes(scope, queryTerms, limit = 12, { includeSuperseded = false, includeRetired = false } = {}) {
     const wanted = new Set(queryTerms ?? [])
     if (!wanted.size) return []
-    return this.activeNodes(scope, 400, { includeSuperseded })
+    return this.activeNodes(scope, this.maxNodes * 4, { includeSuperseded, includeRetired })
       .map(node => {
         const own = new Set(node.terms)
         let shared = 0
@@ -735,11 +809,16 @@ export class Store {
       .map(entry => entry.node)
   }
 
-  /** One hop out from the given nodes, in either direction. */
-  neighbours(scope, ids) {
+  /**
+   * One hop out from the given nodes, in either direction. `associative` skips `supersedes`:
+   * a replaced claim is history, not a neighbour, and following it let recall wire obsolete
+   * claims back into the live graph.
+   */
+  neighbours(scope, ids, { associative = false } = {}) {
     if (!ids.length) return []
     const slots = ids.map(() => '?').join(',')
-    const rows = this.db.prepare(`SELECT * FROM edge WHERE scope=? AND (src IN (${slots}) OR dst IN (${slots}))`)
+    const rows = this.db.prepare(`SELECT * FROM edge WHERE scope=? AND (src IN (${slots}) OR dst IN (${slots}))
+      ${associative ? "AND rel!='supersedes'" : ''}`)
       .all(scope, ...ids, ...ids)
     const other = new Set()
     for (const row of rows) other.add(ids.includes(row.src) ? row.dst : row.src)
@@ -749,9 +828,14 @@ export class Store {
       .filter(Boolean)
   }
 
-  /** Record that a node was surfaced. The log is the Hebbian signal and the GC evidence. */
-  activate(scope, { node, query = null }) {
-    this.db.prepare('INSERT INTO activation VALUES (?,?,?,?,?)').run(id(), scope, node, query, this.now())
+  /**
+   * Record that a node was used. `source` says how: `recall` (the tool), `cue` (the user named
+   * it), `tool` (a tool touched its path), `answer` (the model's reply referred to it). The log
+   * is the base-level activation, the Hebbian signal and the GC evidence at once.
+   */
+  activate(scope, { node, query = null, source = 'recall', turn = null }) {
+    this.db.prepare('INSERT INTO activation(id,scope,node,query,at,source,turn) VALUES (?,?,?,?,?,?,?)')
+      .run(id(), scope, node, query, this.now(), source, Number.isInteger(turn) ? turn : null)
     this.db.prepare('UPDATE node SET hits=hits+1, weight=MIN(3.0, weight+0.1), seen=? WHERE id=?').run(this.now(), node)
     this.pruneActivations(scope)
   }
@@ -825,14 +909,42 @@ export class Store {
   }
 
   /** Decay every edge and drop what has faded below noise. Returns how many were removed. */
-  decayEdges(scope, { factor = 0.97, floor = 0.05 } = {}) {
-    this.db.prepare('UPDATE edge SET w=w*? WHERE scope=?').run(factor, scope)
-    return this.db.prepare('DELETE FROM edge WHERE scope=? AND w < ?').run(scope, floor).changes ?? 0
+  decayEdges(scope, { factor = 0.97, floor = 0.05, rels = null } = {}) {
+    const only = rels?.length ? ` AND rel IN (${rels.map(() => '?').join(',')})` : ''
+    const args = rels?.length ? rels : []
+    this.db.prepare(`UPDATE edge SET w=w*? WHERE scope=?${only}`).run(factor, scope, ...args)
+    return this.db.prepare(`DELETE FROM edge WHERE scope=? AND w < ?${only}`).run(scope, floor, ...args).changes ?? 0
   }
 
-  /** Every edge weight in a scope, for callers that score nodes by connectivity. */
+  /**
+   * Homeostatic scaling: no node may hold more than `budget` of learned weight in total.
+   *
+   * A global decay keeps every ratio, so a hub that is reinforced on every recall stays a hub
+   * forever. Scaling per node (Turrigiano's synaptic scaling, in its simplest form) caps what
+   * any one memory can pull towards itself while leaving the ranking among its own edges alone.
+   * Each edge takes the stricter factor of its two endpoints, so the result is symmetric.
+   */
+  scaleEdges(scope, { rels = ['coactivated', 'precedes'], budget = 3 } = {}) {
+    const slots = rels.map(() => '?').join(',')
+    const rows = this.db.prepare(`SELECT id, src, dst, w FROM edge WHERE scope=? AND rel IN (${slots})`).all(scope, ...rels)
+    const load = new Map()
+    for (const row of rows) {
+      load.set(row.src, (load.get(row.src) ?? 0) + row.w)
+      load.set(row.dst, (load.get(row.dst) ?? 0) + row.w)
+    }
+    const factor = node => Math.min(1, budget / Math.max(load.get(node) ?? 0, 1e-9))
+    const update = this.db.prepare('UPDATE edge SET w=? WHERE id=?')
+    let scaled = 0
+    for (const row of rows) {
+      const f = Math.min(factor(row.src), factor(row.dst))
+      if (f < 1) { update.run(row.w * f, row.id); scaled++ }
+    }
+    return scaled
+  }
+
+  /** Every edge weight in a scope, with its relation, for callers that score by connectivity. */
   edgeWeights(scope) {
-    return this.db.prepare('SELECT src, dst, w FROM edge WHERE scope=?').all(scope)
+    return this.db.prepare('SELECT src, dst, rel, w FROM edge WHERE scope=?').all(scope)
   }
 
   graphStats(scope) {
@@ -906,6 +1018,19 @@ export class Store {
       FROM span_fts JOIN span s ON s.id = span_fts.rowid
       WHERE span_fts MATCH ? AND span_fts.scope=?
       ORDER BY score LIMIT ?`).all(match, scope, limit)
+  }
+
+  /** The verbatim span a node was extracted from — the index half of a hippocampal index. */
+  spanAt(scope, session, seq) {
+    if (!session || !Number.isInteger(seq) || seq < 0) return null
+    return this.db.prepare('SELECT seq, session, text FROM span WHERE scope=? AND session=? AND seq=?').get(scope, String(session), seq) ?? null
+  }
+
+  /** The other direction: live nodes extracted from one span. */
+  nodesAt(scope, session, seq) {
+    if (!session || !Number.isInteger(seq) || seq < 0) return []
+    return this.db.prepare("SELECT * FROM node WHERE scope=? AND session=? AND seq=? AND state='active' AND valid_to IS NULL")
+      .all(scope, String(session), seq).map(row => this.parseNode(row))
   }
 
   /** Substring fallback for queries the tokenizer cannot express (paths, mixed scripts). */

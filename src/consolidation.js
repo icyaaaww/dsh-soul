@@ -145,30 +145,6 @@ export function shadowRisk(profile, shadowedSeqs, { aFloor = 0.35 } = {}) {
 }
 
 /**
- * Record that a span became a claim.
- *
- * Compaction *is* the fast-store-to-slow-store transfer, so this is where tier promotion
- * belongs — not in `sleep()`, which only decays.
- *
- * It deliberately does **not** touch anything that feeds selection. If being picked for a
- * checkpoint raised a node's availability, the next checkpoint would pick it again: a
- * self-confirming loop that looks like learning and is not. The ledger records the event; the
- * signal stays out of it.
- */
-export function noteConsolidation(store, scope, seqs, now = Date.now()) {
-  const promoted = []
-  const stmt = store.db.prepare('SELECT id, tier, sleeps FROM node WHERE scope=? AND seq=? AND pin=0')
-  for (const seq of new Set(seqs.map(Number))) {
-    const row = stmt.get(scope, seq)
-    if (!row) continue
-    store.db.prepare('UPDATE node SET sleeps=sleeps+1, tier=? WHERE id=?')
-      .run(Math.max(Number(row.tier) || 0, 1), row.id)
-    promoted.push({ id: row.id, seq, tier: 1 })
-  }
-  return promoted
-}
-
-/**
  * The identifier-dense slice of a block, not its head.
  *
  * A claim that starts at byte 0 loses exactly what made the block worth promoting: the path or
@@ -207,7 +183,7 @@ function identifierWindow(text, limit = 96) {
  * So the rule is coverage, not decay: no node, identifier-dense, about to be shadowed -> write
  * one. It costs the checkpoint zero bytes and turns a lexical coin-flip into a term lookup.
  */
-export function promoteUncovered(store, scope, blocks, { now = Date.now(), max = 4, minIdentifiers = 1 } = {}) {
+export function promoteUncovered(store, scope, blocks, { now = Date.now(), max = 4, minIdentifiers = 1, session = null } = {}) {
   const IDENT = /[A-Za-z0-9_]*[/.][A-Za-z0-9_./-]+|--[a-z][a-z-]+|\bv?\d+\.\d+\.\d+\b|\b[A-Z]{3,}\b/g
   const existing = new Set()
   // Identifiers the graph already knows, so a block adds information only if it brings
@@ -216,14 +192,18 @@ export function promoteUncovered(store, scope, blocks, { now = Date.now(), max =
   // never gets its turn. Measured: with `max: 2` and no de-duplication, the 路径 and 版本
   // details were never promoted in forty turns.
   const present = new Set()
-  for (const node of store.activeNodes(scope, 500)) {
-    existing.add(Number(node.seq))
+  // Positions are only comparable inside one session and only when the host gave one: a block
+  // with an unknown seq (-1) is never "already covered" by position, only by its identifiers.
+  // Keying by bare seq skipped every block after the first turn, because every turn's
+  // positions used to restart at zero.
+  for (const node of store.activeNodes(scope)) {
+    if (node.session && Number(node.seq) >= 0) existing.add(`${node.session}:${node.seq}`)
     for (const identifier of String(node.claim ?? '').match(IDENT) ?? []) present.add(identifier)
   }
 
   const candidates = []
   for (const block of blocks) {
-    if (existing.has(Number(block.seq))) continue
+    if (session && Number(block.seq) >= 0 && existing.has(`${session}:${block.seq}`)) continue
     const text = String(block.text ?? '').replace(/\s+/g, ' ').trim()
     if (text.length < 12) continue
     // Only blocks that carry something unguessable: a path, a flag, a version, an error code.
@@ -248,7 +228,8 @@ export function promoteUncovered(store, scope, blocks, { now = Date.now(), max =
     const id = `ref-${hash(`${scope}\u0000environment\u0000${claim}`).slice(0, 16)}`
     if (created.some(row => row.id === id)) continue
     store.recordNodes(scope, {
-      nodes: [{ id, kind: 'reference', claim, anchor: `seq:${candidate.block.seq}`, seq: candidate.block.seq, source: 'compaction' }],
+      nodes: [{ id, kind: 'reference', claim, anchor: Number(candidate.block.seq) >= 0 ? `seq:${candidate.block.seq}` : null,
+        seq: candidate.block.seq, session, source: 'compaction' }],
     })
     // Claim them now, so a later block with the same identifiers is not worth another row.
     for (const identifier of candidate.fresh) present.add(identifier)

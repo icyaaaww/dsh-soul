@@ -34,6 +34,8 @@ const arg = (name, fallback) => process.argv.find(a => a.startsWith(`--${name}=`
 const TURNS = Number(arg('turns', 120))
 const BUDGET = Number(arg('budget', 600))
 const LOG = arg('log', null)
+// --truth=tools: only tool paths count as "needed" (the user message is not part of the answer key).
+const TRUTH = arg('truth', 'all')
 const DAY = 86_400_000
 const T0 = 1_790_000_000_000
 
@@ -124,6 +126,7 @@ function dueCard(view, budget) {
 }
 
 function cardFor(policy, store, now, cues, turn, params) {
+  if (params.noCue) cues = null
   if (policy === 'recency') return project(store.activeNodes('p', 200), { budget: BUDGET })
   if (policy === 'due') return dueCard(memoryView(store, 'p', { now }), BUDGET)
   return render(memoryView(store, 'p', { now, cues, turn, params, context: new Map(JSON.parse(store.readMeta('drift:p') ?? '[]')) }), { budget: BUDGET, params })
@@ -145,7 +148,7 @@ function replay(turns, policy, params = PARAMS) {
       const human = turns[t].events.find(e => e.type === 'user/message')
       const text = (human?.data?.message?.content ?? []).map(b => b.text ?? '').join('\n')
       // What this turn will touch, by instance entity: the ground truth for this card.
-      const touched = new Set([text, ...turns[t].events.flatMap(e => (e.data?.message?.content ?? [])
+      const touched = new Set([TRUTH === 'tools' ? '' : text, ...turns[t].events.flatMap(e => (e.data?.message?.content ?? [])
         .filter(b => b.type === 'tool-call').map(b => b.input?.path ?? ''))].flatMap(s => entities(s)).filter(isInstance))
       const card = cardFor(policy, store, now, cuesOf(text), t, params)
       if (previous !== null && card !== previous) changed++
@@ -182,7 +185,7 @@ const pct = v => `${(v * 100).toFixed(1)}%`
 const pad = (s, n) => String(s).padEnd(n)
 console.log(`${LOG ? `log ${LOG}` : 'synthetic Zipf workload'} · ${turns.length} turns · card ${BUDGET} B\n`)
 console.log(pad('policy', 10) + pad('recall@card', 14) + pad('needed', 9) + pad('churn', 9) + 'bytes')
-for (const [policy, params, label] of [['recency', PARAMS, 'recency'], ['due', PARAMS, 'due'], ['need', PARAMS, 'need']]) {
+for (const [policy, params, label] of [['recency', PARAMS, 'recency'], ['due', PARAMS, 'due'], ['need', { ...PARAMS, noCue: true }, 'need-cue'], ['need', PARAMS, 'need']]) {
   const r = replay(turns, policy, params)
   console.log(pad(label, 10) + pad(pct(r.recall), 14) + pad(r.needed, 9) + pad(pct(r.churn), 9) + r.bytes.toFixed(0))
 }

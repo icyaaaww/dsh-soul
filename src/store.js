@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { hash, id, day, clean, bounded, redact, redactData, redactText, terms as termSet, sameTask, entities, NODE_TERMS } from './util.js'
+import { hash, id, day, clean, bounded, oneLine, redact, redactData, redactText, terms as termSet, sameTask, entities, NODE_TERMS } from './util.js'
 import { segment } from './span-index.js'
 
 export const SCHEMA_VERSION = 9
@@ -269,7 +269,7 @@ export class Store {
           this.scrubSpans()
           const update = this.db.prepare('UPDATE node SET claim=?, terms=? WHERE id=?')
           for (const row of this.db.prepare('SELECT id, claim FROM node').all()) {
-            const claim = redactText(row.claim)
+            const claim = oneLine(redactText(row.claim))
             if (claim !== row.claim) update.run(claim, JSON.stringify(termSet(claim)), row.id)
           }
         }
@@ -674,7 +674,9 @@ export class Store {
           hash=COALESCE(excluded.hash, hash), salience=MAX(salience, excluded.salience)`)
       const written = []
       for (const node of nodes) {
-        const claim = bounded(redactText(String(node.claim ?? '')), 400)
+        // One line per claim: the card renders "- label: claim" and the card is a system
+        // prompt, so an embedded newline would forge a second, indistinguishable entry.
+        const claim = bounded(oneLine(redactText(String(node.claim ?? ''))), 400)
         insert.run(node.id, scope, String(node.kind), claim, JSON.stringify(termSet(claim, NODE_TERMS)),
           node.anchor ?? null, node.hash ?? null, node.source ?? null, Number.isFinite(Number(node.seq)) ? Number(node.seq) : 0,
           node.pin ? 1 : 0, now, null, now, 1, 1, 0, 'active', now, now,

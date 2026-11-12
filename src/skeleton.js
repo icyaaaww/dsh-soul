@@ -1,4 +1,4 @@
-import { bounded, bytes as sizeOf, terms as termSet, hash, redact, entities as entitySet } from './util.js'
+import { bounded, oneLine, bytes as sizeOf, terms as termSet, hash, redact, entities as entitySet } from './util.js'
 // One-way: consolidation reads the memory model and the store, never this module. Keeping the
 // arrow pointing this way is what lets `compact()` stay a pure function of its inputs — the
 // caller passes a profile in, so the same span and the same profile always render the same bytes.
@@ -447,7 +447,8 @@ function bestWindow(text, limit) {
 
 function renderNode(node) {
   const label = KIND_LABEL[node.kind] ?? node.kind
-  return `- ${label}: ${node.claim}`
+  // `recordNodes` already stores single-line claims; this covers rows written before that.
+  return `- ${label}: ${oneLine(node.claim)}`
 }
 
 /**

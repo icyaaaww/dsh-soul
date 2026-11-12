@@ -1,4 +1,4 @@
-import { bounded, terms as termSet } from './util.js'
+import { bounded, fail, terms as termSet } from './util.js'
 
 /**
  * Retrieval over the live session's own history.
@@ -178,13 +178,25 @@ export function searchSession(session, query, options) {
  * those events, bounded, so a pointer costs one call and a known number of bytes.
  */
 export function expandRange(session, from, to, { limit = 2000, maxEvents = 200 } = {}) {
-  const start = Math.max(0, Math.min(Number(from) || 0, Number(to) || 0))
-  const end = Math.max(Number(from) || 0, Number(to) || 0)
-  if (typeof session?.eventAt !== 'function') return { from: start, to: end, bytes: 0, text: '', events: 0 }
+  const wanted = [Number(from), Number(to)]
+  // "1e999" and "Infinity" survive Number() as Infinity, and `seq <= end` is then true
+  // forever because the loop counter only advances the stop condition on a hit. Reject
+  // non-finite values, and clamp the upper bound to the session length so a huge but legal
+  // value ("1e12") cannot spin the host either.
+  if (!wanted.every(Number.isFinite)) throw fail('invalid_range', 'from/to 必须是有限数字')
+  const lower = Math.max(0, Math.min(...wanted))
+  const seq = Number(session?.seq)
+  const ceiling = Number.isSafeInteger(seq) && seq >= 0 ? seq
+    : Number.isSafeInteger(Number(session?.log?.length)) ? Number(session.log.length) : 20000
+  const upper = Math.min(Math.max(...wanted), ceiling)
+  if (typeof session?.eventAt !== 'function') return { from: lower, to: upper, bytes: 0, text: '', events: 0 }
   const parts = []
   let events = 0
-  for (let seq = start; seq <= end && events < maxEvents; seq++) {
-    const event = session.eventAt(seq)
+  let scanned = 0
+  // `scanned` is the second bound: a session without `seq` still cannot buy an unbounded walk.
+  for (let cursor = lower; cursor <= upper && events < maxEvents && scanned < 20000; cursor++) {
+    scanned++
+    const event = session.eventAt(cursor)
     if (!event) continue
     const text = textOfEvent(event).trim()
     if (!text) continue
@@ -192,5 +204,5 @@ export function expandRange(session, from, to, { limit = 2000, maxEvents = 200 }
     events++
   }
   const text = bounded(parts.join('\n'), limit)
-  return { from: start, to: end, bytes: Buffer.byteLength(text), text, events }
+  return { from: lower, to: upper, bytes: Buffer.byteLength(text), text, events }
 }

@@ -11,6 +11,22 @@ export function bounded(text, bytes = 4000) {
   return buf.subarray(0, bytes).toString().replace(/�$/u, '')
 }
 
+/**
+ * Collapse text to a single display line.
+ *
+ * Claims are rendered as one card line and the card is injected as a system prompt, so a
+ * newline or a bidi control character inside a claim can forge a second line that looks
+ * exactly like a pinned constraint. Writes go through `recordNodes`, which applies this to
+ * every claim; renderers apply it again for rows written before that rule existed.
+ */
+export function oneLine(text) {
+  return String(text ?? '')
+    .replace(/[\r\n\u0085\u2028\u2029]+/g, ' ')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b\u200e\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/g, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim()
+}
+
 export const bytes = text => Buffer.byteLength(String(text ?? ''))
 
 /**

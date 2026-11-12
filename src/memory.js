@@ -1,6 +1,6 @@
 import { readFileSync, statSync } from 'node:fs'
 import { resolve, sep } from 'node:path'
-import { bounded, hash, terms as termSet, entities as entitySet, isInstance, NODE_TERMS } from './util.js'
+import { bounded, oneLine, hash, terms as termSet, entities as entitySet, isInstance, NODE_TERMS } from './util.js'
 import { extract, normalize, project } from './skeleton.js'
 import { memoryView, propagate, render } from './graph-memory.js'
 import { promoteUncovered } from './consolidation.js'
@@ -780,7 +780,7 @@ export function schematize(store, scope, { minHits = 2, limit = 8 } = {}) {
     if (!span?.text) continue
     const gist = identifierGist(span.text)
     if (!gist) continue
-    const claim = bounded(`${row.claim} → ${gist}`, 240)
+    const claim = bounded(oneLine(`${row.claim} → ${gist}`), 240)
     update.run(claim, JSON.stringify(termSet(claim, NODE_TERMS)), row.id)
     store.indexMentions([{ id: row.id, scope, claim }])
     done.push(row.id)

@@ -1,8 +1,12 @@
-# DSH Soul 2.1.0 — 图记忆修复与可选动力学重做
+# DSH Soul 2.2.0 — 证据回查、协作习惯与受控演化
 
 为 DSH 保存会话中的约束、决策、产物与进度，用本地记忆图和原文索引找回细节，并提供独立的图压缩后端与受控演化流程。
 
 记忆默认开启，记忆动力学与演化默认关闭。抽取和检索在本地执行，不修改模型权重；投影进入主模型上下文仍有 token 成本。演化中的候选编辑与探测会使用显式配置的模型路由。
+
+## 2.2 更新
+
+默认按证据缺口回查原文；协作偏好、分层保留与检索实验可单独开启。受控演化增加单规则修改和可选留出验证。详见 [更新日志](CHANGELOG.md)。
 
 ## 2.1 相比 2.0 改了什么
 
@@ -21,10 +25,10 @@
 
 需要 Node.js 24+，DSH 支持范围为 `>=0.2.1-rc.2 <0.3.0-0`。0.2.0-rc.2 不在支持范围。CI 验证 rc.2 的接入与旧版拒绝路径，本机另验证了桌面端 0.2.1-rc.5。
 
-从本仓库 [v2.1.0 Release](https://github.com/icyaaaww/dsh-soul/releases/tag/v2.1.0) 下载插件安装包与 `SHA256SUMS.txt`：
+从本仓库 [v2.2.0 Release](https://github.com/icyaaaww/dsh-soul/releases/tag/v2.2.0) 下载插件安装包与 `SHA256SUMS.txt`：
 
 ```powershell
-dsh plugin --profile tui add "https://github.com/icyaaaww/dsh-soul/releases/download/v2.1.0/dsh-soul-2.1.0.tgz"
+dsh plugin --profile tui add "https://github.com/icyaaaww/dsh-soul/releases/download/v2.2.0/dsh-soul-2.2.0.tgz"
 ```
 
 `tui` 替换为实际 profile。请使用本仓库的 Release 安装包；npm 上的裸名 `dsh-soul` 可能指向另一位作者的项目。

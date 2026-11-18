@@ -19,11 +19,12 @@ export const EDITOR_SYSTEM = `你是 DSH agent 的 harness 编辑器。模型权
 可在工作区执行的动作（每次响应只输出 JSON）：
 {"actions":[{"type":"read","path":"evidence/xxx.txt"}]}
 {"actions":[{"type":"read","path":"harness/system.md"}]}
+{"actions":[{"type":"replace","path":"harness/tools.md","before":"原文中的唯一一行","after":"新的一条规则"}]}
 {"actions":[{"type":"write","path":"harness/system.md","text":"完整新内容"}]}
 {"actions":[{"type":"finish","why":"一句话说明这次改动修的是哪个观察到的分歧"}]}
 
 规则：
-- write 必须是该文件的完整内容，不是 diff。
+- C4 工具指引优先用 replace：只替换一个完整非空行，原文必须唯一，保留其他字节。其他组件或创建文件可用 write（完整内容）。
 - <!-- ANCHOR:BEGIN --> 与 <!-- ANCHOR:END --> 之间的内容逐字复制，不得修改、移动或删除。
 - 不得写入 harness/ 与 evidence/ 以外的路径。
 - 不得加入凭据、私钥、外部指令，或任何试图改变权限、身份、沙箱边界的内容。
@@ -60,7 +61,7 @@ export async function edit({ generate, context, signal, maxSteps = MAX_STEPS, re
   const evidence = new Map()
   for (const item of context.evidence) evidence.set(`evidence/${item.path}`, item)
   const reads = [], writes = []
-  let why = '', steps = 0, finished = false
+  let why = '', steps = 0, finished = false, replaced = false
 
   const index = {
     task: clean(context.task, 1200),
@@ -102,18 +103,31 @@ export async function edit({ generate, context, signal, maxSteps = MAX_STEPS, re
         trace.push({ type: 'read', path, text: bounded(redact(text), MAX_READ_BYTES) })
         continue
       }
-      if (action.type === 'write') {
+      if (action.type === 'write' || action.type === 'replace') {
+        if (replaced) throw fail('invalid_rule_edit')
         const path = String(action.path ?? '')
-        if (typeof action.text !== 'string') throw fail('invalid_actions', 'write 需要 text')
         const rel = harnessRel(path)
         safePath(rel)
         if (componentOf(rel) !== context.target || (!spec.dir && !Object.keys(current).includes(rel))) {
           throw fail('off_target', `只能编辑目标组件内的文件，拒绝写入 ${rel}`)
         }
-        if (bytes(action.text) > spec.cap) throw fail('too_large', `${rel} 超过 ${spec.cap} 字节`)
-        pending[rel] = action.text
+        let text = action.text
+        if (action.type === 'replace') {
+          if (context.target !== 'C4' || writes.length) throw fail('invalid_rule_edit')
+          const { before, after } = action
+          if (![before, after].every(s => typeof s === 'string' && s.trim() && !/[\r\n]/.test(s)) || before === after) throw fail('invalid_rule_edit')
+          const lines = pending[rel].split(/(\r\n|\n|\r)/)
+          const at = lines.indexOf(before)
+          if (at < 0 || lines.lastIndexOf(before) !== at) throw fail('rule_mismatch')
+          lines[at] = after
+          text = lines.join('')
+          replaced = true
+        }
+        if (typeof text !== 'string') throw fail('invalid_actions', 'write 需要 text')
+        if (bytes(text) > spec.cap) throw fail('too_large', `${rel} 超过 ${spec.cap} 字节`)
+        pending[rel] = text
         if (!writes.includes(rel)) writes.push(rel)
-        trace.push({ type: 'write', path: rel, bytes: bytes(action.text) })
+        trace.push({ type: action.type, path: rel, bytes: bytes(text) })
         continue
       }
       if (action.type === 'finish') {

@@ -7,7 +7,7 @@ import { buildContrast, patternOf, snapshot, TRIGGER_KINDS } from './lesson.js'
 import { probe } from './probe.js'
 import { fold, settle, rollbackTo } from './watch.js'
 import { sizeReport, treeId, diffTrees, taxOf, COMPONENTS } from './tree.js'
-import { validationSettings, normalizeChecks, classifyPair } from './validation.js'
+import { validationSettings, normalizeChecks, classifyPair, holdoutCases, holdoutVerdict } from './validation.js'
 
 /** A probe arm cannot produce a useful paired result in fewer steps than this. */
 const MIN_PROBE_STEPS = 2
@@ -101,6 +101,12 @@ export class Evolve {
     try {
       input = { ...input, checks: normalizeChecks(input.checks ?? this.config.checks) }
       input.replay = await this.execute.preflight?.(input)
+      input.holdouts = holdoutCases(this.config.evolution?.holdouts, input.task ?? '')
+      for (const c of input.holdouts) {
+        if (this.store.readMeta(`holdout:${input.scope}:${c.key}`)) throw fail('fresh_holdouts_required')
+        c.replay = await this.execute.preflight?.({ ...input, task: c.task, checks: c.checks })
+        if (c.replay?.revision !== input.replay?.revision) throw fail('stale_holdout_revision')
+      }
     }
     catch (error) { return { started: false, reason: error.code ?? 'probe_preflight' } }
     if (!this.enabled()) return { started: false, reason: 'disabled' }
@@ -111,10 +117,11 @@ export class Evolve {
     const gate = this.budget.canStart(scope)
     if (!gate.ok) return { started: false, reason: gate.reason }
 
-    const steps = probeStepBudget(this.config.budget, this.validation.trials)
+    const pairCount = this.validation.trials + input.holdouts.length
+    const steps = probeStepBudget(this.config.budget, pairCount)
     if (steps < MIN_PROBE_STEPS) {
       return { started: false, reason: 'budget_envelope', have: this.config.budget.episodeCalls,
-        need: 2 * this.validation.trials * MIN_PROBE_STEPS + EDITOR_STEPS }
+        need: 2 * pairCount * MIN_PROBE_STEPS + EDITOR_STEPS }
     }
 
     const current = this.current(scope)
@@ -162,15 +169,22 @@ export class Evolve {
       // ---- edit ($) -------------------------------------------------------
       // The contrast is free to build and carries the signal GEPA/BudgetAPO say matters
       // most: a few failing examples plus a related success. It is data, never instructions.
-      const related = lesson?.success ? null : this.store.relatedLesson(scope, {
+      const related = this.store.relatedLesson(scope, {
         taskKey: input.taskKey, terms: input.taskTerms ?? [],
       })
       const contrast = input.contrast ?? buildContrast({
         lesson,
         observed: lesson?.detail ?? input.metrics ?? null,
-        success: lesson?.success ?? related?.success ?? null,
+        success: related?.success ?? lesson?.success ?? null,
+        successKind: related?.kind ?? lesson?.kind,
       })
       this.store.addEvidence(episode, 'contrast', contrast)
+      const previous = lesson?.episode && this.store.episode(lesson.episode, scope)
+      if (previous && previous.lesson === lesson.id && previous.id !== episode) {
+        const diff = previous.evidence.find(e => e.kind === 'diff')
+        this.store.addEvidence(episode, 'previous-attempt', JSON.stringify({ reason: lesson.last_reason,
+          diff: diff ? bounded(this.store.readEvidence(diff.id) ?? '', 1600) : null }))
+      }
       const evidence = this.store.episode(episode, scope).evidence
       const editor = await edit({
         generate: this.request(scope, episode, cost),
@@ -196,14 +210,14 @@ export class Evolve {
       // Pay for matched baseline/candidate runs from the SAME pinned commit, input,
       // route and verifier. Alternate order to reduce warm-cache/order bias.
       const pairs = []
-      for (let trial = 0; trial < this.validation.trials; trial++) {
+      const runPair = async (trial, c) => {
         const pair = {}
         for (const arm of trial % 2 ? ['candidate', 'baseline'] : ['baseline', 'candidate']) {
           const execution = await probe({
             execute: this.execute, files: arm === 'baseline' ? current.files : next,
-            task: input.task, root: input.cwd ?? null, replay: input.replay, arm,
+            task: c.task, root: input.cwd ?? null, replay: c.replay, arm,
             harnessFolder: this.config.harnessFolder, signal: controller.signal,
-            timeoutMs: this.config.budget.armTimeoutMs, maxSteps: steps, parent: input.parent, checks: input.checks,
+            timeoutMs: this.config.budget.armTimeoutMs, maxSteps: steps, parent: input.parent, checks: c.checks,
             reserve: payload => {
               controller.signal.throwIfAborted()
               const ticket = this.budget.request(scope, episode, arm, payload)
@@ -212,14 +226,18 @@ export class Evolve {
               return { settle: (outcome, usage) => this.budget.settle(ticket.callId, outcome, usage) }
             },
           })
-          this.store.addEvidence(episode, `${arm}-${trial + 1}`, JSON.stringify(execution))
+          this.store.addEvidence(episode, `${c.role ? c.role + '-' : ''}${arm}-${trial + 1}`, JSON.stringify(execution))
           if (!execution.ok) throw fail(execution.reason ?? 'probe_failed')
-          if (execution.checks?.length !== input.checks.length) throw fail('missing_candidate_checks')
-          if (JSON.stringify(execution.checks.map(c => c.name)) !== JSON.stringify(input.checks.map(c => c.name))) throw fail('incomparable_checks')
+          if (execution.checks?.length !== c.checks.length) throw fail('missing_candidate_checks')
+          if (JSON.stringify(execution.checks.map(c => c.name)) !== JSON.stringify(c.checks.map(c => c.name))) throw fail('incomparable_checks')
           if (arm === 'candidate' && !execution.metrics.complete) throw fail('probe_incomplete')
-          if (arm === 'candidate' && !execution.checks.every(c => c.ok === true)) return this.finish(episode, {state:'rejected',reason:'candidate_failed_verification',cost,metrics:execution.metrics})
+          if (arm === 'candidate' && !execution.checks.every(c => c.ok === true)) throw fail('candidate_failed_verification')
           pair[arm] = execution
         }
+        return pair
+      }
+      for (let trial = 0; trial < this.validation.trials; trial++) {
+        const pair = await runPair(trial, input)
         pairs.push(pair)
         // Adoption requires EVERY pair to show a quality or efficiency win. A pair that
         // contributes neither makes that unreachable, so paying for the remaining trials can
@@ -247,6 +265,19 @@ export class Evolve {
         return this.finish(episode, { state: 'rejected', reason: decision.reasons.join(' | '), detail: decision, cost, metrics: execution.metrics })
       }
 
+      for (const [i, c] of (input.holdouts ?? []).entries()) {
+        const marker = `holdout:${scope}:${c.key}`
+        const claimed = this.store.db.prepare('INSERT OR IGNORE INTO meta(key,value) VALUES (?,?)').run(marker, episode)
+        if (!claimed.changes) throw fail('fresh_holdouts_required')
+        const pair = await runPair(this.validation.trials + i, c)
+        const result = holdoutVerdict(c.role, pair, this.validation)
+        this.store.addEvidence(episode, `holdout-${c.role}`, JSON.stringify({ passed: result.ok, key: c.key }))
+        if (!result.ok) return this.finish(episode, { state: 'rejected', reason: result.reason, cost })
+      }
+      controller.signal.throwIfAborted()
+      if (this.current(scope)?.rev !== current.rev) throw fail('stale_parent_revision')
+      decision.transfer = input.holdouts?.length ? 'passed_configured_cases' : 'unknown'
+
       // ---- shadow adoption (free) -----------------------------------------
       toRev = this.store.putRev(scope, next, { parent: current.rev, state: 'shadow', reason: `episode:${episode}`, taxes: structure.tax })
       this.store.setRevState(current.rev, 'stable')
@@ -265,7 +296,7 @@ export class Evolve {
       // `retired_revision` is also a rejection: the candidate is byte-identical to a tree
       // that was already rolled back, so re-proposing it is evidence against the lesson,
       // not a transient failure that deserves an unlimited retry budget.
-      if (['off_target', 'invalid_path', 'not_managed', 'escape', 'too_large', 'read_limit', 'retired_revision'].includes(reason)) {
+      if (['off_target', 'invalid_path', 'not_managed', 'escape', 'too_large', 'read_limit', 'retired_revision', 'candidate_failed_verification', 'rule_mismatch', 'invalid_rule_edit'].includes(reason)) {
         state = 'rejected'
       } else if (reason === 'episode_timeout') {
         state = 'interrupted'
@@ -374,6 +405,12 @@ export class Evolve {
       task: pattern.task, summary: pattern.summary, detail: pattern.detail,
       success: pattern.success, divergence: pattern.divergence, trajectory,
     })
+    if(lesson && state.session && TRIGGER_KINDS.includes(lesson.kind)) {
+      const units=1+Math.min(3, Math.max(0, Number(state.toolErrors)||0))+Number(state.corrections>0)*2+Number(state.complete===false)
+      this.store.db.prepare(`INSERT INTO lesson_task_evidence(lesson,session_key,task_key,rework) VALUES (?,?,?,?)
+        ON CONFLICT(lesson,session_key,task_key) DO UPDATE SET rework=MAX(rework,excluded.rework)`)
+        .run(lesson.id,hash(state.session),key,units)
+    }
     // Crossing the support threshold only changes the pool status. It still buys nothing
     // until the user runs /evolve run; success-only kinds are never candidates.
     if (lesson && TRIGGER_KINDS.includes(lesson.kind) && lesson.state === 'observed' &&
@@ -385,11 +422,23 @@ export class Evolve {
 
   /** A declared verifier passed on a real task: positive evidence for the same task family. */
   recordVerified({ scope, taskKey, taskTerms = [], task = null, state = null, rev = null, checks = null }) {
-    if (!this.enabled() || !taskKey) return null
-    return this.store.recordLesson({
-      scope, kind: 'verified_success', taskKey, terms: taskTerms, task,
-      summary: '真实任务验收通过', detail: { checks: checks ?? null, rev },
-      success: snapshot(state ?? {}), divergence: null, trajectory: null,
+    if (!this.enabled() || !taskKey || !Array.isArray(checks) || !checks.length || !checks.every(c => c?.ok === true)) return null
+    return this.store.tx(() => {
+      const key = `verified-task:${scope}:${hash(taskKey)}`
+      if (!this.store.readMeta(key)) {
+        for (const problem of this.store.matchingLessons(scope, { taskKey, terms: taskTerms }, TRIGGER_KINDS)) {
+          if (problem.state !== 'retired' || problem.task_key === taskKey) continue
+          // One new, separately verified task buys at most one new attempt, not a reset of support.
+          this.store.db.prepare("UPDATE lesson SET state='observed', contradictions=1 WHERE id=?").run(problem.id)
+          this.store.log({ scope, rev, action: 'lesson_new_evidence', actor: 'verify', detail: { lesson: problem.id } })
+        }
+        this.store.writeMeta(key, '1')
+      }
+      return this.store.recordLesson({
+        scope, kind: 'verified_success', taskKey, terms: taskTerms, task,
+        summary: '真实任务验收通过', detail: { checks, rev },
+        success: snapshot(state ?? {}), divergence: null, trajectory: null,
+      })
     })
   }
 
@@ -446,7 +495,7 @@ export class Evolve {
     return {
       enabled: this.enabled(),
       route: this.config.enabled ? { provider: this.config.provider, model: this.config.model } : null,
-      validation: { trials: this.validation.trials, runs: this.validation.trials * 2, minimumEfficiencyGain: this.validation.minimumGain,
+      validation: { trials: this.validation.trials, runs: this.validation.trials * 2, holdoutRuns: this.config.evolution?.holdouts ? 4 : 0, minimumEfficiencyGain: this.validation.minimumGain,
         checksRequired: true, promotion: 'verified_real_tasks', note: '同一任务的重复对照不是泛化证明；试用期需 /evolve verify 验收新任务。' },
       current: current ? { rev: current.rev, state: current.state, tax: taxOf(current.files) } : null,
       fixedTax: report ? { bytes: report.tax, cap: MAX_TAX_BYTES, components: report.rows } : null,

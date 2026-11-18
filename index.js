@@ -2,6 +2,10 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Store } from './src/store.js'
+import { Collaboration, preferenceOf } from './src/collaboration.js'
+import { randomUUID } from 'node:crypto'
+import { assessEvidence, callEvidence } from './src/recall-evidence.js'
+import { confirmCue, forgetCue, singleObject } from './src/recall-cues.js'
 import { Evolve } from './src/evolve.js'
 import { budgetSettings } from './src/budget.js'
 import { Recorder, divergenceOf, isCorrection, trajectoryText, repeatCount, EMPTY_METRICS } from './src/observe.js'
@@ -10,7 +14,7 @@ import { readDefaults } from './src/harness.js'
 import { turnCounter } from './src/gate.js'
 import { hostProbe } from './src/host-probe.js'
 import { createHostRunner } from './src/host-runner.js'
-import { projectScope, bounded, boolean, integer, human, textBlocks, fail, sameTask, redact, terms as termSet } from './src/util.js'
+import { projectScope, bounded, boolean, integer, human, textBlocks, fail, sameTask, redact, terms as termSet, isInstance } from './src/util.js'
 import { MemoryBuffer, capture, projectionText, recall, neighbourhood, consolidate, recordLookup, recordHandoff, recordCorrection, mergeDuplicates, view, fileFingerprint, promoteTurn, noteUse, noteTurnUse, wireTurn, reconsolidate, recentlyTouched, verifyArtifacts, driftContext, cuesOf } from './src/memory.js'
 import { memoryView, explain, retire, restore, periphery } from './src/graph-memory.js'
 import { searchSession, expandRange } from './src/session-search.js'
@@ -34,7 +38,7 @@ export function settings(input = {}) {
   const enabled = boolean(input.evolution?.enabled, legacyEnabled, 'evolution.enabled')
   const config = {
     enabled,
-    evolution: { enabled },
+    evolution: { enabled, ...(input.evolution?.holdouts === undefined ? {} : { holdouts: input.evolution.holdouts }) },
     profile,
     learning: boolean(input.learning, false, 'learning'),
     database: input.database ?? join(process.env.DSH_HOME?.trim() || join(homedir(), '.dsh'), 'dsh-soul', profile, 'evolve.sqlite'),
@@ -52,8 +56,14 @@ export function settings(input = {}) {
       // On by default: the projection emits nothing until the graph has nodes, so a fresh
       // project pays zero bytes, and this release exists to fix compaction amnesia.
       enabled: boolean(input.memory?.enabled, true, 'memory.enabled'),
+      collaboration: boolean(input.memory?.collaboration, false, 'memory.collaboration'),
       projectionBytes: integer(input.memory?.projectionBytes, 600, 160, 2000, 'memory.projectionBytes'),
       maxNodes: integer(input.memory?.maxNodes, 500, 50, 5000, 'memory.maxNodes'),
+      tieredRetention: boolean(input.memory?.tieredRetention, false, 'memory.tieredRetention'),
+      rankedRecall: boolean(input.memory?.rankedRecall, false, 'memory.rankedRecall'),
+      evidenceRecall: boolean(input.memory?.evidenceRecall, true, 'memory.evidenceRecall'),
+      cardAdmission: boolean(input.memory?.cardAdmission, false, 'memory.cardAdmission'),
+      adaptiveRecall: boolean(input.memory?.adaptiveRecall, false, 'memory.adaptiveRecall'),
       verifyArtifacts: boolean(input.memory?.verifyArtifacts, true, 'memory.verifyArtifacts'),
       // Off by default, deliberately: it changes what the model sees every turn, and a
       // scheduling policy that has not been observed on real sessions is a hypothesis, not a
@@ -106,6 +116,7 @@ function lessonView(lesson) {
   const diagnosis = diagnose(lessonDivergence(lesson))
   return {
     id: lesson.id, kind: lesson.kind, support: lesson.support,
+    ...(lesson.independent_sessions===undefined ? {} : { independentSessions:lesson.independent_sessions, reworkUnits:lesson.rework_units, priority:lesson.estimated_priority }),
     contradictions: lesson.contradictions, state: lesson.state,
     summary: bounded(String(lesson.summary ?? ''), 400),
     target: diagnosis.target, rule: diagnosis.rule, why: diagnosis.why,
@@ -159,7 +170,10 @@ export function apply(ctx, input = {}) {
   const config = settings(input)
   if (!config.enabled && !config.memory.enabled) return
 
-  const store = new Store(config.database, { maxNodes: config.memory.maxNodes })
+  const store = new Store(config.database, { maxNodes: config.memory.maxNodes, tieredRetention: config.memory.tieredRetention, rankedRecall: config.memory.rankedRecall, adaptiveRecall: config.memory.adaptiveRecall })
+  store.evidenceRecall = config.memory.evidenceRecall
+  store.cardAdmission = config.memory.cardAdmission
+  const collaboration = config.memory.enabled && config.memory.collaboration ? new Collaboration(store,config.profile) : null
   // The compaction backend is a separate plugin; one env var is the whole handshake it needs
   // to weight compression by the knowledge graph instead of by word counts alone.
   if (config.memory.enabled) process.env.DSH_SOUL_DATABASE = config.database
@@ -178,6 +192,7 @@ export function apply(ctx, input = {}) {
       if (source === 'runtime-context') return
       if (source === 'user') {
         const text = textBlocks(event.data?.message?.content ?? event.data?.content)
+        if(collaboration && preferenceOf(text)) return
         if (memory.settle(sid, buffered => buffered.type === 'user/message'
           && textBlocks(buffered.data?.message?.content) === text, event.seq)) return
       }
@@ -195,6 +210,12 @@ export function apply(ctx, input = {}) {
   // The current turn's question, as terms. Feeds the card's cue ranking: a node the question
   // points at is shown ahead of a node it does not, within its importance band.
   const cues = new Map()
+  const completedObject = new Map(), pendingObject = new Map()
+  const priorObject = (sid, scope) => {
+    const last = completedObject.get(sid), current = pendingObject.get(sid)
+    if (last?.scope !== scope || (current && (current.scope !== scope || current.hasObjects && current.object !== last.object))) return null
+    return last.object
+  }
   // Retrieval budget per turn. Without it the sufficiency hint becomes an open invitation:
   // one question produced twenty lookups, which costs more than the summary it replaced.
   const lookups = new Map()
@@ -312,6 +333,11 @@ export function apply(ctx, input = {}) {
           if (!human(message)) continue
           const text = textBlocks(message.content)
           if (!text.trim()) continue
+          if(collaboration) {
+            const scope=describe(payload.agent).scope
+            const source=message.id ? `${sid}:${message.id}` : randomUUID()
+            if(collaboration.observe(scope,sid,text,source)) continue
+          }
           // Buffer the raw message: one normalizer decides what a block is, and it is the
           // same one that the offline bench exercises.
           if (config.memory.enabled) memory.push(sid, { type: 'user/message', data: { message } })
@@ -320,6 +346,7 @@ export function apply(ctx, input = {}) {
             // anything the card already says?". Below the threshold the model is about to
             // answer from a card that cannot contain the answer.
             const { scope } = describe(payload.agent)
+            if (store.adaptiveRecall) pendingObject.set(sid, { scope, object: singleObject(text), hasObjects: cuesOf(text).entities.some(isInstance) })
             const card = projectionText(store, scope, config.memory.projectionBytes, { sessionId: String(payload.agent.session.id), dynamics: config.memory.dynamics, promote: config.memory.promote })
             const wanted = new Set(termSet(text))
             const have = new Set(termSet(card))
@@ -363,6 +390,12 @@ export function apply(ctx, input = {}) {
       const sid = String(session.id)
       if (config.memory.enabled) bufferEvent(sid, event)
       if (event.type === 'turn/end') {
+        collaboration?.end(sid)
+        if (store.adaptiveRecall) {
+          if (pendingObject.has(sid)) completedObject.set(sid, pendingObject.get(sid))
+          else completedObject.delete(sid)
+          pendingObject.delete(sid)
+        }
         recorder.observe(sid, event.type, event.data)
         const state = recorder.end(sid)
         if (state) {
@@ -441,6 +474,8 @@ export function apply(ctx, input = {}) {
       const sid = String(agent.session.id)
       recorder.turns.delete(sid); lastTurn.delete(sid); recent.delete(sid)
       memory.clear(sid); cwdBySession.delete(sid); cues.delete(sid); needsLookup.delete(sid); lookups.delete(sid)
+      completedObject.delete(sid); pendingObject.delete(sid)
+      collaboration?.end(sid)
     }))
 
     // ---- harness injection ------------------------------------------------
@@ -465,6 +500,10 @@ export function apply(ctx, input = {}) {
       // history, so compaction cannot erase it. Empty while the graph is empty, which is why
       // it costs nothing on a fresh project.
       if (config.memory.enabled) {
+        if(collaboration) disposers.push(ctx.systemPrompt.context({
+          name:'dsh-soul:collaboration',order:939,interpolate:false,
+          text:({agent})=>!agent || disposed || agent.session.header?.origin==='subagent' ? '' : collaboration.render(describe(agent).scope,String(agent.session.id)),
+        }))
         disposers.push(ctx.systemPrompt.context({
           name: 'dsh-soul:memory', order: 940, interpolate: false,
           text: ({ agent }) => {
@@ -513,19 +552,24 @@ export function apply(ctx, input = {}) {
                 // text" made it alternate between them and give up; the layers are an
                 // implementation detail, so the tool always consults both.
                 const graph = recall(store, scope, args.query, {
+                  previousObject: priorObject(sid, scope),
                   limit: 6, turn: turnCounter(store, scope).get(),
                   dynamicsView: config.memory.dynamics ? memoryView(store, scope, { now: Date.now(), cues: cuesOf(args.query) }) : null,
                 })
                 // The index half of the hippocampal index: a node points back at the span it was
                 // extracted from, so a hit can bring its own evidence (pattern completion).
-                for (const hit of graph.hits.slice(0, 3)) {
+                const originals = []
+                const loadSources = () => { for (const hit of graph.hits.slice(0, 3)) {
                   if (!hit.source) continue
                   const span = store.spanAt(scope, hit.source.session, hit.source.seq)
-                  if (span?.text) hit.excerpt = bounded(span.text.replace(/\s+/g, ' ').trim(), 300)
-                }
+                  if (span?.text) { originals.push(span); hit.excerpt = bounded(span.text.replace(/\s+/g, ' ').trim(), 300) }
+                } }
+                loadSources()
                 let spans = []
                 let indexed = null
-                if (graph.hits.length < 2) {
+                let evidence = store.evidenceRecall ? assessEvidence(args.query,graph.hits,originals) : null
+                if(evidence?.missing.includes('matched_call_result')) evidence = callEvidence(session,args.query) ?? evidence
+                if (evidence ? evidence.status === 'insufficient' : graph.hits.length < 2) {
                   indexed = ingest(store, scope, session)
                   const found = searchIndex(store, scope, args.query, {
                     limit: Math.max(1, Math.min(5, Number(args.k) || 3)),
@@ -533,16 +577,21 @@ export function apply(ctx, input = {}) {
                   })
                   spans = found.spans
                   // Write the pointer back so the same question becomes a card hit next time.
-                  if (spans.length) recordLookup(store, scope, args.query, spans)
+                  if (spans.length && !evidence) recordLookup(store, scope, args.query, spans)
                   // And the other direction: a span hit reactivates the nodes extracted from it.
-                  for (const span of spans) for (const node of store.nodesAt(scope, span.session, span.seq)) {
+                  if (!evidence) for (const span of spans) for (const node of store.nodesAt(scope, span.session, span.seq)) {
                     store.activate(scope, { node: node.id, query: args.query, source: 'recall', turn: turnCounter(store, scope).get() })
+                  }
+                  if (evidence) {
+                    if (indexed.added) loadSources()
+                    evidence = assessEvidence(args.query,graph.hits,originals)
                   }
                 }
                 value = {
                   query: args.query,
                   source: spans.length ? (graph.hits.length ? 'node+span' : 'span') : 'node',
                   nodes: graph.hits,
+                  ...(evidence ? { evidence, guidance: evidence.status==='insufficient' ? '候选不是已证实的答案。检查原文；若仍不能证明，请说明缺少什么。' : '只就所列来源支持的范围作答。' } : {}),
                   neighbours: graph.neighbours,
                   spans,
                   coverage: store.spanCoverage(scope),
@@ -755,12 +804,16 @@ export function apply(ctx, input = {}) {
     // ---- memory command ---------------------------------------------------
     if (config.memory.enabled) disposers.push(ctx.commands.register({
       name: 'mem', description: '查看与维护记忆骨架（不调用模型）',
-      input: { hint: 'show / stats / dynamics / recall <关键词> / sleep / restore <id> / prune' }, recordInput: false,
+      input: { hint: 'show / stats / dynamics / recall <关键词> / confirm <节点id> <问法> / forget-cue <问法> / sleep / restore <id> / prune' }, recordInput: false,
       handler: trackedCommand(async ({ agent, rawInput, signal }) => {
         try {
           signal?.throwIfAborted()
           const [verb = 'show', ...args] = String(rawInput ?? '').trim().split(/\s+/).filter(Boolean)
           const { scope } = describe(agent)
+          if(verb==='style') {
+            if(!collaboration) return {kind:'error',text:'需要配置 memory.collaboration: true'}
+            return {kind:'success',text:JSON.stringify(collaboration.command(scope,String(agent.session.id),args,randomUUID()),null,2)}
+          }
           if (verb === 'stats') return { kind: 'success', text: JSON.stringify({ ...store.memoryStats(scope), graph: store.graphStats(scope) }, null, 2) }
           if (verb === 'show') {
             const card = projectionText(store, scope, config.memory.projectionBytes, { sessionId: String(agent.session.id), dynamics: config.memory.dynamics, promote: config.memory.promote })
@@ -770,9 +823,16 @@ export function apply(ctx, input = {}) {
             const query = args.join(' ').trim()
             if (!query) return { kind: 'error', text: '用法：/mem recall <关键词>' }
             return { kind: 'success', text: JSON.stringify(recall(store, scope, query, {
+              previousObject: priorObject(String(agent.session.id), scope),
               dynamicsView: config.memory.dynamics ? memoryView(store, scope, { now: Date.now() }) : null,
             }), null, 2) }
           }
+          if (verb === 'confirm') {
+            const [id, ...phrase] = args
+            confirmCue(store, scope, id ?? '', phrase.join(' '))
+            return { kind: 'success', text: '已绑定到当前节点；节点失效或正文改变后不再使用。' }
+          }
+          if (verb === 'forget-cue') return { kind: 'success', text: forgetCue(store, scope, args.join(' ')) ? '已删除问法线索。' : '没有匹配的线索。' }
           if (verb === 'graph') {
             const query = args.join(' ').trim()
             if (!query) return { kind: 'error', text: '用法：/mem graph <节点 id 或关键词>' }

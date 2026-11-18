@@ -52,6 +52,11 @@ dsh plugin --profile tui add "https://github.com/icyaaaww/dsh-soul/releases/down
 | `memory.enabled` | `true` | 本地记忆、投影与回捞 |
 | `memory.projectionBytes` | `600` | 投影字节预算，不是 token 数 |
 | `memory.maxNodes` | `500` | 自动剪枝与合并使用的容量上限 |
+| `memory.evidenceRecall` | `true` | 2.2 开发版：图检索不再强化权重或共现边。`soul_recall` 按证据缺口回查原文；关闭可回到旧的按命中数回查和强化行为。 |
+| `memory.cardAdmission` | `false` | 实验：普通进度须被工具在两个不同回合触及才可进入卡片。图中仍保留并可检索，不改变约束或置顶的候选资格。 |
+| `memory.tieredRetention` | `false` | 2.2 实验：活跃区满时先归档，非置顶节点总数超过 `4 × maxNodes` 后再删除；不增加模型调用 |
+| `memory.rankedRecall` | `false` | 2.2 实验：本地 FTS5/BM25 召回，再按对象和词项覆盖重排；与分层保留独立。详见[检索评测](docs/GRAPH-RETRIEVAL.md) |
+| `memory.adaptiveRecall` | `false` | 2.2 实验：补充上一轮唯一文件或实例的指代线索，以及 `/mem confirm <节点id> <问法>` 明确确认的问法；不改变基础排序器，可用 `/mem forget-cue <问法>` 撤销。 |
 | `memory.verifyArtifacts` | `true` | 校验已抽取产物的文件内容指纹 |
 | `memory.dynamics` | `false` | 使用历史、线索与图关联参与卡片排序 |
 | `memory.promote` | `false` | 为未抽取成节点的环境事实补充引用节点 |
@@ -150,7 +155,28 @@ score = need + ln(importance)
 
 后端可以在没有记忆库时从跨度重建结构；记忆库可用时，图加权按实体而非不相交的序号匹配。正文回捞仍依赖实际保留的会话与索引，不能承诺无限保留。
 
+### 实验：记住用户确认过的问法
+
+启用 `memory.adaptiveRecall` 可在同一会话中把“它的超时是多少”绑定到上一轮唯一明确的文件或实例；换对象、对象不唯一或会话结束时，旧对象不再提供线索。这个开关不更换基础检索器，但按对象搜索需要本地 FTS 索引。
+
+用 `/mem confirm <节点id> 场景借用写什么` 记录问法，`/mem forget-cue 场景借用写什么` 撤销。正文发生改变、过期或被替代的节点不再由旧线索提名。匹配依据是词项，并非向量相似度。
+
+`node bench/recall-cues.mjs` 可复现确认前后和上一轮对象的行为对照。本机 5 个主会话的 6 道真实回归题没有历史确认，也均未触发对象线索：原检索及其加线索版本均命中 2/3 道有答案题，严格检索及其加线索版本均为 0/3；各组在 3 道无答案题上都返回空。这个样本不能证明新机制提高自然追问的命中率，两个实验开关保持默认关闭。
+
 ## 受控演化：默认关闭
+
+### 协作习惯：与事实图分开记账
+
+配置 `memory.collaboration: true` 开启；不需要开启付费演化。偏好、用户来源、来源与被确认习惯的关系保存在同一 SQLite 库的独立表中，不作为事实节点或工具权限。每轮只投影本任务适用的固定行为短句。优先级：本轮 > 当前项目 > 用户明确指定的所有项目；同一范围内角色专用规则优先。全局只在同一 profile 内共享。
+
+- `以后这个项目都简短回答`：项目默认；`这次详细点`：仅覆盖本轮；`以后所有项目都先给结论`：明确跨项目。
+- `以后评审先给结论`：只在评审角色生效；实现角色仍侧重实际改动和验证。一次停顿、沉默或模型自评都不会确认长期习惯。
+- `太长了` 等短反馈先影响当轮。同范围、同角色、同一风格在至少三个不同会话出现后，且没有同等强度的反向信号，才进入 `suggested`。它并不自动生效。会话数是保守的样本代理，不代表统计独立性。
+- `/mem style` 查看适用规则、已保存项、候选及来源；`/mem style history` 查看变更与采用候选时的来源数。`/mem style accept review conclusion` 接纳候选；`/mem style revoke review conclusion` 撤销。撤销项目覆盖后回到适用的全局默认。
+- `/mem style set any detailed` 直接设定；`/mem style global set any brief` 设全局；`/mem style global revoke any brief` 撤销全局。角色为 `any/review/build`，风格为 `brief/detailed/conclusion/evidence/options/recommend`。未识别的自由文本不会被当作长期人格指令。
+
+方法验证仍由 `/evolve run` 手动付费启动。经验池的推荐顺序优先看不同会话中观察到的返工：每会话只取该经验的最大返工单位，按错误、纠正和未完成信号估计，再除以 `1 + 已尝试次数`。这不是收益实测或模型费用预测；实际成本和转正、回滚仍看 `/evolve report`。老库不会伪造历史来源，缺少独立来源的旧经验仍可用原支持度区分。
+
 
 演化需要 Git、宿主可用的模型路由与对应 skills/spawn 执行能力。显式配置后，通过 `/evolve run` 启动：
 
@@ -174,6 +200,8 @@ score = need + ln(importance)
 流程为：记录偏差 → 定位一个组件 → 候选编辑 → 结构检查 → 同一固定提交上的基准/候选成对回放 → 项目验收 → 门控 → 影子试用 → 接纳或回滚。
 
 验收命令必须检查真实产物。文件型检查应声明 `protectedPaths`，覆盖验收逻辑与配置；不支持 glob。探测在独立 Git worktree 执行，被忽略的依赖与环境不会自动复制。提示变短、调用变少或用户没有继续纠正，都不能单独作为采纳证据。
+
+2.2 开发版可以在 `evolution.holdouts` 配置一对新的迁移题和对照题。不配置时保持原成本，并把迁移标记为未知。配置、判据和三组实测格式见 [演化评测](docs/EVOLUTION-2.2.md)。
 
 ```text
 /evolve status               能力、规则、预算与试用状态

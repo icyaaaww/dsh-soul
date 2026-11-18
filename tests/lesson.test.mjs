@@ -54,6 +54,15 @@ function seedLesson(store, extra = {}) {
   return store.lessons('p').find(item => item.kind === 'recovery')
 }
 
+test('candidate priority rewards independent sessions and bounded rework, not repeated retries', t => {
+  const {evolve,editor}=setup(t)
+  const add=(session,text)=>evolve.recordObservation({scope:'p',state:state({session,text,toolErrors:1})})
+  for(let i=0;i<9;i++)add('a','修复构建超时')
+  add('b','校准图像颜色');add('c','校准图像颜色')
+  const [first,second]=evolve.eligibleLessons('p');assert.equal(first.independent_sessions,2);assert.equal(second.independent_sessions,1)
+  assert.ok(first.estimated_priority>second.estimated_priority);assert.equal(second.support,9);assert.equal(editor.requests.length,0)
+})
+
 test('a finished turn is classified into exactly one free experience kind', () => {
   assert.equal(patternOf(state()), null, 'ordinary clean work is not evidence of anything')
 

@@ -3,6 +3,8 @@ import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { hash, id, day, clean, bounded, redact, redactData, redactText, terms as termSet, sameTask, entities, NODE_TERMS } from './util.js'
 import { segment } from './span-index.js'
+import { prepareGraphSearch } from './graph-search.js'
+import { prepareCues } from './recall-cues.js'
 
 export const SCHEMA_VERSION = 9
 
@@ -29,11 +31,14 @@ const parseJson = (value, fallback) => {
  * - `ledger` is append-only: every adoption must be explainable after the fact.
  */
 export class Store {
-  constructor(path, { now = Date.now, maxNodes = 500 } = {}) {
+  constructor(path, { now = Date.now, maxNodes = 500, tieredRetention = false, rankedRecall = false, adaptiveRecall = false } = {}) {
     this.now = now
     // The configured cap, so the automatic prune after every write honours `memory.maxNodes`
     // instead of a hard-coded 500 that only `/mem prune` could override.
     this.maxNodes = maxNodes
+    this.tieredRetention = tieredRetention
+    this.rankedRecall = rankedRecall
+    this.adaptiveRecall = adaptiveRecall
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true })
     this.db = new DatabaseSync(path)
     this.db.exec(`PRAGMA busy_timeout=200; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;`)
@@ -124,6 +129,10 @@ export class Store {
           seen INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS lesson_scope ON lesson(scope, state, seen);
         CREATE INDEX IF NOT EXISTS lesson_rev ON lesson(rev);
+        CREATE TABLE IF NOT EXISTS lesson_task_evidence(
+          lesson TEXT NOT NULL REFERENCES lesson(id) ON DELETE CASCADE,
+          session_key TEXT NOT NULL, task_key TEXT NOT NULL, rework INTEGER NOT NULL,
+          PRIMARY KEY(lesson,session_key,task_key));
 
         CREATE TABLE IF NOT EXISTS watch(
           rev TEXT PRIMARY KEY REFERENCES rev(id) ON DELETE CASCADE,
@@ -283,6 +292,8 @@ export class Store {
         }
         this.db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`)
       })
+      if (this.rankedRecall || adaptiveRecall) this.tx(() => prepareGraphSearch(this.db))
+      if (adaptiveRecall) this.tx(() => prepareCues(this.db))
       if (version < 8) this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
     } catch (error) {
       this.db.close()
@@ -521,10 +532,7 @@ export class Store {
     const label = bounded(redact(String(task ?? '')), 600)
     const text = bounded(redact(String(summary ?? kind)), 600)
     if (match) {
-      // Recurrence adds support but never reopens the lesson by itself. A compiled lesson is
-      // already in the current version; a retired one has failed its paired gate twice. Only
-      // an explicit rollback reverses a compiled lesson, otherwise retirement would mean
-      // nothing and a pattern that fails validation forever would keep buying episodes.
+      // Recurrence alone cannot re-open paid retries. A separately verified task can.
       this.db.prepare(`UPDATE lesson SET
         support=support+1, seen=?, task=COALESCE(?,task), summary=?, detail=COALESCE(?,detail),
         success=COALESCE(?,success), divergence=COALESCE(?,divergence), trajectory=COALESCE(?,trajectory)
@@ -580,10 +588,16 @@ export class Store {
     // A stale cluster is not a recurring pattern. The window is optional so callers/tests can
     // inspect the whole pool, but the paid path only sees what was observed recently.
     const cutoff = windowMs === null ? 0 : this.now() - windowMs
-    return this.db.prepare(`SELECT * FROM lesson
+    return this.db.prepare(`WITH eligible AS (SELECT * FROM lesson
       WHERE scope=? AND state IN ('observed','candidate') AND kind IN (${slots})
-        AND support>=? AND contradictions<2 AND seen>=?
-      ORDER BY support DESC, seen DESC LIMIT ?`)
+        AND support>=? AND contradictions<2 AND seen>=?), per_session AS (
+        SELECT e.lesson,e.session_key,MAX(e.rework) AS rework FROM lesson_task_evidence e JOIN eligible l ON l.id=e.lesson
+        GROUP BY e.lesson,e.session_key), estimates AS (
+        SELECT lesson,COUNT(*) independent_sessions,SUM(rework) rework_units FROM per_session GROUP BY lesson)
+      SELECT l.*,COALESCE(e.independent_sessions,0) independent_sessions, COALESCE(e.rework_units,0) rework_units,
+        COALESCE(e.rework_units,0)*1.0/(1+l.attempts) estimated_priority FROM eligible l
+        LEFT JOIN estimates e ON e.lesson=l.id
+      ORDER BY estimated_priority DESC,independent_sessions DESC,l.support DESC,l.seen DESC,l.id LIMIT ?`)
       .all(scope, ...kinds, threshold, cutoff, limit)
       .map(row => this.parseLesson(row))
   }
@@ -591,9 +605,9 @@ export class Store {
   /** Latest successful sample for the same task family, used as contrast evidence. */
   relatedLesson(scope, { taskKey, terms = [], kinds = ['resolved', 'recovery', 'verified_success'], limit = 100 } = {}) {
     const slots = kinds.map(() => '?').join(',')
-    const rows = this.db.prepare(`SELECT * FROM lesson
+    const rows = this.db.prepare(`SELECT * FROM (SELECT * FROM lesson
       WHERE scope=? AND state!='retired' AND kind IN (${slots})
-      ORDER BY seen DESC LIMIT ?`).all(scope, ...kinds, limit)
+      ORDER BY seen DESC, rowid DESC LIMIT ?) ORDER BY CASE kind WHEN 'verified_success' THEN 0 ELSE 1 END, seen DESC`).all(scope, ...kinds, limit)
     for (const row of rows) {
       const lesson = this.parseLesson(row)
       if (sameTask({ taskKey: lesson.task_key, terms: lesson.terms }, { taskKey, terms })) return lesson
@@ -670,7 +684,7 @@ export class Store {
       const insert = this.db.prepare(`INSERT INTO node(
         id,scope,kind,claim,terms,anchor,hash,source,seq,pin,valid_from,valid_to,recorded_at,
         weight,support,hits,state,created,seen,session,salience,turn) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(id) DO UPDATE SET support=support+1, seen=excluded.seen, claim=excluded.claim,
+        ON CONFLICT(id) DO UPDATE SET support=support+1, seen=excluded.seen, claim=excluded.claim, terms=excluded.terms,
           hash=COALESCE(excluded.hash, hash), salience=MAX(salience, excluded.salience)`)
       const written = []
       for (const node of nodes) {
@@ -723,40 +737,41 @@ export class Store {
       WHERE m.scope=? AND m.entity IN (${slots}) AND n.state='active' AND n.valid_to IS NULL`).all(scope, ...wanted)
   }
 
-  /**
-   * Keep the graph bounded, and prefer to let go of what was already let go of.
-   *
-   * The old rule kept the newest 500 by `seen` and deleted the rest, which is a recency policy
-   * wearing a capacity policy's clothes: a decision that had been reused for weeks lost to a
-   * progress line written thirty seconds ago. Deleting on age is the one thing this project
-   * says it does not do.
-   *
-   * Two stages, and the order is the point:
-   *   1. retired rows are kept — retirement is a visibility change, and recall still reads them —
-   *      until the scope holds four times the cap in total. Only then do the oldest retired rows
-   *      go, because a table that cannot shrink is an operational bug.
-   *   2. if the live set is over the cap, fall back to the old recency rule, but never touch a
-   *      pinned node, and rank retrieved nodes ahead of equally old ones.
-   *
-   * The second stage keeps the table bounded even on a project that never calls `/mem sleep`.
-   */
-  pruneNodes(scope, limit = this.maxNodes) {
-    const total = this.db.prepare('SELECT COUNT(*) n FROM node WHERE scope=?').get(scope)?.n ?? 0
-    if (total > limit * 4) {
-      this.db.prepare(`DELETE FROM node WHERE scope=? AND pin=0 AND state!='active' AND id IN (
-        SELECT id FROM node WHERE scope=? AND pin=0 AND state!='active' ORDER BY seen ASC LIMIT ?)`)
-        .run(scope, scope, total - limit * 4)
-    }
-    // Stage 2: still over the cap. Oldest-first ranking, but retrieved nodes rank ahead of
-    // equally old ones — the cap is still enforced, because a table that cannot shrink is an
-    // operational bug, not a fairness win. Exempting `hits > 0` entirely (the first attempt)
-    // did exactly that: 30 nodes with a cap of 5 kept 10.
-    const active = this.db.prepare(
-      "SELECT COUNT(*) n FROM node WHERE scope=? AND pin=0 AND state='active'").get(scope)?.n ?? 0
+  /** Demote on working-set pressure; delete only on archive pressure. Pins are exempt. */
+  pruneTiered(scope, limit) {
+    const { active, total } = this.db.prepare(`SELECT COUNT(*) total,
+      COUNT(CASE WHEN state='active' AND valid_to IS NULL THEN 1 END) active FROM node WHERE scope=? AND pin=0`).get(scope)
     if (active > limit) {
-      this.db.prepare(`DELETE FROM node WHERE scope=? AND pin=0 AND state='active' AND id NOT IN (
-        SELECT id FROM node WHERE scope=? AND pin=0 AND state='active'
-        ORDER BY hits DESC, seen DESC LIMIT ?)`).run(scope, scope, limit)
+      // Reserve a minority of working slots for durable claims; everything else competes
+      // on recent use. A burst of repeated recalls cannot protect a row indefinitely.
+      this.db.prepare(`WITH live AS (SELECT * FROM node WHERE scope=? AND pin=0 AND state='active' AND valid_to IS NULL),
+        durable AS (SELECT id FROM live WHERE kind IN ('decision','constraint') ORDER BY seen DESC, hits DESC, id LIMIT ?),
+        victims AS (SELECT id FROM live WHERE id NOT IN (SELECT id FROM durable)
+          ORDER BY seen + MIN(hits,3)*86400000, seen, id LIMIT ?)
+        UPDATE node SET state='retired' WHERE id IN (SELECT id FROM victims)`)
+        .run(scope, Math.ceil(limit / 4), active - limit)
+    }
+    if (total > limit * 4) {
+      // Always keep the current working set. Drop obsolete evidence first, then ordinary
+      // traces before equally old decisions. Never refresh seen just because a row moved.
+      this.db.prepare(`DELETE FROM node WHERE id IN (SELECT id FROM node WHERE scope=? AND pin=0
+        AND (state!='active' OR valid_to IS NOT NULL) ORDER BY (valid_to IS NULL AND state='retired') ASC,
+        CASE WHEN kind IN ('decision','constraint') THEN 1 ELSE 0 END, seen, id LIMIT ?)`)
+        .run(scope, total - limit * 4)
+    }
+  }
+
+  pruneNodes(scope, limit = this.maxNodes) {
+    if (this.tieredRetention) this.pruneTiered(scope, limit)
+    else {
+      const total = this.db.prepare('SELECT COUNT(*) n FROM node WHERE scope=?').get(scope).n
+      if (total > limit * 4) this.db.prepare(`DELETE FROM node WHERE id IN (
+        SELECT id FROM node WHERE scope=? AND pin=0 AND state!='active' ORDER BY seen ASC LIMIT ?)`)
+        .run(scope, total - limit * 4)
+      const active = this.db.prepare("SELECT COUNT(*) n FROM node WHERE scope=? AND pin=0 AND state='active'").get(scope).n
+      if (active > limit) this.db.prepare(`DELETE FROM node WHERE scope=? AND pin=0 AND state='active' AND id NOT IN (
+        SELECT id FROM node WHERE scope=? AND pin=0 AND state='active' ORDER BY hits DESC, seen DESC LIMIT ?)`)
+        .run(scope, scope, limit)
     }
     this.db.prepare(`DELETE FROM edge WHERE scope=? AND (
       src NOT IN (SELECT id FROM node WHERE scope=?) OR dst NOT IN (SELECT id FROM node WHERE scope=?))`)

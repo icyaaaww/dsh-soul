@@ -1,6 +1,8 @@
 import { readFileSync, statSync } from 'node:fs'
 import { resolve, sep } from 'node:path'
 import { bounded, hash, terms as termSet, entities as entitySet, isInstance, NODE_TERMS } from './util.js'
+import { rankedCandidates } from './graph-search.js'
+import { cueCandidates } from './recall-cues.js'
 import { extract, normalize, project } from './skeleton.js'
 import { memoryView, propagate, render } from './graph-memory.js'
 import { promoteUncovered } from './consolidation.js'
@@ -364,6 +366,7 @@ export function recentlyTouched(store, scope) {
  * entity that too many nodes share activates none of them (the fan effect, again).
  */
 export function noteUse(store, scope, { text = '', paths = [], source = 'cue', turn = currentTurn(store, scope), max = 8 } = {}) {
+  if (store.evidenceRecall && (source === 'cue' || source === 'answer')) return []
   const wanted = [...new Set([...entitySet(text), ...paths.flatMap(path => entitySet(String(path ?? '')))])]
   if (!wanted.length) return []
   const rows = store.nodesMentioning(scope, wanted)
@@ -488,7 +491,9 @@ export const cuesOf = text => ({ terms: termSet(text), entities: entitySet(text)
  * new runtime-context snapshot to the model's history, so a card that changes less costs less.
  */
 export function projectionText(store, scope, budget = 600, { sessionId = null, dynamics = false, promote = false, now = undefined, cues = null, turn = null } = {}) {
-  const nodes = dynamics ? null : store.activeNodes(scope, 200)
+  const admitted = store.cardAdmission ? new Set(store.db.prepare(`SELECT node FROM activation WHERE scope=? AND source='tool' AND turn IS NOT NULL GROUP BY node HAVING COUNT(DISTINCT turn)>=2`).all(scope).map(r=>r.node)) : null
+  const allow = n => !admitted || n.kind !== 'progress' || n.pin || admitted.has(n.id)
+  const nodes = dynamics ? null : store.activeNodes(scope, 200).filter(allow)
   const view = dynamics ? memoryView(store, scope, { now: now ?? Date.now(), cues, context: driftOf(store, scope), turn: Number.isInteger(turn) ? turn : currentTurn(store, scope) }) : null
   if (dynamics ? !view.list.length : !nodes.length) return ''
   // Say how far back the index actually reaches. A silent boundary is worse than a short one:
@@ -506,7 +511,7 @@ export function projectionText(store, scope, budget = 600, { sessionId = null, d
   const room = Math.max(160, budget - Buffer.byteLength(line) - Buffer.byteLength(previous) - 2)
   let card = ''
   if (dynamics) {
-    card = render({ ...view, list: view.list.filter(entry => entry.claim !== handoff?.claim) }, { budget: room })
+    card = render({ ...view, list: view.list.filter(entry => allow(entry) && entry.claim !== handoff?.claim) }, { budget: room })
   } else {
     const body = previous ? nodes.filter(node => node.claim !== handoff.claim) : nodes
     // `referenceLast` only when a feature that manufactures reference nodes is on. Off by
@@ -541,7 +546,7 @@ export function promoteTurn(store, scope, events, { max = 2, now = Date.now(), s
  * needed. 2.0 ranked by activation alone with the view and not at all without it (an inverted
  * condition returned 0 for every pair), so association weights never decided anything.
  */
-export function recall(store, scope, query, { limit = 8, dynamicsView = null, spread = true, turn = null } = {}) {
+export function legacyCandidates(store, scope, query, limit) {
   const queryTerms = termSet(query)
   const queryEntities = entitySet(query)
   const lexical = store.searchNodes(scope, queryTerms, limit, { includeSuperseded: true, includeRetired: true })
@@ -557,9 +562,16 @@ export function recall(store, scope, query, { limit = 8, dynamicsView = null, sp
     seen.add(row.id)
     hits.push(row)
   }
-  const liveHits = hits.filter(row => row.state === 'active' && !row.valid_to)
+  return hits
+}
+
+export function recall(store, scope, query, { limit = 8, dynamicsView = null, spread = true, turn = null, previousObject = null } = {}) {
+  const direct = (store.rankedRecall ? rankedCandidates : legacyCandidates)(store, scope, query, limit)
+  const cues = store.adaptiveRecall ? cueCandidates(store,scope,query,previousObject,limit) : []
+  const hits = cues.length ? [...cues,...direct.filter(n => !cues.some(c => c.id===n.id))].slice(0,limit) : direct
+  const liveHits = hits.filter(row => !row.via && row.state === 'active' && !row.valid_to)
   const t = Number.isInteger(turn) ? turn : currentTurn(store, scope)
-  for (const row of hits) store.activate(scope, { node: row.id, query: String(query ?? ''), source: 'recall', turn: t })
+  if (!store.evidenceRecall) for (const row of hits) if (!row.via) store.activate(scope, { node: row.id, query: String(query ?? ''), source: 'recall', turn: t })
 
   const neighbours = store.neighbours(scope, liveHits.map(row => row.id), { associative: true })
     .filter(row => row.state === 'active' && !row.valid_to)
@@ -575,7 +587,7 @@ export function recall(store, scope, query, { limit = 8, dynamicsView = null, sp
   const top = liveHits.slice(0, 4)
   for (let i = 0; i < top.length; i++) for (let j = i + 1; j < top.length; j++) add(top[i].id, top[j].id)
   for (const hit of top) for (const near of neighbours.slice(0, 6)) add(hit.id, near.id)
-  for (const pair of pairs) store.link(scope, { ...pair, rel: 'coactivated', delta: 0.1 })
+  if (!store.evidenceRecall) for (const pair of pairs) store.link(scope, { ...pair, rel: 'coactivated', delta: 0.1 })
 
   const spreadRank = spread ? spreadFrom(store, scope, liveHits) : new Map()
   const extra = spread ? transitive(store, spreadRank, hits, neighbours, limit) : []
@@ -593,11 +605,11 @@ export function recall(store, scope, query, { limit = 8, dynamicsView = null, sp
     .map(({ row }) => row)
   return {
     query: String(query ?? ''),
-    hits: hits.map(row => describe(store, scope, row, dynamicsView)),
+    hits: hits.map(row => ({ ...describe(store, scope, row, dynamicsView), ...(row.via ? { via: row.via } : {}) })),
     neighbours: ordered.map(row => ({ ...describe(store, scope, row, dynamicsView), strength: Math.round((strengths.get(row.id) ?? 0) * 100) / 100,
       ...(spreadRank.has(row.id) ? { reach: Number(spreadRank.get(row.id).toFixed(3)) } : {}) })),
     next: successors(store, scope, liveHits),
-    links: pairs.length,
+    links: store.evidenceRecall ? 0 : pairs.length,
     spread: spreadRank.size,
   }
 }

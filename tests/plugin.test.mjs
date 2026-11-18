@@ -49,6 +49,22 @@ test('memory starts without a model; evolution remains off and both can be disab
   assert.equal(off.tools.length, 0)
 })
 
+test('soul_recall skips span search for one grounded claim and seeks evidence despite multiple hits', async () => {
+  const {ctx,tools}=fakeContext();const h=apply(ctx,{database:':memory:'})
+  try {
+    const agent={session:session()},scope=projectScope(agent.session),claim='src/a.js 的重试次数设为 3。'
+    const find=async query=>JSON.parse((await tools.find(t=>t.name==='soul_recall').execute({query},{agent})).text)
+    h.store.recordNodes(scope,{nodes:[{id:'d',kind:'decision',claim,session:'s1',seq:4}]})
+    h.store.putSpans(scope,'s1',[{seq:4,kind:'user/message',text:claim,hash:'h1'}])
+    const one=await find('src/a.js 的重试次数是多少？')
+    assert.equal(one.evidence.status,'supported');assert.equal(one.indexed,undefined)
+    h.store.recordNodes(scope,{nodes:[{id:'p',kind:'progress',claim:'src/a.js 正在调试'}]})
+    const two=await find('src/a.js 的心跳间隔是多少？')
+    assert.ok(two.nodes.length>=2);assert.ok(two.indexed);assert.equal(two.evidence.status,'insufficient')
+    assert.equal(h.store.nodeRow('d').hits,0)
+  } finally { await h.stop() }
+})
+
 test('explicit evolution switch overrides the legacy alias and memory can be disabled separately', async () => {
   assert.equal(settings({ profile: 'test', enabled: true, evolution: { enabled: false } }).enabled, false)
   assert.throws(() => settings({ profile: 'test', evolution: { enabled: true } }), /显式配置 provider/)

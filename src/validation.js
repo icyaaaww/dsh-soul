@@ -30,6 +30,29 @@ export function normalizeChecks(checks) {
   })
 }
 
+// Holdouts are project-owner supplied, never model-generated. A control is expected
+// to work on the baseline; passing that case is retention, not an efficiency win.
+export function holdoutCases(config, original) {
+  if (config === undefined) return []
+  if (!Array.isArray(config) || config.length !== 2) throw fail('invalid_holdouts')
+  const key = text => text.trim().normalize('NFKC').toLowerCase().replace(/\s+/g, ' ')
+  const seen = new Set([key(original)])
+  return ['transfer', 'control'].map(role => {
+    const c = config.find(item => item?.role === role)
+    if (typeof c?.task !== 'string' || !c.task.trim() || c.task.length > 2000 || seen.has(key(c.task))) throw fail('invalid_holdouts')
+    seen.add(key(c.task))
+    return { role, task: c.task.trim(), key: hash(key(c.task)), checks: normalizeChecks(c.checks) }
+  })
+}
+
+export function holdoutVerdict(role, pair, settings) {
+  const verdict = classifyPair(pair, settings)
+  if (!verdict.valid) return { ok: false, reason: verdict.reason }
+  const a = pair.baseline.metrics, b = pair.candidate.metrics
+  if (role === 'control') return { ok: success(pair.baseline) && b.toolCalls <= a.toolCalls && b.toolErrors <= a.toolErrors, reason: 'control_regression_or_invalid_baseline' }
+  return { ok: verdict.quality || verdict.efficiency || b.toolErrors < a.toolErrors, reason: 'no_transfer_gain' }
+}
+
 export async function verifierFingerprint(cwd, checks) {
   const entries = [], base = resolve(cwd)
   let size = 0, count = 0

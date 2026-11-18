@@ -58,6 +58,18 @@ test('/mem registers with the new verbs advertised', async () => {
   } finally { await h.stop() }
 })
 
+test('/mem confirm and forget-cue require human commands and round-trip through recall', async () => {
+  const h = harness({memory:{adaptiveRecall:true}})
+  try {
+    const scope = projectScope(session(h.dir))
+    h.handle.store.recordNodes(scope,{nodes:[{id:'node1',kind:'decision',claim:'NOB 的废墟教堂'}]})
+    assert.equal((await h.run('confirm node1 场景借用写什么')).kind,'success')
+    assert.equal(JSON.parse((await h.run('recall 场景借用怎么写')).text).hits[0].via,'confirmed_phrase')
+    assert.equal((await h.run('forget-cue 场景借用写什么')).kind,'success')
+    assert.equal(JSON.parse((await h.run('recall 场景借用怎么写')).text).hits.length,0)
+  } finally { await h.stop() }
+})
+
 test('/mem dynamics reports the ledger even with an empty graph', async () => {
   const h = harness()
   try {
@@ -124,6 +136,41 @@ async function turn(h, text = '看一下 src/store.js') {
   )
   h.handlers.get('session/event')(session(h.dir), { type: 'turn/end', data: {} })
 }
+
+test('previous-object hints belong to one completed turn, session and object', async () => {
+  const h = harness({memory:{adaptiveRecall:true}})
+  try {
+    assert.equal(h.handle.store.rankedRecall,false,'opting into cues does not change the base ranker')
+    h.handle.store.recordNodes(projectScope(session(h.dir)),{nodes:[{id:'a',kind:'decision',claim:'src/a.js 超时 17 秒'}]})
+    await turn(h,'检查 src/a.js')
+    const via = async (id='s1') => {
+      const result = await h.mem.handler({agent:{session:{...session(h.dir),id}}, rawInput:'recall 它的超时是多少',signal:signal()})
+      return JSON.parse(result.text).hits.filter(n=>n.via==='previous_object').map(n=>n.id)
+    }
+    assert.deepEqual(await via(),['a']); assert.deepEqual(await via('s2'),[])
+    const m={role:'user',source:{kind:'user'},content:[{type:'text',text:'换到 src/b.js'}]}
+    await h.handlers.get('agent/pre-step')({agent:{session:session(h.dir)},messages:[m],step:1},async()=>({kind:'accept',messages:[m]}))
+    assert.deepEqual(await via(),[],'do not use an old anchor while the new turn is in progress')
+    h.handlers.get('session/event')(session(h.dir),{type:'turn/end',data:{}})
+    assert.deepEqual(await via(),[])
+    await turn(h,'检查 src/a.js'); h.handlers.get('agent/disposed')({agent:{session:session(h.dir)}})
+    assert.deepEqual(await via(),[])
+  } finally { await h.stop() }
+})
+
+test('collaboration projects the scoped style, expires a turn override and spends no calls', async () => {
+  const h=harness({enabled:false,memory:{collaboration:true}})
+  try {
+    const agent={session:session(h.dir)}, prompt=()=>h.contexts.find(c=>c.name==='dsh-soul:collaboration').text({agent})
+    const send=async(text,id)=>{const m={id,role:'user',source:{kind:'user'},content:[{type:'text',text}]};await h.handlers.get('agent/pre-step')({agent,messages:[m]},async()=>({kind:'accept',messages:[m]}))}
+    const end=()=>h.handlers.get('session/event')(agent.session,{type:'turn/end',data:{}})
+    await send('以后这个项目都简短回答','one');end();assert.match(prompt(),/简短回答/)
+    await send('这次详细点','two');assert.match(prompt(),/展开说明/);end();assert.match(prompt(),/简短回答/)
+    assert.equal((await h.run('style revoke any brief')).kind,'success');assert.equal(prompt(),'')
+    assert.equal(h.handle.store.db.prepare('SELECT count(*) n FROM call').get().n,0)
+    assert.equal(h.handle.store.activeNodes(projectScope(agent.session)).length,0)
+  } finally {await h.stop()}
+})
 
 test('idle maintenance merges duplicates and leaves retirement alone', async () => {
   const h = harness({ memory: { maintenanceTurns: 5 } })

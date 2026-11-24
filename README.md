@@ -10,6 +10,7 @@
 - 可选软遗忘只将足够久、未使用且没有关系的普通进度节点移出活动图；保留记录与召回能力，恢复后有 30 天宽限期。约束、决策、产物和显著事件不自动退休。
 - 修复 issue #8：仅当本轮确实包含可回捞历史的请求时提示回查，按会话限频，避免普通闲聊因词面重合低而产生重复提示。
 - 主题与软遗忘均默认关闭，不增加模型调用；原 2.2 默认卡片和排序不变。
+- 明确要求查原文或核对来源时，先检索原始会话片段，再用片段关联节点扩展图召回；普通查询保持图优先，命中不等于证据证明。
 
 
 
@@ -34,10 +35,10 @@
 
 需要 Node.js 24+，DSH 支持范围为 `>=0.2.1-rc.2 <0.3.0-0`。0.2.0-rc.2 不在支持范围。CI 验证 rc.2 的接入与旧版拒绝路径，本机另验证了桌面端 0.2.1-rc.5。
 
-当前最新公开安装包仍为 [v2.2.0 Release](https://github.com/icyaaaww/dsh-soul/releases/tag/v2.2.0)；2.3.0 尚未发布。
+当前最新公开安装包为 [v2.3.0 Release](https://github.com/icyaaaww/dsh-soul/releases/tag/v2.3.0)。
 
 ```powershell
- dsh plugin --profile tui add "https://github.com/icyaaaww/dsh-soul/releases/download/v2.2.0/dsh-soul-2.2.0.tgz"
+ dsh plugin --profile tui add "https://github.com/icyaaaww/dsh-soul/releases/download/v2.3.0/dsh-soul-2.3.0.tgz"
 ```
 
 `tui` 替换为实际 profile。请使用本仓库的 Release 安装包；npm 上的裸名 `dsh-soul` 可能指向另一位作者的项目。

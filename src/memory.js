@@ -565,13 +565,28 @@ export function legacyCandidates(store, scope, query, limit) {
   return hits
 }
 
-export function recall(store, scope, query, { limit = 8, dynamicsView = null, spread = true, turn = null, previousObject = null } = {}) {
+export function recall(store, scope, query, { limit = 8, dynamicsView = null, spread = true, turn = null, previousObject = null, evidenceSpans = [] } = {}) {
   const direct = (store.rankedRecall ? rankedCandidates : legacyCandidates)(store, scope, query, limit)
+  const evidenceHits = []
+  const evidenceIds = new Set()
+  for (const span of evidenceSpans) for (const row of store.nodesAt(scope, span.session, span.seq)) {
+    if (evidenceIds.has(row.id)) continue
+    evidenceIds.add(row.id)
+    evidenceHits.push({ ...row, via: 'source_span' })
+  }
   const cues = store.adaptiveRecall ? cueCandidates(store,scope,query,previousObject,limit) : []
-  const hits = cues.length ? [...cues,...direct.filter(n => !cues.some(c => c.id===n.id))].slice(0,limit) : direct
-  const liveHits = hits.filter(row => !row.via && row.state === 'active' && !row.valid_to)
+  const seen = new Set()
+  const hits = []
+  for (const row of [...evidenceHits, ...cues, ...direct]) {
+    if (seen.has(row.id) || hits.length >= limit) continue
+    seen.add(row.id)
+    hits.push(row)
+  }
+  const liveHits = hits.filter(row => (!row.via || row.via === 'source_span') && row.state === 'active' && !row.valid_to)
   const t = Number.isInteger(turn) ? turn : currentTurn(store, scope)
-  if (!store.evidenceRecall) for (const row of hits) if (!row.via) store.activate(scope, { node: row.id, query: String(query ?? ''), source: 'recall', turn: t })
+
+  if (!store.evidenceRecall) for (const row of hits) if (!row.via || row.via === 'source_span') store.activate(scope, { node: row.id, query: String(query ?? ''), source: 'recall', turn: t })
+
 
   const neighbours = store.neighbours(scope, liveHits.map(row => row.id), { associative: true })
     .filter(row => row.state === 'active' && !row.valid_to)

@@ -6,6 +6,10 @@ const attributes = /连接池上限|超时(?:时间|秒数)?|重试次数|缓存
 const statusQuestion = /(?:成功了吗|成功了没|完成了吗|是否.{0,8}(?:成功|完成)|执行结果|did .{0,40}succeed)/i
 const unverified = /[？?]|可能|预计|计划|建议|假设|不要|不再|并非|不是|尚未|未确认|如果|拟定|据说|示例|草案|错误|不正确|作废|取消|以前|曾经|过去|原先|原来/u
 const refKey = ({session,seq}) => JSON.stringify([session,seq])
+const originalRequest = /原文|原始(?:文本|资料|材料|来源|记录|文档|证据)|出处|引文|引用原文|查(?:看|找|一下)?原文|核对(?:原文|来源)|\b(?:original(?:\s+(?:text|source|document|record))?|verbatim|citation|quoted?)\b/iu
+
+export const requestsOriginalEvidence = query => originalRequest.test(String(query ?? ''))
+
 
 export function assessEvidence(query, hits, spans = []) {
   const missing = (...gaps) => ({status:'insufficient', missing:gaps, sources:[]})

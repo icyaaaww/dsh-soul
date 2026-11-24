@@ -65,6 +65,36 @@ test('full-text search finds a Chinese phrase and substring search finds a path'
   } finally { store.close() }
 })
 
+
+test('source-first search ranks original event spans ahead of assistant summaries', () => {
+  const store = new Store(':memory:')
+  try {
+    ingest(store, 'p', fakeSession([
+      { ...user('第 17 节。缓存命中率在冷启动后需要重新预热。'), type: 'user/message' },
+      { ...user('第 17 节里日志要保留五天。'), type: 'assistant/message' },
+    ]))
+    const query = '第 17 节里日志要保留几天？查原文。'
+    const ordinary = searchIndex(store, 'p', query)
+    const sourceFirst = searchIndex(store, 'p', query, { sourceFirst: true })
+    assert.equal(ordinary.spans[0].kind, 'assistant/message')
+    assert.equal(sourceFirst.spans[0].kind, 'user/message')
+    assert.match(sourceFirst.spans[0].text, /缓存命中率/)
+  } finally { store.close() }
+})
+
+test('substring fallback preserves source priority and treats underscores literally', () => {
+  const store = new Store(':memory:')
+  try {
+    ingest(store, 'p', fakeSession([
+      user('prefix_rawXdoc_suffix'),
+      { ...user('summary_raw_doc_suffix'), type: 'assistant/message' },
+      user('source_raw_doc_suffix'),
+    ]))
+    const hits = store.findSpans('p', 'raw_doc', 3, { sourceFirst: true })
+    assert.deepEqual(hits.map(row => [row.seq, row.kind]), [[2, 'user/message'], [1, 'assistant/message']])
+  } finally { store.close() }
+})
+
 test('results stay within the byte budget and report coverage', () => {
   const store = new Store(':memory:')
   try {

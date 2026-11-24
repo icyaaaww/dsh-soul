@@ -81,7 +81,7 @@ export function ingest(store, scope, session, { max = MAX_INGEST_PER_CALL, budge
  * FTS5 first (bm25 ranking), substring second for queries the tokenizer cannot express —
  * a Windows path is one "word" to FTS and a literal to LIKE.
  */
-export function searchIndex(store, scope, query, { limit = 3, maxBytes = 4000, maxSpanBytes = 1200, sessionId = null } = {}) {
+export function searchIndex(store, scope, query, { limit = 3, maxBytes = 4000, maxSpanBytes = 1200, sessionId = null, sourceFirst = false } = {}) {
   const coverage = store.spanCoverage(scope)
   const terms = termSet(query)
   if (!terms.length || !coverage.spans) return { spans: [], bytes: 0, coverage }
@@ -89,7 +89,11 @@ export function searchIndex(store, scope, query, { limit = 3, maxBytes = 4000, m
   const match = terms.slice(0, 12).map(phrase).join(' OR ')
   let rows = []
   try { rows = store.searchSpans(scope, match, limit * 4) } catch { rows = [] }
-  if (!rows.length) rows = store.findSpans(scope, String(query ?? '').trim(), limit * 2)
+  if (!rows.length) rows = store.findSpans(scope, String(query ?? '').trim(), limit * 2, { sourceFirst })
+  else if (sourceFirst) {
+    const priority = kind => kind === 'tool/result' ? 0 : kind === 'user/message' ? 1 : 2
+    rows.sort((a, b) => priority(a.kind) - priority(b.kind))
+  }
 
   const needles = String(query ?? '').toLowerCase().split(/\s+/).filter(token => token.length >= 2)
   const spans = []
@@ -105,6 +109,7 @@ export function searchIndex(store, scope, query, { limit = 3, maxBytes = 4000, m
       // expand it, only read what is quoted here.
       session: row.session ?? null,
       current: sessionId === null ? true : row.session === sessionId,
+      kind: row.kind ?? null,
       score: Math.round((Number(row.score) || 0) * 1000) / 1000,
       text,
     })

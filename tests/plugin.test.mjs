@@ -65,6 +65,35 @@ test('soul_recall skips span search for one grounded claim and seeks evidence de
   } finally { await h.stop() }
 })
 
+test('explicit original lookup ranks source spans first and seeds graph recall', async () => {
+  const { ctx, tools } = fakeContext()
+  const h = apply(ctx, { database: ':memory:' })
+  try {
+    const agent = { session: session() }, scope = projectScope(agent.session)
+    const source = '第 17 节。缓存命中率在冷启动后需要重新预热，预热脚本会遍历索引目录并重建字段映射。'
+    const summary = '第 17 节里，日志要保留 5 天。'
+    h.store.putSpans(scope, 's1', [
+      { seq: 10, kind: 'user/message', text: source, hash: 'original-source' },
+      { seq: 11, kind: 'assistant/message', text: summary, hash: 'assistant-summary' },
+    ])
+    h.store.recordNodes(scope, { nodes: [
+      { id: 'source-node', kind: 'progress', claim: '第 17 节缓存命中率需要预热', session: 's1', seq: 10 },
+      { id: 'connected-node', kind: 'decision', claim: '预热脚本遍历索引并重建字段映射' },
+    ] })
+    h.store.link(scope, { src: 'source-node', dst: 'connected-node', rel: 'related', delta: 1 })
+
+    const out = JSON.parse((await tools.find(t => t.name === 'soul_recall').execute(
+      { query: '第 17 节里日志要保留几天？请查原文。' }, { agent },
+    )).text)
+    assert.equal(out.spans[0].kind, 'user/message')
+    assert.match(out.spans[0].text, /缓存命中率/)
+    assert.ok(out.nodes.some(node => node.id === 'source-node' && node.via === 'source_span'))
+    assert.ok(out.neighbours.some(node => node.id === 'connected-node'))
+    assert.equal(out.evidence.status, 'insufficient')
+  } finally { await h.stop() }
+})
+
+
 test('retrieval hints require low-coverage history/detail asks, cool down per session, and expire with turns', async () => {
   const { ctx, contexts, handlers } = fakeContext()
   const dirA = mkdtempSync(join(tmpdir(), 'soul-hint-a-'))

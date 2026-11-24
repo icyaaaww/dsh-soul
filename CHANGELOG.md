@@ -1,3 +1,7 @@
+## Unreleased
+
+- Explicit original-source queries search provenance spans before graph recall; matching source spans seed graph expansion. Other queries retain graph-first retrieval.
+
 ## 2.3.0 — 可回溯主题与保守遗忘（2026-11-24）
 
 - 新增可选的确定性主题目录：父级只路由到可展开的原子记忆与来源，不替代历史证据。

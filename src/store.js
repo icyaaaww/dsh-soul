@@ -1029,12 +1029,11 @@ export class Store {
 
   /** Full-text search over stored spans. bm25 is lower-is-better. */
   searchSpans(scope, match, limit) {
-    return this.db.prepare(`SELECT s.seq, s.session, s.text, bm25(span_fts) score
+    return this.db.prepare(`SELECT s.seq, s.session, s.kind, s.text, bm25(span_fts) score
       FROM span_fts JOIN span s ON s.id = span_fts.rowid
       WHERE span_fts MATCH ? AND span_fts.scope=?
       ORDER BY score LIMIT ?`).all(match, scope, limit)
   }
-
   /** The verbatim span a node was extracted from — the index half of a hippocampal index. */
   spanAt(scope, session, seq) {
     if (!session || !Number.isInteger(seq) || seq < 0) return null
@@ -1049,9 +1048,11 @@ export class Store {
   }
 
   /** Substring fallback for queries the tokenizer cannot express (paths, mixed scripts). */
-  findSpans(scope, needle, limit) {
-    return this.db.prepare('SELECT seq, session, text FROM span WHERE scope=? AND text LIKE ? ORDER BY seq LIMIT ?')
-      .all(scope, `%${String(needle).replaceAll('%', '')}%`, limit)
+  findSpans(scope, needle, limit, { sourceFirst = false } = {}) {
+    const sourceOrder = sourceFirst ? "CASE kind WHEN 'tool/result' THEN 0 WHEN 'user/message' THEN 1 ELSE 2 END, " : ''
+    const literal = String(needle).replace(/[!%_]/g, '!$&')
+    return this.db.prepare(`SELECT seq, session, kind, text FROM span WHERE scope=? AND text LIKE ? ESCAPE '!'
+      ORDER BY ${sourceOrder}seq LIMIT ?`).all(scope, `%${literal}%`, limit)
   }
 
   // -- watch ---------------------------------------------------------------

@@ -294,7 +294,7 @@ export function run(event) {
 
 ### 测试覆盖
 
-- 本机 Windows / Node 24.19.0 / 桌面端 DSH 0.2.1-rc.5：完整测试 **225 通过，0 失败，0 跳过**。
+- 2.3.0 发布验证：自动化套件 264 项通过、0 失败；另有 3 项真实 DSH 宿主集成测试由维护者在实际宿主环境补测通过。
 - GitHub CI 覆盖 Windows、Ubuntu 的常规检查，以及 DSH 0.2.1-rc.2 的宿主接入；0.2.0-rc.2 用于验证不支持旧宿主时的拒绝路径。
 - 宿主用例使用真实 Cordis、AgentLoop、SessionStore、ToolRuntime 等服务，模型响应使用确定性适配器，不能据此推算真实模型任务成功率。
 

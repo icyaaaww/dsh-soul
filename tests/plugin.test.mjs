@@ -65,6 +65,49 @@ test('soul_recall skips span search for one grounded claim and seeks evidence de
   } finally { await h.stop() }
 })
 
+test('retrieval hints require low-coverage history/detail asks, cool down per session, and expire with turns', async () => {
+  const { ctx, contexts, handlers } = fakeContext()
+  const dirA = mkdtempSync(join(tmpdir(), 'soul-hint-a-'))
+  const dirB = mkdtempSync(join(tmpdir(), 'soul-hint-b-'))
+  const handle = apply(ctx, { database: ':memory:' })
+  const agentA = { session: { id: 'hint-a', header: { cwd: dirA } } }
+  const agentB = { session: { id: 'hint-b', header: { cwd: dirB } } }
+  const provider = contexts.find(c => c.name === 'dsh-soul:memory')
+  const query = '之前对 package.json 的具体决定是什么？'
+  const submit = async (agent, text) => {
+    const message = { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] }
+    await handlers.get('agent/pre-step')({ agent, messages: [message] }, async () => ({ kind: 'accept', messages: [message] }))
+  }
+  const prompt = agent => provider.text({ agent })
+  try {
+    handle.store.recordNodes(projectScope(agentA.session), { nodes: [{ id: 'hint-a-node', kind: 'decision', claim: 'package.json builds must use pnpm' }] })
+    handle.store.recordNodes(projectScope(agentB.session), { nodes: [{ id: 'hint-b-node', kind: 'decision', claim: 'package.json builds must use pnpm' }] })
+
+    await submit(agentA, '你感觉这个插件用的咋样？')
+    assert.doesNotMatch(prompt(agentA), /\[提示\]/, 'casual low-overlap conversation alone should not trigger retrieval')
+    handlers.get('session/event')(agentA.session, { type: 'turn/end', data: {} })
+    await submit(agentA, query)
+    assert.match(prompt(agentA), /\[提示\]/, 'low-coverage history/detail requests should still hint')
+    await submit(agentA, query)
+    assert.match(prompt(agentA), /\[提示\]/, 'the hint remains available through the active turn')
+    handlers.get('session/event')(agentA.session, { type: 'turn/end', data: {} })
+    assert.doesNotMatch(prompt(agentA), /\[提示\]/, 'a hint expires at turn end')
+    await submit(agentA, query)
+    assert.doesNotMatch(prompt(agentA), /\[提示\]/, 'the cooldown suppresses repeated hints in one session')
+
+    await submit(agentB, query)
+    assert.match(prompt(agentB), /\[提示\]/, 'another session has an independent cooldown')
+
+    handlers.get('agent/disposed')({ agent: agentB })
+    await submit(agentB, query)
+    assert.match(prompt(agentB), /\[提示\]/, 'disposing a session clears its cooldown')
+  } finally {
+    await handle.stop()
+    rmSync(dirA, { recursive: true, force: true })
+    rmSync(dirB, { recursive: true, force: true })
+  }
+})
+
 test('explicit evolution switch overrides the legacy alias and memory can be disabled separately', async () => {
   assert.equal(settings({ profile: 'test', enabled: true, evolution: { enabled: false } }).enabled, false)
   assert.throws(() => settings({ profile: 'test', evolution: { enabled: true } }), /显式配置 provider/)

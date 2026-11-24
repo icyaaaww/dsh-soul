@@ -181,7 +181,7 @@ function statements(store) {
   set = {
     edge: store.db.prepare('SELECT src, dst, rel, w FROM edge WHERE scope=?'),
     retire: store.db.prepare("UPDATE node SET state='retired', seen=? WHERE id=? AND pin=0"),
-    restore: store.db.prepare("UPDATE node SET state='active' WHERE id=? AND state='retired'"),
+    restore: store.db.prepare("UPDATE node SET state='active', seen=? WHERE id=? AND state='retired'"),
   }
   PREPARED.set(store, set)
   return set
@@ -432,7 +432,7 @@ export function retire(store, scope, view, options) {
 export function restore(store, ids) {
   const stmt = statements(store).restore
   const out = []
-  for (const id of ids) if (stmt.run(id).changes) out.push(id)
+  for (const id of ids) if (stmt.run(store.now(), id).changes) out.push(id)
   return out
 }
 

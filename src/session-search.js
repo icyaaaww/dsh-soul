@@ -1,4 +1,4 @@
-import { bounded, terms as termSet } from './util.js'
+import { bounded, fail, terms as termSet } from './util.js'
 
 /**
  * Retrieval over the live session's own history.
@@ -10,6 +10,7 @@ import { bounded, terms as termSet } from './util.js'
  */
 
 const MAX_SCAN = 12000
+const MAX_EXPAND_SCAN = 20000
 const MAX_SPAN_BYTES = 1200
 const MAX_TOTAL_BYTES = 4000
 
@@ -171,6 +172,24 @@ export function searchSession(session, query, options) {
   return searchSpans(spans, query, options)
 }
 
+/** Upper seq bound reported by the host session, or null when the session exposes none. */
+function sessionCeiling(session) {
+  const seq = Number(session?.seq)
+  if (Number.isSafeInteger(seq) && seq >= 0) return seq
+  const logLength = Number(session?.log?.length)
+  if (Number.isSafeInteger(logLength) && logLength >= 0) return logLength
+  const nodes = session?.surface?.nodes
+  if (Array.isArray(nodes)) {
+    let max = -1
+    for (const entry of nodes) {
+      const n = Number(entry)
+      if (Number.isSafeInteger(n) && n > max) max = n
+    }
+    return max
+  }
+  return null
+}
+
 /**
  * Read one addressable range verbatim.
  *
@@ -178,13 +197,36 @@ export function searchSession(session, query, options) {
  * those events, bounded, so a pointer costs one call and a known number of bytes.
  */
 export function expandRange(session, from, to, { limit = 2000, maxEvents = 200 } = {}) {
-  const start = Math.max(0, Math.min(Number(from) || 0, Number(to) || 0))
-  const end = Math.max(Number(from) || 0, Number(to) || 0)
-  if (typeof session?.eventAt !== 'function') return { from: start, to: end, bytes: 0, text: '', events: 0 }
+  const wanted = [Number(from), Number(to)]
+  // "1e999" and "Infinity" survive Number() as Infinity, and numbers above MAX_SAFE_INTEGER
+  // lose unit precision (`cursor++ === cursor`), so `cursor <= upper` would spin forever when
+  // empty slots do not increment `events`. Reject non-finite / unsafe values, clamp to the
+  // session ceiling, and cap scan width so sparse or huge ranges stay bounded.
+  if (!wanted.every(n => Number.isFinite(n) && Math.abs(n) <= Number.MAX_SAFE_INTEGER)) {
+    throw fail('invalid_range', 'from/to 必须是有限数字')
+  }
+  const rawLower = Math.ceil(Math.min(...wanted))
+  const rawUpper = Math.floor(Math.max(...wanted))
+  const ceiling = sessionCeiling(session)
+  if (rawUpper < 0 || rawLower > rawUpper) {
+    const edge = ceiling === null ? Math.max(0, rawLower) : Math.max(0, Math.min(rawLower, Math.max(0, ceiling)))
+    return { from: edge, to: edge, bytes: 0, text: '', events: 0 }
+  }
+  if (ceiling !== null && rawLower > ceiling) {
+    const edge = Math.max(0, ceiling)
+    return { from: edge, to: edge, bytes: 0, text: '', events: 0 }
+  }
+  const lower = Math.max(0, rawLower)
+  const boundedUpper = ceiling === null ? rawUpper : Math.min(rawUpper, ceiling)
+  const upper = Math.min(boundedUpper, lower + MAX_EXPAND_SCAN - 1, Number.MAX_SAFE_INTEGER)
+  if (typeof session?.eventAt !== 'function') return { from: lower, to: upper, bytes: 0, text: '', events: 0 }
   const parts = []
   let events = 0
-  for (let seq = start; seq <= end && events < maxEvents; seq++) {
-    const event = session.eventAt(seq)
+  let scanned = 0
+  // `scanned` is the second bound: a sparse session or one without `seq` still cannot spin.
+  for (let cursor = lower; cursor <= upper && events < maxEvents && scanned < MAX_EXPAND_SCAN; cursor++) {
+    scanned++
+    const event = session.eventAt(cursor)
     if (!event) continue
     const text = textOfEvent(event).trim()
     if (!text) continue
@@ -192,5 +234,5 @@ export function expandRange(session, from, to, { limit = 2000, maxEvents = 200 }
     events++
   }
   const text = bounded(parts.join('\n'), limit)
-  return { from: start, to: end, bytes: Buffer.byteLength(text), text, events }
+  return { from: lower, to: upper, bytes: Buffer.byteLength(text), text, events }
 }

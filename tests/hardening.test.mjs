@@ -158,6 +158,29 @@ test('oneLine keeps joiners but strips line breaks and bidi overrides', () => {
   assert.equal(oneLine('a\u200cb'), 'a\u200cb')
 })
 
+test('artifact claims and grouped paths retain significant spaces', () => {
+  const store = new Store(':memory:')
+  try {
+    const dir = 'docs/annual  reports/'
+    const first = ' January  notes.md'
+    const second = 'February  notes.md'
+    const artifacts = [first, second].map((name, i) => ({
+      id: `artifact-${i}`, kind: 'artifact', seq: i + 1, pin: 1,
+      anchor: `file:${dir}${name}`, claim: `${dir}${name} 已写入`,
+    }))
+    store.recordNodes(scope, { nodes: artifacts.slice(0, 1) })
+    for (const dynamics of [false, true]) {
+      const card = projectionText(store, scope, 600, { dynamics })
+      assert.ok(card.includes(`- 产物: ${dir}${first} 已写入`), card)
+    }
+    store.recordNodes(scope, { nodes: artifacts.slice(1) })
+    const grouped = projectionText(store, scope, 600, { dynamics: true })
+    const line = grouped.split('\n').find(line => line.startsWith(`- 产物: ${dir} 下 `))
+    assert.ok(line, grouped)
+    assert.deepEqual(line.slice(`- 产物: ${dir} 下 `.length, -' 已写入'.length).split('、').sort(), [first, second])
+  } finally { store.close() }
+})
+
 test('a correction containing a newline cannot forge a second card line', () => {
   const store = new Store(':memory:')
   try {

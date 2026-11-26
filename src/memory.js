@@ -463,7 +463,7 @@ export function driftOf(store, scope) {
  * card turns "there is an index" into "here is what to look for".
  */
 export function recordHandoff(store, scope, sessionId, claim, at = Date.now()) {
-  const text = bounded(oneLine(String(claim ?? '')), 120)
+  const text = bounded(oneLine(claim).trim(), 120)
   if (!text) return null
   store.writeMeta(`handoff:${scope}`, JSON.stringify({ claim: text, session: String(sessionId), at }))
   return text

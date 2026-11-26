@@ -1,3 +1,5 @@
+import { oneLine } from './util.js'
+
 /**
  * Graph memory — the read path.
  *
@@ -534,10 +536,14 @@ export function render(view, { budget = 600, labels = LABELS, params = PARAMS } 
 
 /** One card line. A one-member artifact group reads as its plain path. */
 function renderLine(line, labels = LABELS) {
-  if (!(line.kind === 'artifact' && line.names)) return `- ${labels[line.kind] ?? line.kind}: ${line.text}`
-  return line.names.length === 1
-    ? `- ${labels.artifact}: ${line.dir}${line.names[0]} 已写入`
-    : `- ${labels.artifact}: ${line.dir} 下 ${line.names.join('、')} 已写入`
+  // Single-line by construction: the card is a system prompt, so a newline in a claim
+  // would render as a second line that is indistinguishable from a real entry.
+  if (!(line.kind === 'artifact' && line.names)) return `- ${labels[line.kind] ?? line.kind}: ${oneLine(line.text)}`
+  const dir = oneLine(line.dir)
+  const names = line.names.map(oneLine)
+  return names.length === 1
+    ? `- ${labels.artifact}: ${dir}${names[0]} 已写入`
+    : `- ${labels.artifact}: ${dir} 下 ${names.join('、')} 已写入`
 }
 
 /** Ledger line for `/mem dynamics`: what the read path currently believes, and why. */

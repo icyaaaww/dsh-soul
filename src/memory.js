@@ -1,6 +1,6 @@
 import { readFileSync, statSync } from 'node:fs'
 import { resolve, sep } from 'node:path'
-import { bounded, hash, terms as termSet, entities as entitySet, isInstance, NODE_TERMS } from './util.js'
+import { bounded, oneLine, hash, terms as termSet, entities as entitySet, isInstance, NODE_TERMS } from './util.js'
 import { rankedCandidates } from './graph-search.js'
 import { cueCandidates } from './recall-cues.js'
 import { extract, normalize, project } from './skeleton.js'
@@ -463,7 +463,7 @@ export function driftOf(store, scope) {
  * card turns "there is an index" into "here is what to look for".
  */
 export function recordHandoff(store, scope, sessionId, claim, at = Date.now()) {
-  const text = bounded(String(claim ?? '').trim(), 120)
+  const text = bounded(oneLine(claim).trim(), 120)
   if (!text) return null
   store.writeMeta(`handoff:${scope}`, JSON.stringify({ claim: text, session: String(sessionId), at }))
   return text
@@ -505,7 +505,7 @@ export function projectionText(store, scope, budget = 600, { sessionId = null, d
   // Only from a *previous* session: inside the same session the card already carries the work.
   const handoff = handoffFor(store, scope)
   const previous = handoff && sessionId && handoff.session !== sessionId
-    ? `[上次会话 ${new Date(handoff.at).toISOString().slice(0, 10)}] ${handoff.claim}`
+    ? `[上次会话 ${new Date(handoff.at).toISOString().slice(0, 10)}] ${oneLine(handoff.claim)}`
     : ''
   // Do not say the same sentence twice: the handoff line already carries it.
   const room = Math.max(160, budget - Buffer.byteLength(line) - Buffer.byteLength(previous) - 2)
@@ -807,7 +807,7 @@ export function schematize(store, scope, { minHits = 2, limit = 8 } = {}) {
     if (!span?.text) continue
     const gist = identifierGist(span.text)
     if (!gist) continue
-    const claim = bounded(`${row.claim} → ${gist}`, 240)
+    const claim = bounded(oneLine(`${row.claim} → ${gist}`), 240)
     update.run(claim, JSON.stringify(termSet(claim, NODE_TERMS)), row.id)
     store.indexMentions([{ id: row.id, scope, claim }])
     done.push(row.id)

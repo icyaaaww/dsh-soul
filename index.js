@@ -579,12 +579,18 @@ export function apply(ctx, input = {}) {
                 let indexed = null
                 let spans = []
                 if (sourceFirst) {
+                  // Capture the watermark before indexing. Anything at or below it already
+                  // existed before this turn, so a hit above it is this turn's own words.
+                  const echoFloor = store.spanWatermark(scope, sid)
                   indexed = ingest(store, scope, session)
-                  spans = searchIndex(store, scope, args.query, {
+                  const foundSource = searchIndex(store, scope, args.query, {
                     limit: Math.max(1, Math.min(5, Number(args.k) || 3)),
                     sessionId: sid,
                     sourceFirst: true,
-                  }).spans
+                  })
+                  spans = echoFloor >= 0
+                    ? foundSource.spans.filter(s => !(s.session === sid && s.seq > echoFloor))
+                    : foundSource.spans
                 }
                 const graph = recall(store, scope, args.query, {
                   previousObject: priorObject(sid, scope),
@@ -605,12 +611,17 @@ export function apply(ctx, input = {}) {
                 if (evidence?.missing.includes('matched_call_result')) evidence = callEvidence(session, args.query) ?? evidence
                 if (sourceFirst && !evidence && spans.length) recordLookup(store, scope, args.query, spans)
                 if (!sourceFirst && (evidence ? evidence.status === 'insufficient' : graph.hits.length < 2)) {
+                  const echoFloor = store.spanWatermark(scope, sid)
                   indexed = ingest(store, scope, session)
                   const found = searchIndex(store, scope, args.query, {
                     limit: Math.max(1, Math.min(5, Number(args.k) || 3)),
                     sessionId: sid,
                   })
-                  spans = found.spans
+                  // Evidence must predate the claim: drop spans this turn just indexed, so a
+                  // hit cannot be the very sentence that asked the question.
+                  spans = echoFloor >= 0
+                    ? found.spans.filter(s => !(s.session === sid && s.seq > echoFloor))
+                    : found.spans
                   // Write the pointer back so the same question becomes a card hit next time.
                   if (spans.length && !evidence) recordLookup(store, scope, args.query, spans)
                   // And the other direction: a span hit reactivates the nodes extracted from it.
